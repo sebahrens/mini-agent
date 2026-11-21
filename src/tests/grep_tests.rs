@@ -190,16 +190,30 @@ async fn grep_per_call_limit_restricts_source_context_and_compact_results() {
     assert!(context.starts_with("2 results"), "{context}");
     assert!(context.contains("hits.txt:1-before"), "{context}");
     assert!(!context.contains("hits.txt:3"), "{context}");
-    for cap in [0, 6, u64::MAX] {
-        let error = tool
+    let error = tool
+        .call(search_args(
+            root.path(),
+            serde_json::json!({"max_results":0}),
+        ))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("at least 1"), "{error}");
+    // Above the cap: served at the cap, with a note.
+    for cap in [6, u64::MAX] {
+        let output = tool
             .call(search_args(
                 root.path(),
                 serde_json::json!({"max_results":cap}),
             ))
             .await
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("configured cap 5"), "{error}");
+            .unwrap();
+        assert!(
+            output.contains(&format!(
+                "max_results {cap} exceeds the cap 5; showing up to 5"
+            )),
+            "{output}"
+        );
     }
     std::fs::write(root.path().join("other.txt"), "needle").unwrap();
     for mode in ["files_only", "count"] {

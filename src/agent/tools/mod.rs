@@ -796,7 +796,7 @@ pub fn is_vcs_metadata(name: &str) -> bool {
 #[serde(deny_unknown_fields)]
 pub struct ReadArgs {
     pub path: String,
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::raw_notebook_flag")]
     pub raw_notebook: bool,
     #[serde(default, deserialize_with = "lenient::offset_usize")]
     pub offset: Option<usize>,
@@ -817,7 +817,7 @@ pub struct ReadArgs {
 pub struct WriteArgs {
     pub path: String,
     pub content: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::overwrite_flag")]
     pub overwrite: bool,
 }
 
@@ -825,9 +825,9 @@ pub struct WriteArgs {
 #[serde(deny_unknown_fields)]
 pub struct EditArgs {
     pub path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::replace_all_flag")]
     pub replace_all: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient::fuzzy_flag")]
     pub fuzzy: bool,
     #[serde(default)]
     pub block: Option<String>,
@@ -861,24 +861,24 @@ pub struct BashArgs {
         deserialize_with = "lenient::shell_timeout_ms"
     )]
     pub timeout: Option<u64>,
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::background_flag")]
     pub background: bool,
     /// Run under a pseudo-terminal (Unix): stdin/stdout/stderr are one TTY.
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::pty_flag")]
     pub pty: bool,
     /// Capture stdout and stderr separately instead of one merged stream.
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::separate_streams_flag")]
     pub separate_streams: bool,
     /// Directory to run in: workspace-relative or absolute inside the
     /// workspace. Each call is a fresh shell, so `cd` does not persist.
     #[serde(default)]
     pub workdir: Option<String>,
     /// Promote the foreground command to a background job at its deadline.
-    #[serde(default, deserialize_with = "lenient::optional_flag")]
+    #[serde(default, deserialize_with = "lenient::auto_background_flag")]
     pub auto_background: Option<bool>,
     /// Retry this one command outside the sandbox after interactive user
     /// approval. Only offered when `shell-allow-escalation` is on.
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::escalate_flag")]
     pub escalate: bool,
     /// Why the command needs to leave the sandbox; shown in the approval.
     #[serde(default)]
@@ -1071,22 +1071,22 @@ pub struct GrepArgs {
     pub include: Option<String>,
     #[serde(default, deserialize_with = "lenient::context_lines_usize")]
     pub context_lines: Option<usize>,
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::case_insensitive_flag")]
     pub case_insensitive: bool,
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::files_only_flag")]
     pub files_only: bool,
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::count_flag")]
     pub count: bool,
     /// A call may lower, but never raise, the configured result cap.
     #[serde(default, deserialize_with = "lenient::max_results_u64")]
     pub max_results: Option<u64>,
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::multiline_flag")]
     pub multiline: bool,
     /// Result lines (or matching files) to skip, for paging.
     #[serde(default, deserialize_with = "lenient::offset_u64")]
     pub offset: Option<u64>,
     /// Also search files that `.gitignore`/`.ignore`/global excludes hide.
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::no_ignore_flag")]
     pub no_ignore: bool,
 }
 
@@ -1124,7 +1124,7 @@ pub struct FindFilesArgs {
     #[serde(default)]
     pub sort: FindFilesSort,
     /// Also list files that `.gitignore`/`.ignore`/global excludes hide.
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::no_ignore_flag")]
     pub no_ignore: bool,
 }
 
@@ -1142,7 +1142,7 @@ pub struct ListDirArgs {
     #[serde(default, deserialize_with = "lenient::depth_usize")]
     pub depth: Option<usize>,
     /// Also list entries that `.gitignore`/`.ignore`/global excludes hide.
-    #[serde(default, deserialize_with = "lenient::flag")]
+    #[serde(default, deserialize_with = "lenient::no_ignore_flag")]
     pub no_ignore: bool,
 }
 

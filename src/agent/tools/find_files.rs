@@ -2408,15 +2408,16 @@ impl Tool for FindFilesTool {
         let pattern = FindFilesPattern::compile(&args.pattern, args.mode)?;
         let no_matches_hint = pattern.no_matches_hint();
         let configured_cap = usize::try_from(self.max_results).unwrap_or(usize::MAX);
-        if args
-            .limit
-            .is_some_and(|limit| limit == 0 || limit > configured_cap)
-        {
-            return Err(ToolError::Msg(format!(
-                "find_files limit must be between 1 and the configured cap {configured_cap}. Example: {{\"pattern\":\"*.rs\",\"limit\":{}}}",
-                configured_cap.min(50)
-            )));
+        if args.limit == Some(0) {
+            return Err(ToolError::Msg(
+                "find_files limit must be at least 1. Example: {\"pattern\":\"*.rs\",\"limit\":50}"
+                    .to_string(),
+            ));
         }
+        // A request above the configured cap is served at the cap and says so.
+        let cap_note = args.limit.filter(|limit| *limit > configured_cap).map(|limit| {
+            format!("[limit {limit} exceeds the cap {configured_cap}; showing up to {configured_cap}]")
+        });
         // Arguments are validated before any permission effect, so a prompt is
         // never raised for a call that fails on its own arguments.
         let coaching =
@@ -2504,9 +2505,11 @@ impl Tool for FindFilesTool {
             .await?;
             (bound, coaching)
         };
-        let coaching = combine_coaching(coaching, path_coaching);
+        let coaching = combine_coaching(combine_coaching(coaching, path_coaching), cap_note);
 
-        let max_results = args.limit.unwrap_or(configured_cap);
+        let max_results = args
+            .limit
+            .map_or(configured_cap, |limit| limit.min(configured_cap));
         let offset = args.offset.unwrap_or(0);
         // The heap keeps the first `offset + page` matches in stable order.
         let keep = offset.saturating_add(max_results);

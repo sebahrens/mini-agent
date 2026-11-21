@@ -2281,7 +2281,8 @@ saved session under the retention limits above.
   cap drops lines and the full output was saved to a log, the omission marker names the log instead
   of suggesting a re-run.
 - `grep`, `find_files` and `list_dir` validate arguments before any permission prompt, and all
-  three reject a per-call cap of 0 or above the configured cap with an example. `grep` context
+  three reject a per-call cap of 0 with an example, and serve one above the configured cap at the
+  cap with a one-line note. `grep` context
   lines use the same shape as match lines: `path:N:text` and `path:N-text`.
 - Numeric and boolean arguments of the built-in tools also accept string spellings (`"200"`,
   `"true"`) and integral floats; other type errors name the field.

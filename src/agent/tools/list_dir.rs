@@ -213,19 +213,19 @@ impl Tool for ListDirTool {
             )));
         }
         let configured_cap = self.max_entries.and_then(|cap| usize::try_from(cap).ok());
-        if args
-            .limit
-            .is_some_and(|limit| limit == 0 || configured_cap.is_some_and(|cap| limit > cap))
-        {
-            let cap = configured_cap.map_or_else(
-                || "the configured cap".to_string(),
-                |cap| format!("the configured cap {cap}"),
-            );
-            return Err(ToolError::Msg(format!(
-                "list_dir limit must be between 1 and {cap}. Example: {{\"path\":\"src\",\"limit\":{}}}",
-                configured_cap.map_or(100, |cap| cap.min(100))
-            )));
+        if args.limit == Some(0) {
+            return Err(ToolError::Msg(
+                "list_dir limit must be at least 1. Example: {\"path\":\"src\",\"limit\":100}"
+                    .to_string(),
+            ));
         }
+        // A request above the configured cap is served at the cap and says so.
+        let cap_note = configured_cap
+            .zip(args.limit)
+            .filter(|(cap, limit)| limit > cap)
+            .map(|(cap, limit)| {
+                format!("[limit {limit} exceeds the cap {cap}; showing up to {cap}]")
+            });
         let offset = args.offset.unwrap_or(0);
         crate::agent::tools::validate_workspace_binding(self.workspace.as_ref())?;
         let target = crate::agent::tools::resolve_tool_target(
@@ -304,6 +304,7 @@ impl Tool for ListDirTool {
             .await?;
             (bound, coaching)
         };
+        let coaching = crate::agent::tools::combine_coaching(coaching, cap_note);
 
         let coverage = bound_directory.listing_coverage();
         let ignore_mode = bound_directory.ignore_mode();

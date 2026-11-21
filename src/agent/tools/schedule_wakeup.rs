@@ -74,8 +74,10 @@ fn single_line_reason(reason: &str) -> String {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ScheduleWakeupArgs {
+    #[serde(deserialize_with = "crate::agent::tools::lenient::delay_secs_i64")]
     pub delay_secs: i64,
     pub reason: String,
+    #[serde(deserialize_with = "crate::agent::tools::lenient::noop_flag")]
     pub noop: bool,
 }
 

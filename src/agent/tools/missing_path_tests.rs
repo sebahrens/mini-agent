@@ -94,8 +94,8 @@ async fn missing_paths_name_the_tool_and_path_for_every_path_tool() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
-// mini-agent-sskdu.97: the three search tools reject a per-call cap of 0 or
-// above the configured cap the same way, and grep keeps one line shape.
+// mini-agent-sskdu.97: the three search tools reject a per-call cap of 0, serve
+// one above the configured cap at the cap with a note, and grep keeps one line shape.
 #[tokio::test]
 async fn search_tools_share_one_cap_policy_and_line_shape() {
     let base = std::env::temp_dir()
@@ -104,40 +104,61 @@ async fn search_tools_share_one_cap_policy_and_line_shape() {
         .join(format!("mini-agent-cap-policy-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&base).unwrap();
     std::fs::write(base.join("f.txt"), "one\nneedle\nthree\n").unwrap();
-    for (tool, error) in [
+    let zero = [
         (
             "grep",
             GrepTool::new(None, None, 5)
                 .with_workspace(base.clone())
-                .call(args(serde_json::json!({"pattern": "x", "max_results": 6})))
-                .await
-                .unwrap_err()
-                .to_string(),
+                .call(args(serde_json::json!({"pattern": "x", "max_results": 0})))
+                .await,
         ),
         (
             "find_files",
             FindFilesTool::new(None, None, 5)
                 .with_workspace(base.clone())
                 .call(args(serde_json::json!({"pattern": "*", "limit": 0})))
-                .await
-                .unwrap_err()
-                .to_string(),
+                .await,
         ),
         (
             "list_dir",
             ListDirTool::new(None, None, Some(5))
                 .with_workspace(base.clone())
-                .call(args(serde_json::json!({"limit": 6})))
-                .await
-                .unwrap_err()
-                .to_string(),
+                .call(args(serde_json::json!({"limit": 0})))
+                .await,
         ),
-    ] {
+    ];
+    for (tool, result) in zero {
+        let error = result.unwrap_err().to_string();
         assert!(
-            error.starts_with(&format!("{tool} ")) && error.contains("between 1 and"),
+            error.starts_with(&format!("{tool} ")) && error.contains("at least 1"),
             "{error}"
         );
         assert!(error.contains("Example:"), "{error}");
+    }
+    let over = [
+        GrepTool::new(None, None, 5)
+            .with_workspace(base.clone())
+            .call(args(
+                serde_json::json!({"pattern": "needle", "max_results": 500}),
+            ))
+            .await
+            .unwrap(),
+        FindFilesTool::new(None, None, 5)
+            .with_workspace(base.clone())
+            .call(args(serde_json::json!({"pattern": "*", "limit": 500})))
+            .await
+            .unwrap(),
+        ListDirTool::new(None, None, Some(5))
+            .with_workspace(base.clone())
+            .call(args(serde_json::json!({"limit": 500})))
+            .await
+            .unwrap(),
+    ];
+    for result in over {
+        assert!(
+            result.contains("500 exceeds the cap 5; showing up to 5"),
+            "{result}"
+        );
     }
     let result = GrepTool::new(None, None, 5)
         .with_workspace(base.clone())

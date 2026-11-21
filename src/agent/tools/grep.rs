@@ -867,17 +867,25 @@ impl Tool for GrepTool {
                 "grep files_only and count modes are mutually exclusive".to_string(),
             ));
         }
-        let max_results = args.max_results.unwrap_or(self.max_results);
-        if args
-            .max_results
-            .is_some_and(|limit| limit == 0 || limit > self.max_results)
-        {
-            return Err(ToolError::Msg(format!(
-                "grep max_results must be between 1 and the configured cap {}. Example: {{\"pattern\":\"TODO\",\"max_results\":{}}}",
-                self.max_results,
-                self.max_results.min(50)
-            )));
+        if args.max_results == Some(0) {
+            return Err(ToolError::Msg(
+                "grep max_results must be at least 1. Example: {\"pattern\":\"TODO\",\"max_results\":50}"
+                    .to_string(),
+            ));
         }
+        // A request above the configured cap is served at the cap and says so.
+        let cap_note = args
+            .max_results
+            .filter(|limit| *limit > self.max_results)
+            .map(|limit| {
+                format!(
+                    "[max_results {limit} exceeds the cap {}; showing up to {}]",
+                    self.max_results, self.max_results
+                )
+            });
+        let max_results = args
+            .max_results
+            .map_or(self.max_results, |limit| limit.min(self.max_results));
         let re = RegexBuilder::new(&args.pattern)
             .case_insensitive(args.case_insensitive)
             .dot_matches_new_line(args.multiline)
@@ -977,7 +985,7 @@ impl Tool for GrepTool {
             .await?;
             (target, coaching)
         };
-        let coaching = combine_coaching(coaching, path_coaching);
+        let coaching = combine_coaching(combine_coaching(coaching, path_coaching), cap_note);
         let context = args.context_lines.unwrap_or(0);
 
         let include_re = args

@@ -67,9 +67,18 @@ where
         })
 }
 
-fn boolean<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D::Error> {
+fn boolean<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    field: &str,
+) -> Result<Option<bool>, D::Error> {
     let Some(value) = Option::<Value>::deserialize(deserializer)? else {
         return Ok(None);
+    };
+    let bad = || {
+        D::Error::custom(format!(
+            "{field}: expected a boolean (true or false), got {}",
+            describe(&value)
+        ))
     };
     match &value {
         Value::Null => Ok(None),
@@ -77,28 +86,103 @@ fn boolean<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<bool>, D
         Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
             "true" => Ok(Some(true)),
             "false" => Ok(Some(false)),
-            _ => Err(D::Error::custom(format!(
-                "expected a boolean (true or false), got {}",
-                describe(&value)
-            ))),
+            _ => Err(bad()),
         },
-        _ => Err(D::Error::custom(format!(
-            "expected a boolean (true or false), got {}",
-            describe(&value)
-        ))),
+        _ => Err(bad()),
     }
 }
 
 /// A boolean that defaults to false and also accepts `"true"` / `"false"`.
-pub(crate) fn flag<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
-    boolean(deserializer).map(Option::unwrap_or_default)
+pub(crate) fn flag<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    field: &str,
+) -> Result<bool, D::Error> {
+    boolean(deserializer, field).map(Option::unwrap_or_default)
 }
 
-/// An optional boolean that also accepts `"true"` / `"false"`.
-pub(crate) fn optional_flag<'de, D: Deserializer<'de>>(
+/// A required boolean that also accepts `"true"` / `"false"`.
+pub(crate) fn required_flag<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    field: &str,
+) -> Result<bool, D::Error> {
+    boolean(deserializer, field)?
+        .ok_or_else(|| D::Error::custom(format!("{field}: expected a boolean, got null")))
+}
+
+/// A required signed integer that also accepts `"30"` and `30.0`.
+pub(crate) fn required_i64<'de, D: Deserializer<'de>>(
+    deserializer: D,
+    field: &str,
+) -> Result<i64, D::Error> {
+    let value = Value::deserialize(deserializer)?;
+    let parsed = match &value {
+        Value::Number(number) => number.as_i64().or_else(|| {
+            number
+                .as_f64()
+                .filter(|n| n.fract() == 0.0)
+                .map(|n| n as i64)
+        }),
+        Value::String(text) => text.trim().parse::<i64>().ok().or_else(|| {
+            text.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|n| n.fract() == 0.0)
+                .map(|n| n as i64)
+        }),
+        _ => None,
+    };
+    parsed.ok_or_else(|| {
+        D::Error::custom(format!(
+            "{field}: expected an integer, got {}",
+            describe(&value)
+        ))
+    })
+}
+
+/// Define a named `deserialize_with` function for one boolean field so the
+/// error message can name it.
+macro_rules! flag_field {
+    ($name:ident, $field:literal) => {
+        pub(crate) fn $name<'de, D: serde::Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<bool, D::Error> {
+            $crate::agent::tools::lenient::flag(deserializer, $field)
+        }
+    };
+}
+
+flag_field!(raw_notebook_flag, "raw_notebook");
+flag_field!(overwrite_flag, "overwrite");
+flag_field!(replace_all_flag, "replace_all");
+flag_field!(fuzzy_flag, "fuzzy");
+flag_field!(background_flag, "background");
+flag_field!(pty_flag, "pty");
+flag_field!(separate_streams_flag, "separate_streams");
+flag_field!(escalate_flag, "escalate");
+flag_field!(case_insensitive_flag, "case_insensitive");
+flag_field!(files_only_flag, "files_only");
+flag_field!(count_flag, "count");
+flag_field!(multiline_flag, "multiline");
+flag_field!(no_ignore_flag, "no_ignore");
+
+pub(crate) fn auto_background_flag<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<bool>, D::Error> {
-    boolean(deserializer)
+    boolean(deserializer, "auto_background")
+}
+
+pub(crate) fn full_text_flag<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<bool>, D::Error> {
+    boolean(deserializer, "full_text")
+}
+
+pub(crate) fn noop_flag<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    required_flag(deserializer, "noop")
+}
+
+pub(crate) fn delay_secs_i64<'de, D: Deserializer<'de>>(deserializer: D) -> Result<i64, D::Error> {
+    required_i64(deserializer, "delay_secs")
 }
 
 /// Define a named `deserialize_with` function for one integer field so the
@@ -123,6 +207,15 @@ integer_field!(character_limit_usize, "character_limit", usize);
 integer_field!(max_results_u64, "max_results", u64);
 integer_field!(since_u64, "since", u64);
 integer_field!(timeout_ms_u64, "timeout_ms", u64);
+integer_field!(wait_ms_u64, "wait_ms", u64);
+integer_field!(line_u32, "line", u32);
+integer_field!(column_u32, "column", u32);
+integer_field!(end_line_u32, "end_line", u32);
+integer_field!(end_column_u32, "end_column", u32);
+integer_field!(action_u32, "action", u32);
+integer_field!(edit_usize, "edit", usize);
+integer_field!(text_offset_usize, "text_offset", usize);
+integer_field!(cell_index_usize, "cell_index", usize);
 
 /// Shell deadline in milliseconds. Values from 1 to 999 are refused with the
 /// seconds/milliseconds hint: a model thinking in seconds (`"timeout": 120`)
@@ -205,7 +298,17 @@ mod tests {
             "{error}"
         );
         let error = error_of::<GrepArgs>(json!({"pattern":"x","count":"maybe"}));
-        assert!(error.contains("expected a boolean"), "{error}");
+        assert!(
+            error.contains("count: expected a boolean (true or false), got the string \"maybe\""),
+            "{error}"
+        );
+        let error = error_of::<crate::agent::tools::WriteArgs>(
+            json!({"path":"a","content":"b","overwrite":3}),
+        );
+        assert!(error.contains("overwrite: expected a boolean"), "{error}");
+        let wake: crate::agent::tools::schedule_wakeup::ScheduleWakeupArgs =
+            serde_json::from_value(json!({"delay_secs":"30","reason":"r","noop":"false"})).unwrap();
+        assert_eq!((wake.delay_secs, wake.noop), (30, false));
     }
 
     // mini-agent-sskdu.183: shell timeouts are milliseconds; sub-second values
