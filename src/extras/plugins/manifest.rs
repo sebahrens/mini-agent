@@ -58,13 +58,21 @@ pub(crate) struct Components {
 
 fn is_plain(path: &Path) -> bool {
     !path.as_os_str().is_empty()
-        && path.components().all(|c| matches!(c, std::path::Component::Normal(_) | std::path::Component::CurDir))
+        && path.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
 }
 
 fn read_json(path: &Path) -> Result<Value, String> {
     let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
-        return Err(format!("{} is not a regular file under 1 MiB", path.display()));
+        return Err(format!(
+            "{} is not a regular file under 1 MiB",
+            path.display()
+        ));
     }
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))
@@ -82,9 +90,17 @@ pub(crate) fn read_manifest(root: &Path) -> Result<(Manifest, Value), String> {
             "plugin name '{name}' must be lowercase letters, digits and single hyphens (at most 32)"
         ));
     }
-    let text = |key: &str| json.get(key).and_then(Value::as_str).map(|s| s.chars().take(200).collect());
+    let text = |key: &str| {
+        json.get(key)
+            .and_then(Value::as_str)
+            .map(|s| s.chars().take(200).collect())
+    };
     Ok((
-        Manifest { name: name.to_owned(), version: text("version"), description: text("description") },
+        Manifest {
+            name: name.to_owned(),
+            version: text("version"),
+            description: text("description"),
+        },
         json,
     ))
 }
@@ -112,21 +128,26 @@ fn dirs_for(json: &Value, key: &str, default: &str) -> Result<Vec<PathBuf>, Stri
 
 fn md_files(root: &Path, dir: &Path) -> Vec<(PathBuf, PathBuf)> {
     fn walk(base: &Path, dir: &Path, out: &mut Vec<(PathBuf, PathBuf)>, depth: usize) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         let mut entries: Vec<_> = entries.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             if kind.is_symlink() {
                 continue;
             }
             let path = entry.path();
             if kind.is_dir() && depth < 3 {
                 walk(base, &path, out, depth + 1);
-            } else if kind.is_file() && path.extension().is_some_and(|e| e == "md") {
-                if let Ok(rel) = path.strip_prefix(base) {
-                    out.push((rel.to_path_buf(), path.clone()));
-                }
+            } else if kind.is_file()
+                && path.extension().is_some_and(|e| e == "md")
+                && let Ok(rel) = path.strip_prefix(base)
+            {
+                out.push((rel.to_path_buf(), path.clone()));
             }
         }
     }
@@ -140,7 +161,9 @@ fn md_files(root: &Path, dir: &Path) -> Vec<(PathBuf, PathBuf)> {
 
 fn hook_groups(value: &Value) -> Vec<HookGroup> {
     let events = value.get("hooks").unwrap_or(value);
-    let Some(events) = events.as_object() else { return Vec::new() };
+    let Some(events) = events.as_object() else {
+        return Vec::new();
+    };
     events
         .iter()
         .flat_map(|(event, groups)| {
@@ -149,13 +172,21 @@ fn hook_groups(value: &Value) -> Vec<HookGroup> {
                 .into_iter()
                 .flatten()
                 .filter(|group| group.is_object())
-                .map(|group| HookGroup { event: event.clone(), group: group.clone() })
+                .map(|group| HookGroup {
+                    event: event.clone(),
+                    group: group.clone(),
+                })
         })
         .collect()
 }
 
 /// A manifest value that is either inline JSON or a path to a JSON file.
-fn inline_or_file(root: &Path, json: &Value, key: &str, default_file: &str) -> Result<Option<Value>, String> {
+fn inline_or_file(
+    root: &Path,
+    json: &Value,
+    key: &str,
+    default_file: &str,
+) -> Result<Option<Value>, String> {
     match json.get(key) {
         Some(Value::Object(_)) => Ok(json.get(key).cloned()),
         Some(Value::String(path)) => {
@@ -181,7 +212,10 @@ pub(crate) fn discover(root: &Path, json: &Value) -> Result<Components, String> 
     for dir in dirs_for(json, "commands", "commands")? {
         for (rel_to_dir, rel) in md_files(root, &dir) {
             let stem = rel_to_dir.with_extension("");
-            let parts: Vec<String> = stem.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect();
+            let parts: Vec<String> = stem
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
             if parts.len() > 3 || parts.iter().any(|p| p.is_empty()) {
                 continue;
             }
@@ -197,13 +231,17 @@ pub(crate) fn discover(root: &Path, json: &Value) -> Result<Components, String> 
                 continue;
             }
             let name = rel_to_dir.with_extension("").to_string_lossy().into_owned();
-            if crate::context::agents::valid_agent_name(&name) && !found.agents.iter().any(|a| a.name == name) {
+            if crate::context::agents::valid_agent_name(&name)
+                && !found.agents.iter().any(|a| a.name == name)
+            {
                 found.agents.push(Part { name, rel });
             }
         }
     }
     for dir in dirs_for(json, "skills", "skills")? {
-        let Ok(entries) = std::fs::read_dir(root.join(&dir)) else { continue };
+        let Ok(entries) = std::fs::read_dir(root.join(&dir)) else {
+            continue;
+        };
         let mut names: Vec<String> = entries
             .flatten()
             .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
@@ -213,7 +251,10 @@ pub(crate) fn discover(root: &Path, json: &Value) -> Result<Components, String> 
         names.sort();
         for name in names {
             if !found.skills.iter().any(|s| s.name == name) {
-                found.skills.push(Part { rel: dir.join(&name), name });
+                found.skills.push(Part {
+                    rel: dir.join(&name),
+                    name,
+                });
             }
         }
     }
@@ -261,7 +302,11 @@ pub(crate) fn content_hash(root: &Path) -> Result<String, String> {
         hasher.update((bytes.len() as u64).to_le_bytes());
         hasher.update(&bytes);
     }
-    Ok(hasher.finalize().iter().map(|b| format!("{b:02x}")).collect())
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// Copy a plugin tree into `to`, skipping `.git`, refusing symbolic links and
@@ -276,7 +321,10 @@ pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
             return Err("plugin directory nesting is too deep".into());
         }
         std::fs::create_dir_all(to).map_err(|e| format!("cannot create {}: {e}", to.display()))?;
-        for entry in std::fs::read_dir(from).map_err(|e| format!("{}: {e}", from.display()))?.flatten() {
+        for entry in std::fs::read_dir(from)
+            .map_err(|e| format!("{}: {e}", from.display()))?
+            .flatten()
+        {
             let name = entry.file_name();
             if name == ".git" {
                 continue;
@@ -284,7 +332,10 @@ pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
             let kind = entry.file_type().map_err(|e| e.to_string())?;
             let source = entry.path();
             if kind.is_symlink() {
-                return Err(format!("{} is a symbolic link; plugins may not contain links", source.display()));
+                return Err(format!(
+                    "{} is a symbolic link; plugins may not contain links",
+                    source.display()
+                ));
             }
             if kind.is_dir() {
                 walk(&source, &to.join(&name), budget, depth + 1)?;
@@ -292,10 +343,17 @@ pub(crate) fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
                 let len = entry.metadata().map_err(|e| e.to_string())?.len();
                 budget.files += 1;
                 budget.bytes += len;
-                if budget.files > MAX_FILES || len > MAX_FILE_BYTES || budget.bytes > MAX_TOTAL_BYTES {
-                    return Err("plugin is too large (limits: 512 files, 1 MiB per file, 8 MiB total)".into());
+                if budget.files > MAX_FILES
+                    || len > MAX_FILE_BYTES
+                    || budget.bytes > MAX_TOTAL_BYTES
+                {
+                    return Err(
+                        "plugin is too large (limits: 512 files, 1 MiB per file, 8 MiB total)"
+                            .into(),
+                    );
                 }
-                std::fs::copy(&source, to.join(&name)).map_err(|e| format!("cannot copy {}: {e}", source.display()))?;
+                std::fs::copy(&source, to.join(&name))
+                    .map_err(|e| format!("cannot copy {}: {e}", source.display()))?;
             }
         }
         Ok(())
@@ -314,10 +372,22 @@ pub(crate) mod fixture {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, text).unwrap();
         };
-        w(".claude-plugin/plugin.json", &format!("{{\"name\":\"{name}\",\"version\":\"1.0.0\",\"description\":\"fixture\"}}"));
-        w("commands/ship.md", "---\ndescription: ship it\n---\nShip $ARGUMENTS");
-        w("agents/reviewer.md", "---\nname: reviewer\ndescription: reviews\n---\nYou review.");
-        w("skills/lint/SKILL.md", "---\nname: lint\ndescription: lints\n---\nLint.");
+        w(
+            ".claude-plugin/plugin.json",
+            &format!("{{\"name\":\"{name}\",\"version\":\"1.0.0\",\"description\":\"fixture\"}}"),
+        );
+        w(
+            "commands/ship.md",
+            "---\ndescription: ship it\n---\nShip $ARGUMENTS",
+        );
+        w(
+            "agents/reviewer.md",
+            "---\nname: reviewer\ndescription: reviews\n---\nYou review.",
+        );
+        w(
+            "skills/lint/SKILL.md",
+            "---\nname: lint\ndescription: lints\n---\nLint.",
+        );
         w(
             "hooks/hooks.json",
             "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Bash\",\"hooks\":[{\"type\":\"command\",\"command\":\"${CLAUDE_PLUGIN_ROOT}/guard.sh\",\"args\":[]}]}]}}",
@@ -336,12 +406,22 @@ mod tests {
 
     #[test]
     fn names_manifest_and_all_five_components_are_discovered() {
-        let root = std::env::temp_dir().join(format!("mini-agent-plugin-man-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-plugin-man-{}", uuid::Uuid::new_v4()));
         fixture::write_plugin(&root, "acme");
         let (manifest, json) = read_manifest(&root).unwrap();
-        assert_eq!((manifest.name.as_str(), manifest.version.as_deref()), ("acme", Some("1.0.0")));
+        assert_eq!(
+            (manifest.name.as_str(), manifest.version.as_deref()),
+            ("acme", Some("1.0.0"))
+        );
         let found = discover(&root, &json).unwrap();
-        assert_eq!(found.commands, vec![Part { name: "ship".into(), rel: "commands/ship.md".into() }]);
+        assert_eq!(
+            found.commands,
+            vec![Part {
+                name: "ship".into(),
+                rel: "commands/ship.md".into()
+            }]
+        );
         assert_eq!(found.agents[0].name, "reviewer");
         assert_eq!(found.skills[0].name, "lint");
         assert_eq!(found.hooks.len(), 1);
@@ -368,7 +448,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn copying_refuses_links_and_skips_git() {
-        let root = std::env::temp_dir().join(format!("mini-agent-plugin-copy-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-plugin-copy-{}", uuid::Uuid::new_v4()));
         fixture::write_plugin(&root.join("src"), "acme");
         std::fs::create_dir_all(root.join("src/.git")).unwrap();
         std::fs::write(root.join("src/.git/config"), "x").unwrap();
@@ -376,7 +457,11 @@ mod tests {
         assert!(root.join("dst/commands/ship.md").is_file());
         assert!(!root.join("dst/.git").exists());
         std::os::unix::fs::symlink("/etc/hosts", root.join("src/link")).unwrap();
-        assert!(copy_tree(&root.join("src"), &root.join("dst2")).unwrap_err().contains("symbolic link"));
+        assert!(
+            copy_tree(&root.join("src"), &root.join("dst2"))
+                .unwrap_err()
+                .contains("symbolic link")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -72,22 +72,50 @@ fn push_unique(map: &mut BTreeMap<String, Vec<String>>, tool: &str, pattern: Str
 
 fn secret_name(name: &str) -> bool {
     let upper = name.to_ascii_uppercase();
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "AUTH", "CREDENTIAL", "COOKIE"]
-        .iter()
-        .any(|word| upper.contains(word))
+    [
+        "KEY",
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "AUTH",
+        "CREDENTIAL",
+        "COOKIE",
+    ]
+    .iter()
+    .any(|word| upper.contains(word))
 }
 
 fn secret_value(value: &str) -> bool {
     let v = value.trim();
-    ["sk-", "ghp_", "gho_", "ghs_", "github_pat_", "xoxb-", "xoxp-", "AKIA", "AIza", "eyJ", "Bearer ", "Basic "]
-        .iter()
-        .any(|prefix| v.starts_with(prefix))
+    [
+        "sk-",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "AKIA",
+        "AIza",
+        "eyJ",
+        "Bearer ",
+        "Basic ",
+    ]
+    .iter()
+    .any(|prefix| v.starts_with(prefix))
 }
 
 fn placeholder_name(server: &str, name: &str) -> String {
     let clean = |text: &str| {
         text.chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+            .map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    c.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
             .collect::<String>()
     };
     format!("MCP_{}_{}", clean(server), clean(name))
@@ -106,7 +134,11 @@ fn clean_map(
         // An existing `${VAR}` reference is not a secret, it is a reference.
         let is_reference = text.contains("${");
         if !is_reference && (secret_name(name) || secret_value(text)) {
-            let var = if kind == "env" { name.clone() } else { placeholder_name(server, name) };
+            let var = if kind == "env" {
+                name.clone()
+            } else {
+                placeholder_name(server, name)
+            };
             let replacement = if kind == "env" {
                 format!("${{{var}}}")
             } else if let Some(rest) = text.strip_prefix("Bearer ") {
@@ -128,13 +160,16 @@ fn clean_map(
 
 fn valid_server_name(name: &str) -> bool {
     (1..=64).contains(&name.chars().count())
-        && name.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// One `mcpServers` entry in Claude Code / `.mcp.json` shape.
 pub(crate) fn claude_server(name: &str, entry: &Json, plan: &mut Plan) {
     let Some(object) = entry.as_object() else {
-        plan.unsupported.push(format!("MCP server '{name}': not an object"));
+        plan.unsupported
+            .push(format!("MCP server '{name}': not an object"));
         return;
     };
     let kind = object.get("type").and_then(Json::as_str).unwrap_or("stdio");
@@ -142,7 +177,8 @@ pub(crate) fn claude_server(name: &str, entry: &Json, plan: &mut Plan) {
     match kind {
         "stdio" => {
             let Some(command) = object.get("command").and_then(Json::as_str) else {
-                plan.unsupported.push(format!("MCP server '{name}': no command"));
+                plan.unsupported
+                    .push(format!("MCP server '{name}': no command"));
                 return;
             };
             table.insert("command".into(), toml::Value::String(command.to_owned()));
@@ -163,7 +199,8 @@ pub(crate) fn claude_server(name: &str, entry: &Json, plan: &mut Plan) {
         }
         "http" | "sse" | "streamable-http" => {
             let Some(url) = object.get("url").and_then(Json::as_str) else {
-                plan.unsupported.push(format!("MCP server '{name}': no url"));
+                plan.unsupported
+                    .push(format!("MCP server '{name}': no url"));
                 return;
             };
             table.insert("url".into(), toml::Value::String(url.to_owned()));
@@ -178,13 +215,15 @@ pub(crate) fn claude_server(name: &str, entry: &Json, plan: &mut Plan) {
             }
         }
         other => {
-            plan.unsupported
-                .push(format!("MCP server '{name}': transport '{other}' is not supported"));
+            plan.unsupported.push(format!(
+                "MCP server '{name}': transport '{other}' is not supported"
+            ));
             return;
         }
     }
     if !valid_server_name(name) {
-        plan.unsupported.push(format!("MCP server '{name}': the name is not usable here"));
+        plan.unsupported
+            .push(format!("MCP server '{name}': the name is not usable here"));
         return;
     }
     plan.mcp.insert(name.to_owned(), table);
@@ -220,7 +259,9 @@ fn claude_rule(rule: &str, mode: &str, plan: &mut Plan) {
         None => (rule.trim(), None),
     };
     let Some(tools) = tool_for_claude(name) else {
-        plan.unsupported.push(format!("{mode} rule '{rule}': tool '{name}' has no equivalent"));
+        plan.unsupported.push(format!(
+            "{mode} rule '{rule}': tool '{name}' has no equivalent"
+        ));
         return;
     };
     for tool in tools {
@@ -228,9 +269,9 @@ fn claude_rule(rule: &str, mode: &str, plan: &mut Plan) {
             ("bash", None) => match mode {
                 "deny" => push_unique(&mut plan.deny, tool, "**".into()),
                 "ask" => push_unique(&mut plan.ask, tool, "**".into()),
-                _ => plan
-                    .unsupported
-                    .push(format!("allow rule '{rule}': an unrestricted Bash allow is not imported")),
+                _ => plan.unsupported.push(format!(
+                    "allow rule '{rule}': an unrestricted Bash allow is not imported"
+                )),
             },
             ("bash", Some(command)) => {
                 let prefix = command
@@ -242,11 +283,19 @@ fn claude_rule(rule: &str, mode: &str, plan: &mut Plan) {
                     }
                     ("allow", None) => push_unique(&mut plan.allow, tool, command.to_owned()),
                     (mode, Some(prefix)) => {
-                        let map = if mode == "deny" { &mut plan.deny } else { &mut plan.ask };
+                        let map = if mode == "deny" {
+                            &mut plan.deny
+                        } else {
+                            &mut plan.ask
+                        };
                         push_unique(map, tool, format!("{prefix} *"));
                     }
                     (mode, None) => {
-                        let map = if mode == "deny" { &mut plan.deny } else { &mut plan.ask };
+                        let map = if mode == "deny" {
+                            &mut plan.deny
+                        } else {
+                            &mut plan.ask
+                        };
                         push_unique(map, tool, command.to_owned());
                     }
                 }
@@ -283,7 +332,10 @@ fn claude_model(model: &str) -> Option<String> {
 }
 
 /// Convert Claude Code's `settings.json` and `.claude.json` contents.
-pub(crate) fn plan_claude(settings: Option<&str>, claude_json: Option<&str>) -> Result<Plan, String> {
+pub(crate) fn plan_claude(
+    settings: Option<&str>,
+    claude_json: Option<&str>,
+) -> Result<Plan, String> {
     let mut plan = Plan::default();
     if let Some(text) = settings {
         let json: Json = serde_json::from_str(text).map_err(|e| format!("settings.json: {e}"))?;
@@ -313,13 +365,22 @@ pub(crate) fn plan_claude(settings: Option<&str>, claude_json: Option<&str>) -> 
             }
         }
         if let Some(hooks) = json.get("hooks").and_then(Json::as_object) {
-            let groups: usize = hooks.values().filter_map(Json::as_array).map(Vec::len).sum();
+            let groups: usize = hooks
+                .values()
+                .filter_map(Json::as_array)
+                .map(Vec::len)
+                .sum();
             plan.actions.push(format!(
                 "{groups} hook group(s) in settings.json were not imported (global hooks are trusted without a prompt); review them and copy the ones you want into the mini-agent settings.json"
             ));
         }
-        if json.get("env").and_then(Json::as_object).is_some_and(|e| !e.is_empty()) {
-            plan.unsupported.push("env: session environment variables are not imported".into());
+        if json
+            .get("env")
+            .and_then(Json::as_object)
+            .is_some_and(|e| !e.is_empty())
+        {
+            plan.unsupported
+                .push("env: session environment variables are not imported".into());
         }
     }
     if let Some(text) = claude_json {
@@ -329,9 +390,17 @@ pub(crate) fn plan_claude(settings: Option<&str>, claude_json: Option<&str>) -> 
                 claude_server(name, entry, &mut plan);
             }
         }
-        if json.get("projects").and_then(Json::as_object).is_some_and(|p| {
-            p.values().any(|v| v.get("mcpServers").and_then(Json::as_object).is_some_and(|m| !m.is_empty()))
-        }) {
+        if json
+            .get("projects")
+            .and_then(Json::as_object)
+            .is_some_and(|p| {
+                p.values().any(|v| {
+                    v.get("mcpServers")
+                        .and_then(Json::as_object)
+                        .is_some_and(|m| !m.is_empty())
+                })
+            })
+        {
             plan.unsupported
                 .push("per-project MCP servers in .claude.json are not imported".into());
         }
@@ -356,25 +425,32 @@ pub(crate) fn plan_codex(config: &str) -> Result<Plan, String> {
     }
     for key in ["approval_policy", "sandbox_mode"] {
         if let Some(setting) = value.get(key).and_then(toml::Value::as_str) {
-            plan.unsupported
-                .push(format!("{key} = \"{setting}\": use --mode / --sandbox profiles instead"));
+            plan.unsupported.push(format!(
+                "{key} = \"{setting}\": use --mode / --sandbox profiles instead"
+            ));
         }
     }
     if let Some(servers) = value.get("mcp_servers").and_then(toml::Value::as_table) {
         for (name, entry) in servers {
             // Reuse the JSON converter through a JSON view of the entry.
             let mut json = serde_json::to_value(entry).map_err(|e| e.to_string())?;
-            if let Some(object) = json.as_object_mut() {
-                if object.contains_key("url") {
-                    object.entry("type").or_insert(Json::String("http".into()));
-                    if let Some(var) = object.remove("bearer_token_env_var").and_then(|v| v.as_str().map(str::to_owned)) {
-                        object
-                            .entry("headers")
-                            .or_insert_with(|| Json::Object(Default::default()))
-                            .as_object_mut()
-                            .expect("headers object")
-                            .insert("Authorization".into(), Json::String(format!("Bearer ${{{var}}}")));
-                    }
+            if let Some(object) = json.as_object_mut()
+                && object.contains_key("url")
+            {
+                object.entry("type").or_insert(Json::String("http".into()));
+                if let Some(var) = object
+                    .remove("bearer_token_env_var")
+                    .and_then(|v| v.as_str().map(str::to_owned))
+                {
+                    object
+                        .entry("headers")
+                        .or_insert_with(|| Json::Object(Default::default()))
+                        .as_object_mut()
+                        .expect("headers object")
+                        .insert(
+                            "Authorization".into(),
+                            Json::String(format!("Bearer ${{{var}}}")),
+                        );
                 }
             }
             claude_server(name, &json, &mut plan);
@@ -391,14 +467,18 @@ pub(crate) fn plan_opencode(config: &str) -> Result<Plan, String> {
         if model.contains('/') {
             plan.model = Some(model.to_owned());
         } else {
-            plan.unsupported.push(format!("model '{model}': choose it with /model"));
+            plan.unsupported
+                .push(format!("model '{model}': choose it with /model"));
         }
     }
     if let Some(servers) = json.get("mcp").and_then(Json::as_object) {
         for (name, entry) in servers {
-            let Some(object) = entry.as_object() else { continue };
+            let Some(object) = entry.as_object() else {
+                continue;
+            };
             if object.get("enabled") == Some(&Json::Bool(false)) {
-                plan.unsupported.push(format!("MCP server '{name}': disabled in opencode"));
+                plan.unsupported
+                    .push(format!("MCP server '{name}': disabled in opencode"));
                 continue;
             }
             let mut converted = serde_json::Map::new();
@@ -412,7 +492,8 @@ pub(crate) fn plan_opencode(config: &str) -> Result<Plan, String> {
                         .filter_map(Json::as_str)
                         .collect();
                     let Some((program, args)) = command.split_first() else {
-                        plan.unsupported.push(format!("MCP server '{name}': no command"));
+                        plan.unsupported
+                            .push(format!("MCP server '{name}': no command"));
                         continue;
                     };
                     converted.insert("command".into(), Json::String((*program).to_owned()));
@@ -454,7 +535,8 @@ pub(crate) fn plan_opencode(config: &str) -> Result<Plan, String> {
                 "grep" => "grep",
                 "webfetch" => "web_fetch",
                 other => {
-                    plan.unsupported.push(format!("permission.{other}: no equivalent"));
+                    plan.unsupported
+                        .push(format!("permission.{other}: no equivalent"));
                     continue;
                 }
             };
@@ -462,7 +544,9 @@ pub(crate) fn plan_opencode(config: &str) -> Result<Plan, String> {
                 Json::String(action) => vec![("**".to_owned(), action.clone())],
                 Json::Object(map) => map
                     .iter()
-                    .filter_map(|(pattern, action)| Some((pattern.clone(), action.as_str()?.to_owned())))
+                    .filter_map(|(pattern, action)| {
+                        Some((pattern.clone(), action.as_str()?.to_owned()))
+                    })
                     .collect(),
                 _ => Vec::new(),
             };
@@ -483,10 +567,14 @@ pub(crate) fn plan_opencode(config: &str) -> Result<Plan, String> {
 /// Markdown files below `dir`, relative paths kept.
 fn markdown_files(dir: &Path) -> Vec<PathBuf> {
     fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             if kind.is_symlink() {
                 continue;
             }
@@ -506,7 +594,10 @@ fn markdown_files(dir: &Path) -> Vec<PathBuf> {
 fn plan_copies(plan: &mut Plan, from: &Path, to: &Path) {
     for file in markdown_files(from) {
         if let Ok(relative) = file.strip_prefix(from) {
-            plan.files.push(FileCopy { from: file.clone(), to: to.join(relative) });
+            plan.files.push(FileCopy {
+                from: file.clone(),
+                to: to.join(relative),
+            });
         }
     }
 }
@@ -525,10 +616,17 @@ pub(crate) fn plan_from_home(
             let settings = read(home.join(".claude/settings.json"));
             let user = read(home.join(".claude.json"));
             if settings.is_none() && user.is_none() {
-                return Err("no Claude Code settings found (~/.claude/settings.json, ~/.claude.json)".into());
+                return Err(
+                    "no Claude Code settings found (~/.claude/settings.json, ~/.claude.json)"
+                        .into(),
+                );
             }
             let mut plan = plan_claude(settings.as_deref(), user.as_deref())?;
-            plan_copies(&mut plan, &home.join(".claude/commands"), &config_dir.join("commands"));
+            plan_copies(
+                &mut plan,
+                &home.join(".claude/commands"),
+                &config_dir.join("commands"),
+            );
             plan_copies(&mut plan, &home.join(".claude/agents"), agents_dir);
             plan
         }
@@ -536,7 +634,11 @@ pub(crate) fn plan_from_home(
             let text = read(home.join(".codex/config.toml"))
                 .ok_or("no Codex settings found (~/.codex/config.toml)")?;
             let mut plan = plan_codex(&text)?;
-            plan_copies(&mut plan, &home.join(".codex/prompts"), &config_dir.join("commands"));
+            plan_copies(
+                &mut plan,
+                &home.join(".codex/prompts"),
+                &config_dir.join("commands"),
+            );
             plan
         }
         Source::Opencode => {
@@ -565,9 +667,13 @@ fn string_array(items: &[String]) -> toml_edit::Array {
 
 /// Apply `plan` to the TOML text of the global config, preserving every
 /// existing key and comment. Returns the new text and what was skipped.
-pub(crate) fn apply_to_config(existing: &str, plan: &Plan) -> Result<(String, Vec<String>), String> {
-    let mut doc: toml_edit::DocumentMut =
-        existing.parse().map_err(|e| format!("the existing config.toml does not parse: {e}"))?;
+pub(crate) fn apply_to_config(
+    existing: &str,
+    plan: &Plan,
+) -> Result<(String, Vec<String>), String> {
+    let mut doc: toml_edit::DocumentMut = existing
+        .parse()
+        .map_err(|e| format!("the existing config.toml does not parse: {e}"))?;
     let mut skipped = Vec::new();
     if let Some(model) = &plan.model {
         if doc.contains_key("model") {
@@ -582,7 +688,9 @@ pub(crate) fn apply_to_config(existing: &str, plan: &Plan) -> Result<(String, Ve
             .and_then(|s| s.as_table_like())
             .is_some_and(|s| s.contains_key(name));
         if present {
-            skipped.push(format!("MCP server '{name}': already configured, kept yours"));
+            skipped.push(format!(
+                "MCP server '{name}': already configured, kept yours"
+            ));
             continue;
         }
         let servers = doc
@@ -622,7 +730,11 @@ pub(crate) fn apply_to_config(existing: &str, plan: &Plan) -> Result<(String, Ve
             let mut merged: Vec<String> = section
                 .get(tool)
                 .and_then(|v| v.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect()
+                })
                 .unwrap_or_default();
             for pattern in patterns {
                 if !merged.contains(pattern) {
@@ -681,7 +793,12 @@ pub(crate) fn diff_lines(before: &str, after: &str) -> Vec<String> {
 }
 
 /// The full preview shown before anything is written.
-pub(crate) fn preview(source: Source, plan: &Plan, config_diff: &[String], skipped: &[String]) -> String {
+pub(crate) fn preview(
+    source: Source,
+    plan: &Plan,
+    config_diff: &[String],
+    skipped: &[String],
+) -> String {
     let mut out = format!("Import from {}:\n", source.label());
     if config_diff.is_empty() && plan.files.is_empty() {
         out.push_str("\n  nothing to import.\n");
@@ -695,7 +812,11 @@ pub(crate) fn preview(source: Source, plan: &Plan, config_diff: &[String], skipp
     if !plan.files.is_empty() {
         out.push_str("\nfiles to copy:\n");
         for copy in &plan.files {
-            out.push_str(&format!("  + {}  <-  {}\n", copy.to.display(), copy.from.display()));
+            out.push_str(&format!(
+                "  + {}  <-  {}\n",
+                copy.to.display(),
+                copy.from.display()
+            ));
         }
     }
     for (title, items) in [
@@ -759,13 +880,19 @@ pub(crate) fn parse_invocation(args: &[std::ffi::OsString]) -> Option<Invocation
             Some("codex") if source.is_none() => source = Some(Source::Codex),
             Some("opencode") if source.is_none() => source = Some(Source::Opencode),
             Some(other) => {
-                return Some(Invocation::Invalid(format!("unexpected argument '{other}'")));
+                return Some(Invocation::Invalid(format!(
+                    "unexpected argument '{other}'"
+                )));
             }
             None => return Some(Invocation::Invalid("arguments must be valid UTF-8".into())),
         }
     }
     Some(match source {
-        Some(source) => Invocation::Run(ImportArgs { source, dry_run, yes }),
+        Some(source) => Invocation::Run(ImportArgs {
+            source,
+            dry_run,
+            yes,
+        }),
         None => Invocation::Invalid("choose one of claude, codex, opencode".into()),
     })
 }
@@ -842,7 +969,8 @@ pub(crate) fn run(args: ImportArgs) -> i32 {
 fn write_all(config_path: &Path, existing: &str, updated: &str, plan: &Plan) -> Result<(), String> {
     if existing != updated {
         if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
         crate::fs::atomic_write_sync(config_path, updated.as_bytes())
             .map_err(|e| format!("cannot write {}: {e}", config_path.display()))?;
@@ -852,7 +980,8 @@ fn write_all(config_path: &Path, existing: &str, updated: &str, plan: &Plan) -> 
             continue;
         }
         if let Some(parent) = copy.to.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
         }
         let bytes = std::fs::read(&copy.from)
             .map_err(|e| format!("cannot read {}: {e}", copy.from.display()))?;
@@ -868,7 +997,10 @@ pub(crate) fn detection_note(home: &Path) -> Option<String> {
         (Source::Claude, home.join(".claude/settings.json")),
         (Source::Claude, home.join(".claude.json")),
         (Source::Codex, home.join(".codex/config.toml")),
-        (Source::Opencode, home.join(".config/opencode/opencode.json")),
+        (
+            Source::Opencode,
+            home.join(".config/opencode/opencode.json"),
+        ),
     ]
     .into_iter()
     .filter(|(_, path)| path.is_file())
@@ -951,7 +1083,12 @@ mod tests {
             codex.mcp["web"]["headers"]["Authorization"].as_str(),
             Some("Bearer ${WEB_TOKEN}")
         );
-        assert!(codex.unsupported.iter().any(|u| u.contains("approval_policy")));
+        assert!(
+            codex
+                .unsupported
+                .iter()
+                .any(|u| u.contains("approval_policy"))
+        );
 
         let opencode = plan_opencode(
             r#"{"model":"anthropic/claude-x","mcp":{"loc":{"type":"local","command":["node","s.js"],"environment":{"SECRET_KEY":"abc"}},"off":{"type":"remote","url":"https://o","enabled":false}},
@@ -960,7 +1097,10 @@ mod tests {
         .unwrap();
         assert_eq!(opencode.model.as_deref(), Some("anthropic/claude-x"));
         assert_eq!(opencode.mcp["loc"]["command"].as_str(), Some("node"));
-        assert_eq!(opencode.mcp["loc"]["env"]["SECRET_KEY"].as_str(), Some("${SECRET_KEY}"));
+        assert_eq!(
+            opencode.mcp["loc"]["env"]["SECRET_KEY"].as_str(),
+            Some("${SECRET_KEY}")
+        );
         assert!(!opencode.mcp.contains_key("off"));
         assert_eq!(opencode.allow["bash"], ["git *"]);
         assert_eq!(opencode.deny["bash"], ["rm *"]);
@@ -978,7 +1118,10 @@ mod tests {
         assert!(skipped.iter().any(|s| s.contains("model")));
         assert!(skipped.iter().any(|s| s.contains("'files'")));
         let parsed: toml::Table = updated.parse().unwrap();
-        assert_eq!(parsed["mcp_servers"]["remote"]["url"].as_str(), Some("https://x.example/mcp"));
+        assert_eq!(
+            parsed["mcp_servers"]["remote"]["url"].as_str(),
+            Some("https://x.example/mcp")
+        );
         let bash: Vec<&str> = parsed["permission-allow"]["bash"]
             .as_array()
             .unwrap()
@@ -1021,8 +1164,15 @@ mod tests {
         // Planning and previewing touched nothing.
         assert!(!config.exists() && !agents.exists());
         write_all(&config.join("config.toml"), "", &updated, &plan).unwrap();
-        assert_eq!(std::fs::read_to_string(config.join("commands/team/ship.md")).unwrap(), "ship it");
-        assert!(std::fs::read_to_string(config.join("config.toml")).unwrap().contains("mcp_servers"));
+        assert_eq!(
+            std::fs::read_to_string(config.join("commands/team/ship.md")).unwrap(),
+            "ship it"
+        );
+        assert!(
+            std::fs::read_to_string(config.join("config.toml"))
+                .unwrap()
+                .contains("mcp_servers")
+        );
         assert!(plan_from_home(Source::Codex, &home, &config, &agents).is_err());
         assert!(detection_note(&home).unwrap().contains("claude"));
         let _ = std::fs::remove_dir_all(&root);
@@ -1030,11 +1180,28 @@ mod tests {
 
     #[test]
     fn invocation_parsing_claims_only_import_settings() {
-        let args = |items: &[&str]| items.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let args = |items: &[&str]| {
+            items
+                .iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
         assert!(parse_invocation(&args(&["mini-agent", "import settings"])).is_none());
         assert!(parse_invocation(&args(&["mini-agent"])).is_none());
-        match parse_invocation(&args(&["mini-agent", "import-settings", "codex", "--dry-run"])) {
-            Some(Invocation::Run(a)) => assert_eq!(a, ImportArgs { source: Source::Codex, dry_run: true, yes: false }),
+        match parse_invocation(&args(&[
+            "mini-agent",
+            "import-settings",
+            "codex",
+            "--dry-run",
+        ])) {
+            Some(Invocation::Run(a)) => assert_eq!(
+                a,
+                ImportArgs {
+                    source: Source::Codex,
+                    dry_run: true,
+                    yes: false
+                }
+            ),
             _ => panic!("expected run"),
         }
         assert!(matches!(

@@ -58,7 +58,8 @@ Completed and cancelled todos count as done; a temporarily locked store displays
 | `/export [file]` | Export the current session to a standalone HTML page (default `mini-agent-session-<id>.html`), Markdown with `.md`, or JSONL with `.jsonl`. Quote a file name that contains spaces. Markdown preserves message bodies literally in fenced blocks and includes tool arguments; each tool result shows at most 16 KiB with an omission notice and any recorded full-output path. Export does not read that path and refuses to overwrite an existing file. Markdown is a readable transcript; use JSONL for `/import`. Requires the `export` feature (default-on). |
 | `/import <file>` | Import a session from a versioned mini-agent JSONL export (or a native session JSON document), save it, and load it. Schema markers select the format deterministically; imports accept the same 100,000 messages as a saved session and up to 48 MiB of JSONL (the 32 MiB session-snapshot cap plus framing), so any saved session can be exported and re-imported, and external native files cannot inject a hidden redo snapshot. Requires the `export` feature. |
 | `/share` | Show what sharing would publish: the HTML export's size, how many tool outputs it contains (tool output can include file contents and secrets such as `.env` values), and that a secret gist is readable by anyone with the link. Nothing is uploaded. |
-| `/share confirm` | Upload the HTML export as a secret GitHub gist and print the URL. The upload gives up after 10 seconds connecting or 30 seconds in total. Requires `GITHUB_TOKEN` or `GH_TOKEN` and the `export` feature. |
+| `/share confirm` | Upload the HTML export as a secret GitHub gist and print the URL. The upload gives up after 10 seconds connecting or 30 seconds in total. The credential is `GITHUB_TOKEN`, then `GH_TOKEN`, then the GitHub CLI's stored login (`gh auth token`); the reply says which source was used. The gist id is saved in the session, so a second `/share confirm` updates the same gist (a gist deleted elsewhere is recreated). Requires the `export` feature. |
+| `/unshare` | Delete the session's shared gist and forget its id (a gist that is already gone counts as deleted). Uses the same credential sources as `/share confirm`. |
 | `/queue` | List input queued while the agent is busy (same as `/queue ls`). Interrupting or failing the main run drops queued inputs and reports how many were dropped. |
 | `/jobs` | List this session's retained background job IDs, command summaries, statuses and exit codes; captured output is not included. Works while the main agent runs. |
 | `/notices` | Print the last 20 status-line notices (copy confirmations, `/expand` errors, "opening <url>"). The status line shows a notice for a few seconds and truncates it; error notices are also written to the transcript. |
@@ -243,6 +244,10 @@ files are skipped with a warning containing their path and read error.
 | `/thinking` | Alias for `/reasoning`. |
 | `/steer <message>` | While a turn runs, hold text messages (up to 64 KiB in total) for the next settled tool batch instead of queueing them; each is delivered as its own user message, in order, and none interrupts tools. See [mid-turn steering](TOOL_RUNTIME.md#mid-turn-steering) and `running_input` in [CONFIG.md](CONFIG.md). |
 | `/review [msg]` | Run a one-shot code review. Activates the `review` prompt in readonly mode, submits a review message, and restores the previous prompt afterward. Without a message, auto-generates one based on session and worktree context. |
+| `/review --base <ref> \| --commit <sha> \| --uncommitted \| --pr <n> [--post] [--security] [focus]` | Review an explicit change set. `--base` reviews only this branch's own commits (`<ref>...HEAD`), `--commit` one commit, `--uncommitted` staged and unstaged changes against HEAD; the file list and a diff bounded to 48 KiB are placed in the review message (resolved with the structured git tool, so git permissions apply). `--pr` tells the model to read the pull request with `gh pr view`/`gh pr diff` through the shell tool. `--post` adds an instruction to draft review comments, show them, and submit them with `gh pr review` only after you confirm in the conversation (the shell approval prompt still applies); nothing is posted automatically. `--security` focuses the review on security (or uses a `security-review` prompt when you have one). A modal four-item target picker is not built; a bare `/review` keeps its automatic message. |
+| `/feedback [text]` | Show a draft issue (what happened, build/version/target/terminal/features and the `/doctor` report) with home-directory paths and credential-looking text redacted, and no transcript. `/feedback --open [text]` opens the repository's new-issue page with that draft prefilled in the browser (or prints the address when none can be opened). Nothing is submitted for you. |
+| `/release-notes` | Print the CHANGELOG section for the running version (the Unreleased section when the version has no heading yet), embedded at build time. `mini-agent update` reminds you of it after a successful install. |
+| `/plugins` | List installed plugins and their commands, agents, skills and hook/MCP approval state. Read-only: install, remove, update and approve with `mini-agent plugin` (see below). |
 | `/expand [n\|all]` | Unfold a folded tool result in place: the latest without an argument, the `n`th latest expandable result (`1` = latest), or every retained result with `all`. Works while the agent is running and reports only on the status line. |
 | `/collapse [n\|all]` | Fold tool results back to their one-line summary; same arguments as `/expand`. |
 | `/toggle` | Show toggleable features, runtime availability, and current-workspace learned-skill service failures or degradation with retry status. |
@@ -472,6 +477,50 @@ and rolls the transcript back.
 schedule, use [`/cron`](#cron); a `/loop` whose first argument is an interval
 such as `5m` is refused with a `did you mean /cron 5m ...?` hint rather than
 starting a round.
+
+## Plugins, imports and scheduled runs (command line)
+
+These are subcommands of the binary, handled before the interactive session starts.
+
+`mini-agent plugin install <path|git-url|name@marketplace> [--ref REF]` installs a plugin in
+Claude Code's layout (`.claude-plugin/plugin.json`, `commands/`, `agents/`, `skills/`,
+`hooks/hooks.json`, `.mcp.json`). The tree is copied (no symbolic links; at most 512 files, 1 MiB
+per file, 8 MiB total) into `<data_dir>/plugins/<name>/` with a SHA-256 of its content; git sources
+are `https://`, `ssh://` or `user@host:path` shallow clones, never prompting, with the resolved
+commit recorded. Commands become `/<plugin>:<name>` (files under `<config_dir>/commands/<plugin>/`),
+agents become `<plugin>-<name>` (files in the agents directory), skills load from the installed
+directory (listed as `<plugin>:<name>`; your own same-named skill wins). **Hooks and MCP servers are
+inactive** until `mini-agent plugin trust <name>` shows each hook command and MCP server and you
+confirm (`--yes` for scripts); approval is bound to the content hash, writes the reviewed hooks to
+`<config_dir>/settings.json` and the servers to `config.toml` as `mcp_servers."<plugin>.<server>"`
+(credential-looking env values become `${NAME}` references), and `${CLAUDE_PLUGIN_ROOT}` expands to
+the installed directory. `plugin update [name]` re-fetches from the recorded source; a changed
+content hash removes the activation and requires a new `plugin trust`. `plugin remove <name>` undoes
+everything the plugin wrote. `plugin marketplace add|list|remove` registers marketplace indexes
+(`.claude-plugin/marketplace.json` in a directory, a JSON file, or a git URL) that
+`install <plugin>@<marketplace>` resolves.
+
+`mini-agent import-settings <claude|codex|opencode> [--dry-run] [--yes]` reads another agent's
+user settings read-only and previews a diff of the resulting `config.toml`: MCP servers, permission
+rules (`permission-allow`, `-allow-prefix`, `-ask`, `-deny`), the model when unambiguous, and
+copies of custom commands and agents. Credential-looking values are never copied (they become
+`${NAME}` references and are listed), hooks are never imported (global hooks are trusted without a
+prompt) and anything without an equivalent is listed. Existing keys, servers and the existing
+`model` win. Nothing is written without confirmation (`--yes` confirms; `--dry-run` never writes).
+`--setup` points to it when such settings are detected.
+
+`mini-agent schedule add (--daily HH:MM | --weekdays HH:MM | --every 30m) --prompt TEXT
+[--workspace DIR] [--permission-mode MODE] [--max-budget-usd N] [--timeout 1h]`, `schedule list`,
+`schedule remove <id>` and `schedule run <id>` install per-user OS timers: a launchd agent
+(`~/Library/LaunchAgents/com.mini-agent.schedule.<id>.plist`) on macOS, a systemd user timer
+(`mini-agent-schedule-<id>.timer`, `Persistent=true` so a missed fire runs at the next start) on
+Linux and a Task Scheduler task (`schtasks`) on Windows. The timer runs `mini-agent schedule run
+<id>`, which runs one headless turn in the workspace (`-p`, session `sched-<id>`: created by the
+first run, resumed by later ones after a success) and records `<id>.last.json` and `<id>.log` under
+`<data_dir>/schedules/`. Runs are ordinary `-p` runs: asks are denied unless rules allow them, and
+`terminal_notify` and the status-socket signals behave as configured. There is no daemon. The
+Linux and Windows installers follow the documented command grammars and have not been exercised on
+those systems.
 
 ## Cron
 

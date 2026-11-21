@@ -55,7 +55,9 @@ fn xml_escape(text: &str) -> String {
 fn calendar_dict(hour: u8, minute: u8, weekday: Option<u8>) -> String {
     let mut out = String::from("    <dict>\n");
     if let Some(day) = weekday {
-        out.push_str(&format!("      <key>Weekday</key><integer>{day}</integer>\n"));
+        out.push_str(&format!(
+            "      <key>Weekday</key><integer>{day}</integer>\n"
+        ));
     }
     out.push_str(&format!(
         "      <key>Hour</key><integer>{hour}</integer>\n      <key>Minute</key><integer>{minute}</integer>\n    </dict>\n"
@@ -189,7 +191,9 @@ pub(crate) fn install_commands(
             "launchctl".into(),
             "bootstrap".into(),
             format!("gui/{uid}"),
-            plist.map(|p| p.to_string_lossy().into_owned()).unwrap_or_default(),
+            plist
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
         ]],
         Platform::Systemd => vec![
             vec!["systemctl".into(), "--user".into(), "daemon-reload".into()],
@@ -232,7 +236,11 @@ pub(crate) fn remove_commands(platform: Platform, id: &str, uid: u32) -> Vec<Vec
 /// Commands to run after the unit files are deleted (systemd reload).
 pub(crate) fn after_remove_commands(platform: Platform) -> Vec<Vec<String>> {
     match platform {
-        Platform::Systemd => vec![vec!["systemctl".into(), "--user".into(), "daemon-reload".into()]],
+        Platform::Systemd => vec![vec![
+            "systemctl".into(),
+            "--user".into(),
+            "daemon-reload".into(),
+        ]],
         _ => Vec::new(),
     }
 }
@@ -250,7 +258,12 @@ pub(crate) fn schtasks_create(entry: &Entry, exe: &Path) -> Vec<String> {
     argv.push(action);
     match entry.when {
         When::Daily { hour, minute } => {
-            argv.extend(["/SC".into(), "DAILY".into(), "/ST".into(), format!("{hour:02}:{minute:02}")]);
+            argv.extend([
+                "/SC".into(),
+                "DAILY".into(),
+                "/ST".into(),
+                format!("{hour:02}:{minute:02}"),
+            ]);
         }
         When::Weekdays { hour, minute } => argv.extend([
             "/SC".into(),
@@ -261,7 +274,12 @@ pub(crate) fn schtasks_create(entry: &Entry, exe: &Path) -> Vec<String> {
             format!("{hour:02}:{minute:02}"),
         ]),
         When::Every { minutes } => {
-            argv.extend(["/SC".into(), "MINUTE".into(), "/MO".into(), minutes.to_string()]);
+            argv.extend([
+                "/SC".into(),
+                "MINUTE".into(),
+                "/MO".into(),
+                minutes.to_string(),
+            ]);
         }
     }
     argv.push("/F".into());
@@ -288,17 +306,41 @@ mod tests {
     #[test]
     fn launchd_plist_has_label_arguments_and_calendar() {
         let exe = Path::new("/opt/bin/mini-agent");
-        let weekdays = launchd_plist(&entry(When::Weekdays { hour: 8, minute: 5 }), exe, Path::new("/l.log"));
+        let weekdays = launchd_plist(
+            &entry(When::Weekdays { hour: 8, minute: 5 }),
+            exe,
+            Path::new("/l.log"),
+        );
         assert!(weekdays.contains("<string>com.mini-agent.schedule.ab12cd34</string>"));
-        assert!(weekdays.contains("<string>schedule</string>") && weekdays.contains("<string>run</string>"));
+        assert!(
+            weekdays.contains("<string>schedule</string>")
+                && weekdays.contains("<string>run</string>")
+        );
         assert_eq!(weekdays.matches("<key>Weekday</key>").count(), 5);
         assert!(weekdays.contains("<key>Hour</key><integer>8</integer>"));
         assert!(weekdays.contains("/work/my repo"));
-        let every = launchd_plist(&entry(When::Every { minutes: 30 }), exe, Path::new("/l.log"));
+        let every = launchd_plist(
+            &entry(When::Every { minutes: 30 }),
+            exe,
+            Path::new("/l.log"),
+        );
         assert!(every.contains("<key>StartInterval</key>\n  <integer>1800</integer>"));
-        let daily = launchd_plist(&entry(When::Daily { hour: 23, minute: 0 }), exe, Path::new("/l.log"));
-        assert!(daily.contains("<key>StartCalendarInterval</key>\n  <dict>"), "{daily}");
-        assert!(daily.matches("<dict>").count() == 2 && daily.matches("</dict>").count() == 2, "{daily}");
+        let daily = launchd_plist(
+            &entry(When::Daily {
+                hour: 23,
+                minute: 0,
+            }),
+            exe,
+            Path::new("/l.log"),
+        );
+        assert!(
+            daily.contains("<key>StartCalendarInterval</key>\n  <dict>"),
+            "{daily}"
+        );
+        assert!(
+            daily.matches("<dict>").count() == 2 && daily.matches("</dict>").count() == 2,
+            "{daily}"
+        );
         // Markup characters in paths cannot break the document.
         let mut hostile = entry(When::Daily { hour: 1, minute: 2 });
         hostile.workspace = "/a</string><x>&".into();
@@ -322,13 +364,26 @@ mod tests {
     #[test]
     fn schtasks_argv_covers_each_schedule_kind() {
         let exe = Path::new("C:\\Program Files\\mini-agent\\mini-agent.exe");
-        let weekly = schtasks_create(&entry(When::Weekdays { hour: 8, minute: 30 }), exe);
-        assert_eq!(&weekly[..4], ["schtasks", "/Create", "/TN", "mini-agent-schedule-ab12cd34"]);
+        let weekly = schtasks_create(
+            &entry(When::Weekdays {
+                hour: 8,
+                minute: 30,
+            }),
+            exe,
+        );
+        assert_eq!(
+            &weekly[..4],
+            ["schtasks", "/Create", "/TN", "mini-agent-schedule-ab12cd34"]
+        );
         assert_eq!(
             weekly[5],
             "\"C:\\Program Files\\mini-agent\\mini-agent.exe\" schedule run ab12cd34"
         );
-        assert!(weekly.windows(2).any(|w| w == ["/D", "MON,TUE,WED,THU,FRI"]));
+        assert!(
+            weekly
+                .windows(2)
+                .any(|w| w == ["/D", "MON,TUE,WED,THU,FRI"])
+        );
         assert!(weekly.windows(2).any(|w| w == ["/ST", "08:30"]));
         assert_eq!(weekly.last().map(String::as_str), Some("/F"));
         let every = schtasks_create(&entry(When::Every { minutes: 15 }), exe);
@@ -342,23 +397,52 @@ mod tests {
     fn install_and_remove_commands_are_fixed_grammars() {
         let e = entry(When::Daily { hour: 1, minute: 1 });
         let exe = Path::new("/x/mini-agent");
-        let plist = Path::new("/home/u/Library/LaunchAgents/com.mini-agent.schedule.ab12cd34.plist");
+        let plist =
+            Path::new("/home/u/Library/LaunchAgents/com.mini-agent.schedule.ab12cd34.plist");
         assert_eq!(
             install_commands(Platform::Launchd, &e, exe, Some(plist), 501),
-            vec![vec!["launchctl", "bootstrap", "gui/501", plist.to_str().unwrap()]]
+            vec![vec![
+                "launchctl",
+                "bootstrap",
+                "gui/501",
+                plist.to_str().unwrap()
+            ]]
         );
         assert_eq!(
             remove_commands(Platform::Launchd, "ab12cd34", 501),
-            vec![vec!["launchctl", "bootout", "gui/501/com.mini-agent.schedule.ab12cd34"]]
+            vec![vec![
+                "launchctl",
+                "bootout",
+                "gui/501/com.mini-agent.schedule.ab12cd34"
+            ]]
         );
         let systemd = install_commands(Platform::Systemd, &e, exe, None, 0);
-        assert_eq!(systemd[1].last().map(String::as_str), Some("mini-agent-schedule-ab12cd34.timer"));
+        assert_eq!(
+            systemd[1].last().map(String::as_str),
+            Some("mini-agent-schedule-ab12cd34.timer")
+        );
         assert_eq!(
             remove_commands(Platform::TaskScheduler, "ab12cd34", 0)[0],
-            ["schtasks", "/Delete", "/TN", "mini-agent-schedule-ab12cd34", "/F"]
+            [
+                "schtasks",
+                "/Delete",
+                "/TN",
+                "mini-agent-schedule-ab12cd34",
+                "/F"
+            ]
         );
-        let files = files(Platform::Systemd, &e, exe, Path::new("/home/u"), Path::new("/l"));
+        let files = files(
+            Platform::Systemd,
+            &e,
+            exe,
+            Path::new("/home/u"),
+            Path::new("/l"),
+        );
         assert_eq!(files.len(), 2);
-        assert!(files[1].path.ends_with("mini-agent-schedule-ab12cd34.timer"));
+        assert!(
+            files[1]
+                .path
+                .ends_with("mini-agent-schedule-ab12cd34.timer")
+        );
     }
 }

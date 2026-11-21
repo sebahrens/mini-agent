@@ -25,20 +25,23 @@ pub(crate) fn redact(text: &str, home: Option<&str>) -> String {
         out = out.replace(trimmed, "~");
         out = out.replace(&trimmed.replace('\\', "/"), "~");
     }
-    out.lines()
-        .map(redact_line)
-        .collect::<Vec<_>>()
-        .join("\n")
+    out.lines().map(redact_line).collect::<Vec<_>>().join("\n")
 }
 
 fn redact_line(line: &str) -> String {
     let lower = line.to_ascii_lowercase();
-    let sensitive_key = ["key", "token", "secret", "password", "passwd", "authorization", "credential"]
-        .iter()
-        .any(|word| lower.contains(word));
-    if sensitive_key
-        && let Some(split) = line.find([':', '='])
-    {
+    let sensitive_key = [
+        "key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "credential",
+    ]
+    .iter()
+    .any(|word| lower.contains(word));
+    if sensitive_key && let Some(split) = line.find([':', '=']) {
         return format!("{} [redacted]", redact_words(&line[..=split]));
     }
     redact_words(line)
@@ -53,9 +56,20 @@ fn redact_words(line: &str) -> String {
 
 fn redact_word(word: &str) -> String {
     let core = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-');
-    let prefixed = ["sk-", "ghp_", "gho_", "ghs_", "github_pat_", "xoxb-", "xoxp-", "AKIA", "AIza", "eyJ"]
-        .iter()
-        .any(|prefix| core.starts_with(prefix) && core.len() >= prefix.len() + 8);
+    let prefixed = [
+        "sk-",
+        "ghp_",
+        "gho_",
+        "ghs_",
+        "github_pat_",
+        "xoxb-",
+        "xoxp-",
+        "AKIA",
+        "AIza",
+        "eyJ",
+    ]
+    .iter()
+    .any(|prefix| core.starts_with(prefix) && core.len() >= prefix.len() + 8);
     let long_blob = core.len() >= 32
         && core
             .chars()
@@ -150,10 +164,7 @@ pub(crate) fn release_notes() -> &'static str {
     RELEASE_NOTES
 }
 
-pub(crate) async fn handle_feedback(
-    parts: &[&str],
-    ctx: &mut SlashCtx<'_>,
-) -> anyhow::Result<()> {
+pub(crate) async fn handle_feedback(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let open = parts.get(1) == Some(&"--open");
     let text = parts[if open { 2 } else { 1 }.min(parts.len())..].join(" ");
     let diagnostics = match crate::paths::process_paths_ref() {
@@ -223,7 +234,11 @@ mod tests {
             note ghp_ABCDEFGHIJKLMNOPQRSTUV and Authorization: Bearer abc.def\n\
             blob 0123456789abcdef0123456789abcdef0123456789\n\
             C:\\Users\\bob\\proj\\x.rs and /home/carol/src";
-        let body = issue_body("it crashed in /Users/alice/work token=zzz", diagnostics, Some("/Users/alice"));
+        let body = issue_body(
+            "it crashed in /Users/alice/work token=zzz",
+            diagnostics,
+            Some("/Users/alice"),
+        );
         assert!(body.contains(env!("CARGO_PKG_VERSION")));
         assert!(body.contains(env!("MINI_AGENT_BUILD_TARGET")));
         for secret in [
@@ -244,7 +259,9 @@ mod tests {
     #[test]
     fn issue_url_is_encoded_and_bounded() {
         let url = issue_url("a b&c", &"x".repeat(MAX_BODY_BYTES * 2));
-        assert!(url.starts_with("https://github.com/sebahrens/mini-agent/issues/new?title=a%20b%26c"));
+        assert!(
+            url.starts_with("https://github.com/sebahrens/mini-agent/issues/new?title=a%20b%26c")
+        );
         let body = issue_body(&"y".repeat(20_000), "", None);
         assert!(body.len() <= MAX_BODY_BYTES + 32);
     }

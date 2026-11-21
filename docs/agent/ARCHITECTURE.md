@@ -152,6 +152,10 @@ reproducing code; focus on structure, relationships, and rationale.
 - `src/extras/` — Optional features gated behind Cargo features
 - `src/extras/loop/validation.rs` — Shared bounded, sandboxed loop-validator execution, operation-scoped cancellation, and diagnostics
 - `src/extras/goal/` — Persistent objectives: the record, the pure gate, the round driver, the checks and judge tiers, and round transcripts. `--loop` is a preset over it.
+- `src/extras/plugins/` — Installable plugin bundles: manifest and component discovery, content hashing, install/update/remove, marketplace index and hash-bound trust for hooks and MCP servers (`mini-agent plugin`, `/plugins`).
+- `src/extras/schedule/` — `mini-agent schedule`: schedule entries, launchd/systemd/Task Scheduler artifact generation and the single bounded launcher (also used for plugin `git clone`).
+- `src/setup/import.rs` — `mini-agent import-settings`: conversion of Claude Code, Codex and opencode user settings into `config.toml` with a preview.
+- `src/ui/statusline_command.rs` — Command-backed status-bar segments (interval cache over the `key_command` launcher).
 
 ## Key Types
 - `AnyAgent` / `AnyClient` — type-erased agent and LLM client

@@ -1073,7 +1073,11 @@ impl TokenSource {
 /// (`gh auth token`, run through the credential-helper launcher with its
 /// timeout and output cap). `lookup` is the environment, injectable for tests.
 fn env_token(lookup: impl Fn(&str) -> Option<String>) -> Option<(String, TokenSource)> {
-    let usable = |name: &str| lookup(name).map(|v| v.trim().to_owned()).filter(|v| !v.is_empty());
+    let usable = |name: &str| {
+        lookup(name)
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+    };
     usable("GITHUB_TOKEN")
         .map(|t| (t, TokenSource::GithubToken))
         .or_else(|| usable("GH_TOKEN").map(|t| (t, TokenSource::GhToken)))
@@ -1083,12 +1087,8 @@ pub(crate) async fn resolve_github_token() -> Result<(String, TokenSource)> {
     if let Some(found) = env_token(|name| std::env::var(name).ok()) {
         return Ok(found);
     }
-    match crate::key_command::run_once(
-        "gh",
-        vec!["gh".into(), "auth".into(), "token".into()],
-        10,
-    )
-    .await
+    match crate::key_command::run_once("gh", vec!["gh".into(), "auth".into(), "token".into()], 10)
+        .await
     {
         Ok(token) => Ok((token, TokenSource::GhCli)),
         Err(_) => anyhow::bail!(
@@ -1150,6 +1150,27 @@ fn valid_gist_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
+/// Send one gist request. A non-success answer is an error naming the status,
+/// except that a missing gist (404) is `None` when `tolerate_missing`.
+async fn send_gist(
+    request: reqwest::RequestBuilder,
+    tolerate_missing: bool,
+) -> Result<Option<reqwest::Response>> {
+    let response = request
+        .send()
+        .await
+        .context("failed to reach the GitHub API")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        if tolerate_missing && status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let text = response.text().await.unwrap_or_default();
+        anyhow::bail!("GitHub API returned {}: {}", status, text.trim());
+    }
+    Ok(Some(response))
+}
+
 pub(crate) async fn delete_gist(
     client: &reqwest::Client,
     base_url: &str,
@@ -1157,16 +1178,13 @@ pub(crate) async fn delete_gist(
     id: &str,
 ) -> Result<()> {
     anyhow::ensure!(valid_gist_id(id), "the recorded gist id is not valid");
-    let response = gist_headers(client.delete(format!("{base_url}/{id}")), token)
-        .send()
-        .await
-        .context("failed to reach the GitHub API")?;
-    let status = response.status();
-    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
-        return Ok(());
-    }
-    let text = response.text().await.unwrap_or_default();
-    anyhow::bail!("GitHub API returned {}: {}", status, text.trim());
+    // A gist that is already gone counts as removed.
+    send_gist(
+        gist_headers(client.delete(format!("{base_url}/{id}")), token),
+        true,
+    )
+    .await?;
+    Ok(())
 }
 
 pub(crate) async fn publish_gist(
@@ -1186,30 +1204,23 @@ pub(crate) async fn publish_gist(
     let mut updated = false;
     let mut response = None;
     if let Some(id) = existing.filter(|id| valid_gist_id(id)) {
-        let patch = gist_headers(client.patch(format!("{base_url}/{id}")), token)
-            .json(&body)
-            .send()
-            .await
-            .context("failed to reach the GitHub API")?;
-        // A gist deleted behind our back: create a fresh one.
-        if patch.status() != reqwest::StatusCode::NOT_FOUND {
-            updated = patch.status().is_success();
-            response = Some(patch);
-        }
+        // A gist deleted behind our back (404) is created afresh below.
+        response = send_gist(
+            gist_headers(client.patch(format!("{base_url}/{id}")), token).json(&body),
+            true,
+        )
+        .await?;
+        updated = response.is_some();
     }
     let response = match response {
         Some(response) => response,
-        None => gist_headers(client.post(base_url), token)
-            .json(&body)
-            .send()
-            .await
-            .context("failed to reach the GitHub API")?,
+        None => send_gist(
+            gist_headers(client.post(base_url), token).json(&body),
+            false,
+        )
+        .await?
+        .context("GitHub API returned no response")?,
     };
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        anyhow::bail!("GitHub API returned {}: {}", status, text.trim());
-    }
     let json: serde_json::Value = response
         .json()
         .await
@@ -1234,6 +1245,7 @@ pub(crate) async fn publish_gist(
 }
 
 /// Create-only upload used by tests of the transport: returns the gist URL.
+#[cfg(test)]
 pub(crate) async fn upload_gist(
     client: &reqwest::Client,
     url: &str,
@@ -1303,7 +1315,8 @@ mod gist_tests {
     #[tokio::test]
     async fn share_share_again_updates_and_unshare_deletes() {
         let created = r#"{"id":"abc123","html_url":"https://gist.github.com/u/abc123"}"#;
-        let (base, server) = serve(vec![(201, created), (200, created), (204, ""), (404, "{}")]).await;
+        let (base, server) =
+            serve(vec![(201, created), (200, created), (204, ""), (404, "{}")]).await;
         let client = reqwest::Client::new();
         let first = publish_gist(&client, &base, "t", "s.html", "<p>", "d", None)
             .await
@@ -1349,7 +1362,13 @@ mod gist_tests {
 
     #[tokio::test]
     async fn a_hostile_recorded_id_never_reaches_the_url() {
-        let result = delete_gist(&reqwest::Client::new(), "http://127.0.0.1:9/gists", "t", "../x").await;
+        let result = delete_gist(
+            &reqwest::Client::new(),
+            "http://127.0.0.1:9/gists",
+            "t",
+            "../x",
+        )
+        .await;
         assert!(result.is_err());
     }
 }

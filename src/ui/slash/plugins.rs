@@ -12,7 +12,10 @@ pub(crate) fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) {
         super::write_error(ctx.renderer, "application paths are unavailable");
         return;
     };
-    super::write_result(ctx.renderer, crate::extras::plugins::describe_for_paths(paths));
+    super::write_result(
+        ctx.renderer,
+        crate::extras::plugins::describe_for_paths(paths),
+    );
     super::write_ok(
         ctx.renderer,
         "Manage plugins with `mini-agent plugin install|remove|update|trust`.",

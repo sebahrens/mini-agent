@@ -434,7 +434,11 @@ async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
             let _ = persist_session_unless_ephemeral(no_session, ctx.session, |notice| {
                 write_error(ctx.renderer, format!("warning: {notice}"))
             });
-            let verb = if share.updated { "updated" } else { "shared as" };
+            let verb = if share.updated {
+                "updated"
+            } else {
+                "shared as"
+            };
             write_ok(
                 ctx.renderer,
                 format!(
@@ -452,7 +456,10 @@ async fn handle_share(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<
 #[cfg(feature = "export")]
 async fn handle_unshare(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     let Some(id) = ctx.session.shared_gist_id.as_ref().map(|id| id.to_string()) else {
-        write_ok(ctx.renderer, "this session has no shared gist (nothing to unshare)");
+        write_ok(
+            ctx.renderer,
+            "this session has no shared gist (nothing to unshare)",
+        );
         return Ok(());
     };
     match crate::extras::export::unshare_gist(&id).await {

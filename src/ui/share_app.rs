@@ -73,7 +73,7 @@ impl App<'_> {
                 existing.as_deref(),
             )
             .await
-                .map_err(|error| error.to_string());
+            .map_err(|error| error.to_string());
             *active() = None;
             let _ = tx.send(UserEvent::ShareDone(result)).await;
         });
@@ -84,13 +84,17 @@ impl App<'_> {
     /// Delete the session's shared gist (`/unshare`) and forget its id.
     pub(super) fn start_unshare(&mut self) -> anyhow::Result<()> {
         let Some(id) = self.ui.session.shared_gist_id.clone() else {
-            self.renderer
-                .write_line("this session has no shared gist (nothing to unshare)", C_AGENT)?;
+            self.renderer.write_line(
+                "this session has no shared gist (nothing to unshare)",
+                C_AGENT,
+            )?;
             return Ok(());
         };
         if active().is_some() {
-            self.renderer
-                .write_line("a share request is already running (Esc cancels it)", C_ERROR)?;
+            self.renderer.write_line(
+                "a share request is already running (Esc cancels it)",
+                C_ERROR,
+            )?;
             return Ok(());
         }
         self.renderer
@@ -123,14 +127,21 @@ impl App<'_> {
                 self.ui.session.shared_gist_id = None;
                 let _ = self.save_session();
                 self.renderer.write_line(
-                    &format!("unshared: the gist was deleted (via {})", share.source.label()),
+                    &format!(
+                        "unshared: the gist was deleted (via {})",
+                        share.source.label()
+                    ),
                     C_AGENT,
                 )?
             }
             Ok(share) => {
                 self.ui.session.shared_gist_id = Some(share.id.as_str().into());
                 let _ = self.save_session();
-                let verb = if share.updated { "updated" } else { "shared as" };
+                let verb = if share.updated {
+                    "updated"
+                } else {
+                    "shared as"
+                };
                 self.renderer.write_line(
                     &format!(
                         "{verb} secret gist: {} (via {}; /unshare deletes it)",

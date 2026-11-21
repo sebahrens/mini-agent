@@ -2454,10 +2454,7 @@ pub(crate) fn strip_statusline_commands(value: &mut toml::Value) -> usize {
     };
     let mut removed = 0;
     for line in lines {
-        let Some(segments) = line
-            .get_mut("segments")
-            .and_then(toml::Value::as_array_mut)
-        else {
+        let Some(segments) = line.get_mut("segments").and_then(toml::Value::as_array_mut) else {
             continue;
         };
         let before = segments.len();

@@ -1568,10 +1568,8 @@ impl<'a> App<'a> {
         if due.is_empty() {
             return;
         }
-        let input = crate::ui::statusline_command::input_json(
-            self.ui.session,
-            self.ui.workspace.root(),
-        );
+        let input =
+            crate::ui::statusline_command::input_json(self.ui.session, self.ui.workspace.root());
         for spec in due {
             let tx = self.command_segment_tx.clone();
             let input = input.clone();

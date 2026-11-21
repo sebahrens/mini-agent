@@ -186,7 +186,10 @@ pub(crate) fn parse_invocation(args: &[std::ffi::OsString]) -> Option<Invocation
 }
 
 fn valid_id(id: &str) -> bool {
-    id.len() == 8 && id.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    id.len() == 8
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 fn parse_add(args: &[&str]) -> Result<NewEntry, String> {
@@ -198,7 +201,11 @@ fn parse_add(args: &[&str]) -> Result<NewEntry, String> {
     let mut timeout_secs = DEFAULT_TIMEOUT_SECS;
     let mut iter = args.iter();
     while let Some(flag) = iter.next() {
-        let mut value = || iter.next().copied().ok_or_else(|| format!("{flag} needs a value"));
+        let mut value = || {
+            iter.next()
+                .copied()
+                .ok_or_else(|| format!("{flag} needs a value"))
+        };
         let set_when = |when: &mut Option<When>, new: When| {
             if when.replace(new).is_some() {
                 Err("choose one of --daily, --weekdays, --every".to_owned())
@@ -215,7 +222,12 @@ fn parse_add(args: &[&str]) -> Result<NewEntry, String> {
                 let (hour, minute) = parse_time(value()?)?;
                 set_when(&mut when, When::Weekdays { hour, minute })?;
             }
-            "--every" => set_when(&mut when, When::Every { minutes: parse_every(value()?)? })?,
+            "--every" => set_when(
+                &mut when,
+                When::Every {
+                    minutes: parse_every(value()?)?,
+                },
+            )?,
             "--prompt" => prompt = Some(value()?.to_owned()),
             "--workspace" => workspace = Some(PathBuf::from(value()?)),
             "--permission-mode" => {
@@ -229,7 +241,9 @@ fn parse_add(args: &[&str]) -> Result<NewEntry, String> {
                 permission_mode = Some(mode.to_owned());
             }
             "--max-budget-usd" => {
-                let usd: f64 = value()?.parse().map_err(|_| "--max-budget-usd needs a number")?;
+                let usd: f64 = value()?
+                    .parse()
+                    .map_err(|_| "--max-budget-usd needs a number")?;
                 if !usd.is_finite() || usd <= 0.0 {
                     return Err("--max-budget-usd must be a positive number".into());
                 }
@@ -279,7 +293,8 @@ impl Store {
     }
 
     fn save(&self, entry: &Entry) -> Result<(), String> {
-        std::fs::create_dir_all(&self.dir).map_err(|e| format!("cannot create {}: {e}", self.dir.display()))?;
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("cannot create {}: {e}", self.dir.display()))?;
         let json = serde_json::to_vec_pretty(entry).map_err(|e| e.to_string())?;
         crate::fs::atomic_write_sync(&self.entry_path(&entry.id), &json)
             .map_err(|e| format!("cannot save the schedule: {e}"))
@@ -342,7 +357,10 @@ pub(crate) fn add(
         .canonicalize()
         .map_err(|e| format!("workspace {} is not usable: {e}", workspace.display()))?;
     if !workspace.is_dir() {
-        return Err(format!("workspace {} is not a directory", workspace.display()));
+        return Err(format!(
+            "workspace {} is not a directory",
+            workspace.display()
+        ));
     }
     let entry = Entry {
         id: new_id(),
@@ -355,12 +373,19 @@ pub(crate) fn add(
         created: crate::session::rfc3339_utc(jiff::Timestamp::now()),
     };
     store.save(&entry)?;
-    let files = platform::files(host.platform, &entry, &host.exe, &host.home, &store.log_path(&entry.id));
+    let files = platform::files(
+        host.platform,
+        &entry,
+        &host.exe,
+        &host.home,
+        &store.log_path(&entry.id),
+    );
     let mut written = Vec::new();
     let result = (|| -> Result<(), String> {
         for file in &files {
             if let Some(parent) = file.path.parent() {
-                std::fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
             }
             std::fs::write(&file.path, &file.content)
                 .map_err(|e| format!("cannot write {}: {e}", file.path.display()))?;
@@ -410,6 +435,11 @@ pub(crate) fn remove(
     Ok(notes)
 }
 
+/// Runs an argv with a working directory, log file and timeout; returns
+/// `(exit_code, timed_out)`.
+pub(crate) type Launch<'a> =
+    dyn FnMut(&[String], &Path, &Path, Duration) -> Result<(Option<i32>, bool), String> + 'a;
+
 /// The record `schedule run` leaves behind.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RunRecord {
@@ -452,7 +482,7 @@ pub(crate) fn run_entry(
     store: &Store,
     exe: &Path,
     id: &str,
-    launch: &mut dyn FnMut(&[String], &Path, &Path, Duration) -> Result<(Option<i32>, bool), String>,
+    launch: &mut Launch<'_>,
 ) -> Result<RunRecord, String> {
     let entry = store.load(id)?;
     let started = crate::session::rfc3339_utc(jiff::Timestamp::now());
@@ -479,7 +509,8 @@ pub(crate) fn run_entry(
     };
     std::fs::create_dir_all(&store.dir).map_err(|e| e.to_string())?;
     let json = serde_json::to_vec_pretty(&record).map_err(|e| e.to_string())?;
-    crate::fs::atomic_write_sync(&store.last_path(id), &json).map_err(|e| format!("cannot record the result: {e}"))?;
+    crate::fs::atomic_write_sync(&store.last_path(id), &json)
+        .map_err(|e| format!("cannot record the result: {e}"))?;
     Ok(record)
 }
 
@@ -610,7 +641,10 @@ fn last_summary(store: &Store, id: &str) -> String {
             } else if let Some(error) = record.error {
                 format!("error: {error}")
             } else {
-                format!("exit {}", record.exit_code.map_or("?".to_owned(), |c| c.to_string()))
+                format!(
+                    "exit {}",
+                    record.exit_code.map_or("?".to_owned(), |c| c.to_string())
+                )
             }
         ),
         None => "never run".to_owned(),
@@ -627,7 +661,9 @@ pub(crate) fn run(command: Command) -> i32 {
             return 1;
         }
     };
-    let store = Store { dir: paths.data_dir.join("schedules") };
+    let store = Store {
+        dir: paths.data_dir.join("schedules"),
+    };
     let exe = match std::env::current_exe() {
         Ok(exe) => exe,
         Err(error) => {
@@ -643,7 +679,11 @@ pub(crate) fn run(command: Command) -> i32 {
             Ok(record) => {
                 eprintln!(
                     "scheduled run {id} {}",
-                    if record.timed_out { "timed out".to_owned() } else { format!("exited {:?}", record.exit_code) }
+                    if record.timed_out {
+                        "timed out".to_owned()
+                    } else {
+                        format!("exited {:?}", record.exit_code)
+                    }
                 );
                 1
             }
@@ -666,7 +706,12 @@ pub(crate) fn run(command: Command) -> i32 {
     match command {
         Command::Add(new) => match add(&store, &host, &mut SystemRunner, *new, &cwd) {
             Ok(entry) => {
-                println!("Scheduled {} ({}) in {}", entry.id, entry.when.describe(), entry.workspace);
+                println!(
+                    "Scheduled {} ({}) in {}",
+                    entry.id,
+                    entry.when.describe(),
+                    entry.workspace
+                );
                 println!("Results: {}", store.last_path(&entry.id).display());
                 0
             }
@@ -725,30 +770,66 @@ mod tests {
         assert!(parse_invocation(&args("schedule the release")).is_none());
         assert!(parse_invocation(&args("schedule")).is_none());
         assert!(parse_invocation(&args("fix schedule add")).is_none());
-        assert_eq!(parse_invocation(&args("schedule list")), Some(Invocation::Run(Command::List)));
-        assert_eq!(parse_invocation(&args("schedule --help")), Some(Invocation::Help));
+        assert_eq!(
+            parse_invocation(&args("schedule list")),
+            Some(Invocation::Run(Command::List))
+        );
+        assert_eq!(
+            parse_invocation(&args("schedule --help")),
+            Some(Invocation::Help)
+        );
         assert_eq!(
             parse_invocation(&args("schedule remove ab12cd34")),
             Some(Invocation::Run(Command::Remove("ab12cd34".into())))
         );
-        assert!(matches!(parse_invocation(&args("schedule remove ../x")), Some(Invocation::Invalid(_))));
+        assert!(matches!(
+            parse_invocation(&args("schedule remove ../x")),
+            Some(Invocation::Invalid(_))
+        ));
     }
 
     #[test]
     fn add_arguments_validate() {
-        let ok = parse_add(&["--weekdays", "08:00", "--prompt", "review", "--max-budget-usd", "2.5", "--timeout", "30m"]).unwrap();
+        let ok = parse_add(&[
+            "--weekdays",
+            "08:00",
+            "--prompt",
+            "review",
+            "--max-budget-usd",
+            "2.5",
+            "--timeout",
+            "30m",
+        ])
+        .unwrap();
         assert_eq!(ok.when, When::Weekdays { hour: 8, minute: 0 });
         assert_eq!(ok.timeout_secs, 1800);
         assert_eq!(ok.max_budget_usd, Some(2.5));
-        assert_eq!(parse_add(&["--every", "2h", "--prompt", "p"]).unwrap().when, When::Every { minutes: 120 });
+        assert_eq!(
+            parse_add(&["--every", "2h", "--prompt", "p"]).unwrap().when,
+            When::Every { minutes: 120 }
+        );
         for bad in [
             vec!["--daily", "25:00", "--prompt", "p"],
             vec!["--daily", "08:00", "--weekdays", "09:00", "--prompt", "p"],
             vec!["--every", "1m", "--prompt", "p"],
             vec!["--every", "30m"],
             vec!["--daily", "08:00", "--prompt", "  "],
-            vec!["--daily", "08:00", "--prompt", "p", "--permission-mode", "Bad Mode"],
-            vec!["--daily", "08:00", "--prompt", "p", "--max-budget-usd", "-1"],
+            vec![
+                "--daily",
+                "08:00",
+                "--prompt",
+                "p",
+                "--permission-mode",
+                "Bad Mode",
+            ],
+            vec![
+                "--daily",
+                "08:00",
+                "--prompt",
+                "p",
+                "--max-budget-usd",
+                "-1",
+            ],
             vec!["--daily", "08:00", "--prompt", "p", "--bogus"],
         ] {
             assert!(parse_add(&bad).is_err(), "{bad:?}");
@@ -765,7 +846,8 @@ mod tests {
     }
 
     fn fixture() -> (PathBuf, Store, Host) {
-        let root = std::env::temp_dir().join(format!("mini-agent-schedule-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-schedule-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(root.join("ws")).unwrap();
         let host = Host {
             platform: Platform::Launchd,
@@ -773,22 +855,40 @@ mod tests {
             home: root.join("home"),
             uid: 501,
         };
-        (root.clone(), Store { dir: root.join("data/schedules") }, host)
+        (
+            root.clone(),
+            Store {
+                dir: root.join("data/schedules"),
+            },
+            host,
+        )
     }
 
     #[test]
     fn add_list_remove_round_trip_with_platform_artifacts() {
         let (root, store, host) = fixture();
         let mut runner = Recording::default();
-        let new = parse_add(&["--weekdays", "08:00", "--prompt", "nightly review", "--workspace", "ws"]).unwrap();
+        let new = parse_add(&[
+            "--weekdays",
+            "08:00",
+            "--prompt",
+            "nightly review",
+            "--workspace",
+            "ws",
+        ])
+        .unwrap();
         let entry = add(&store, &host, &mut runner, new, &root).unwrap();
-        let plist = host
-            .home
-            .join(format!("Library/LaunchAgents/com.mini-agent.schedule.{}.plist", entry.id));
+        let plist = host.home.join(format!(
+            "Library/LaunchAgents/com.mini-agent.schedule.{}.plist",
+            entry.id
+        ));
         assert!(plist.is_file());
         assert_eq!(runner.0[0][..3], ["launchctl", "bootstrap", "gui/501"]);
         assert_eq!(store.list(), vec![entry.clone()]);
-        assert_eq!(entry.workspace, root.join("ws").canonicalize().unwrap().to_string_lossy());
+        assert_eq!(
+            entry.workspace,
+            root.join("ws").canonicalize().unwrap().to_string_lossy()
+        );
 
         let notes = remove(&store, &host, &mut runner, &entry.id).unwrap();
         assert!(notes.is_empty());
@@ -813,7 +913,8 @@ mod tests {
         assert!(store.list().is_empty());
         let agents = host.home.join("Library/LaunchAgents");
         assert!(std::fs::read_dir(&agents).map(|d| d.count()).unwrap_or(0) == 0);
-        let missing = parse_add(&["--daily", "07:30", "--prompt", "p", "--workspace", "nope"]).unwrap();
+        let missing =
+            parse_add(&["--daily", "07:30", "--prompt", "p", "--workspace", "nope"]).unwrap();
         assert!(add(&store, &host, &mut Recording::default(), missing, &root).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -821,12 +922,35 @@ mod tests {
     #[test]
     fn turn_argv_is_a_headless_named_session_with_the_prompt_last() {
         let (root, store, host) = fixture();
-        let new = parse_add(&["--daily", "07:30", "--prompt", "-rf the thing", "--workspace", "ws", "--permission-mode", "guarded", "--max-budget-usd", "3"]).unwrap();
+        let new = parse_add(&[
+            "--daily",
+            "07:30",
+            "--prompt",
+            "-rf the thing",
+            "--workspace",
+            "ws",
+            "--permission-mode",
+            "guarded",
+            "--max-budget-usd",
+            "3",
+        ])
+        .unwrap();
         let entry = add(&store, &host, &mut Recording::default(), new, &root).unwrap();
         let argv = turn_argv(Path::new("/x/mini-agent"), &entry, false);
-        assert_eq!(argv[..4], ["/x/mini-agent", "-p", "--name", &format!("sched-{}", entry.id)]);
+        assert_eq!(
+            argv[..4],
+            [
+                "/x/mini-agent",
+                "-p",
+                "--name",
+                &format!("sched-{}", entry.id)
+            ]
+        );
         assert_eq!(turn_argv(Path::new("/x"), &entry, true)[2], "--session");
-        assert!(argv.windows(2).any(|w| w == ["--permission-mode", "guarded"]));
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--permission-mode", "guarded"])
+        );
         assert!(argv.windows(2).any(|w| w == ["--max-budget-usd", "3"]));
         assert_eq!(argv[argv.len() - 2..], ["--", "-rf the thing"]);
         let _ = std::fs::remove_dir_all(&root);
@@ -838,17 +962,24 @@ mod tests {
         let new = parse_add(&["--daily", "07:30", "--prompt", "p", "--workspace", "ws"]).unwrap();
         let entry = add(&store, &host, &mut Recording::default(), new, &root).unwrap();
         let mut seen = None;
-        let record = run_entry(&store, Path::new("/x/mini-agent"), &entry.id, &mut |argv, cwd, log, timeout| {
-            seen = Some((argv.to_vec(), cwd.to_path_buf(), log.to_path_buf(), timeout));
-            Ok((Some(0), false))
-        })
+        let record = run_entry(
+            &store,
+            Path::new("/x/mini-agent"),
+            &entry.id,
+            &mut |argv, cwd, log, timeout| {
+                seen = Some((argv.to_vec(), cwd.to_path_buf(), log.to_path_buf(), timeout));
+                Ok((Some(0), false))
+            },
+        )
         .unwrap();
         assert_eq!(record.exit_code, Some(0));
         let (argv, cwd, _, timeout) = seen.unwrap();
         assert_eq!(cwd, PathBuf::from(&entry.workspace));
         assert_eq!(timeout, Duration::from_secs(3600));
         assert!(argv.contains(&"-p".to_owned()));
-        let saved: RunRecord = serde_json::from_str(&std::fs::read_to_string(store.last_path(&entry.id)).unwrap()).unwrap();
+        let saved: RunRecord =
+            serde_json::from_str(&std::fs::read_to_string(store.last_path(&entry.id)).unwrap())
+                .unwrap();
         assert_eq!(saved, record);
         assert!(argv.contains(&"--name".to_owned()));
         // After a successful run the named session is resumed.
@@ -860,7 +991,10 @@ mod tests {
         .unwrap();
         assert!(second.contains(&"--session".to_owned()));
         assert!(last_summary(&store, &entry.id).contains("exit 0"));
-        let failed = run_entry(&store, Path::new("/x"), &entry.id, &mut |_, _, _, _| Err("could not start".into())).unwrap();
+        let failed = run_entry(&store, Path::new("/x"), &entry.id, &mut |_, _, _, _| {
+            Err("could not start".into())
+        })
+        .unwrap();
         assert!(failed.error.is_some() && failed.exit_code.is_none());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -872,7 +1006,11 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let log = root.join("run.log");
         let ok = launch_process(
-            &["sh".into(), "-c".into(), "echo out; echo err >&2; exit 3".into()],
+            &[
+                "sh".into(),
+                "-c".into(),
+                "echo out; echo err >&2; exit 3".into(),
+            ],
             Some(&root),
             Some(&log),
             Duration::from_secs(10),
@@ -891,7 +1029,15 @@ mod tests {
         .unwrap();
         assert_eq!(slow, (None, true));
         assert!(started.elapsed() < Duration::from_secs(10));
-        assert!(launch_process(&["/definitely/not/here".into()], None, None, Duration::from_secs(1)).is_err());
+        assert!(
+            launch_process(
+                &["/definitely/not/here".into()],
+                None,
+                None,
+                Duration::from_secs(1)
+            )
+            .is_err()
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

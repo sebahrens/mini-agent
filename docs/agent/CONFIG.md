@@ -2429,6 +2429,27 @@ appears when cache usage has been reported. Unknown pricing displays dim
 Known zero prices remain distinct from unknown prices. `/context` and `/cost`
 provide the full breakdown.
 
+A segment with `item = "command"` shows the first line of a program's output, for example the
+current Kubernetes context:
+
+```toml
+[[statusline.lines]]
+[[statusline.lines.segments]]
+item = "command"
+command = "kubectl"                       # run directly, never through a shell
+args = ["config", "current-context"]
+interval_secs = 15                        # at least 1, default 10
+timeout_secs = 2                          # 1-10, default 2; the process group is killed after it
+```
+
+The command runs off the UI task through the same launcher as `api_key_commands` (own process
+group, 16 KiB output cap, stderr discarded, your environment, outside the model sandbox) and gets
+a small JSON document on stdin (`model`, `provider`, `cwd`, `session_id`, `context_percentage`,
+`cost`). Its first stdout line, stripped of terminal control sequences and limited to 120
+characters, is cached and shown; a failure, empty output or a timeout shows nothing. Only the
+**global** config can define command segments: they are dropped from project configs at load (with
+a log warning), trusted or not.
+
 When the terminal narrows, whole items fold instead of silently losing their
 last letters. Icons, caps, and decorative separators go first; the combined
 `context` item can shorten to `ctx 1%`, and paths can shorten to a basename or

@@ -206,7 +206,13 @@ mod tests {
 
     #[test]
     fn specs_validate_and_clamp() {
-        assert!(CommandSpec::of(&StatusLineSegment { item: "command".into(), ..Default::default() }).is_none());
+        assert!(
+            CommandSpec::of(&StatusLineSegment {
+                item: "command".into(),
+                ..Default::default()
+            })
+            .is_none()
+        );
         assert!(CommandSpec::of(&segment("", &[])).is_none());
         assert!(CommandSpec::of(&segment("a\0b", &[])).is_none());
         let mut seg = segment("kubectl", &["config", "current-context"]);
@@ -223,14 +229,20 @@ mod tests {
 
     #[test]
     fn output_is_one_sanitised_bounded_line() {
-        assert_eq!(display_line(b"\x1b[31mprod\x1b[0m\nsecond"), Ok("prod".into()));
         assert_eq!(
-            display_line(b"a\x1b]0;evil title\x07b\n"),
-            Ok("ab".into())
+            display_line(b"\x1b[31mprod\x1b[0m\nsecond"),
+            Ok("prod".into())
         );
+        assert_eq!(display_line(b"a\x1b]0;evil title\x07b\n"), Ok("ab".into()));
         assert!(display_line(b"\n\n").is_err());
         assert!(display_line(b"   \n").is_err());
-        assert_eq!(display_line("x".repeat(500).as_bytes()).unwrap().chars().count(), MAX_TEXT_CHARS);
+        assert_eq!(
+            display_line("x".repeat(500).as_bytes())
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_TEXT_CHARS
+        );
     }
 
     #[test]
@@ -247,7 +259,10 @@ mod tests {
         assert_eq!(cached_text(&seg), Some("prod".into()));
         // Idle but inside the interval: not due; after it: due.
         assert!(due(std::slice::from_ref(&spec), now + Duration::from_secs(1)).is_empty());
-        assert_eq!(due(std::slice::from_ref(&spec), now + Duration::from_secs(11)).len(), 1);
+        assert_eq!(
+            due(std::slice::from_ref(&spec), now + Duration::from_secs(11)).len(),
+            1
+        );
         // A failure clears the shown text.
         assert!(finish(&spec, Err("timed out".into())));
         assert_eq!(cached_text(&seg), None);
@@ -269,7 +284,13 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a_command_gets_the_json_on_stdin_and_its_first_line_is_cached() {
-        let seg = segment("sh", &["-c", "read line; printf '\\033[1mctx:%s\\033[0m\\nignored' \"$line\""]);
+        let seg = segment(
+            "sh",
+            &[
+                "-c",
+                "read line; printf '\\033[1mctx:%s\\033[0m\\nignored' \"$line\"",
+            ],
+        );
         let spec = CommandSpec::of(&seg).unwrap();
         due(std::slice::from_ref(&spec), Instant::now());
         run(spec, b"{\"k\":1}\n".to_vec()).await;
@@ -282,7 +303,10 @@ mod tests {
             "[[lines]]\n[[lines.segments]]\nitem = \"model\"\n[[lines.segments]]\nitem = \"command\"\ncommand = \"/tmp/x\"\n",
         )
         .unwrap();
-        assert_eq!(crate::config::load::strip_statusline_commands(&mut value), 1);
+        assert_eq!(
+            crate::config::load::strip_statusline_commands(&mut value),
+            1
+        );
         let left = value["lines"][0]["segments"].as_array().unwrap();
         assert_eq!(left.len(), 1);
     }

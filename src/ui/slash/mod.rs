@@ -5,9 +5,8 @@ mod content;
 pub(crate) mod context;
 pub(crate) mod cron;
 mod doctor;
-mod feedback;
-mod plugins;
 mod features;
+mod feedback;
 #[cfg(feature = "git-worktree")]
 pub(crate) mod git;
 mod help;
@@ -16,6 +15,7 @@ mod hooks;
 pub(crate) mod init;
 mod jobs;
 mod memory;
+mod plugins;
 #[cfg(feature = "subagents")]
 mod tasks;
 #[cfg(feature = "memory")]

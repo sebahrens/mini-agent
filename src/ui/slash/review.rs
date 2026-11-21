@@ -73,9 +73,9 @@ fn valid_ref(value: &str) -> bool {
         && value.len() <= 200
         && !value.starts_with('-')
         && !value.contains("..")
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '@' | '^' | '~' | '+' | '-'))
+        && value.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '@' | '^' | '~' | '+' | '-')
+        })
 }
 
 pub(crate) fn parse_args(args: &[&str]) -> Result<ReviewRequest, String> {
@@ -315,7 +315,11 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
     let msg = if request.target.is_some() || request.post || request.security {
         let resolved = match &request.target {
             #[cfg(feature = "git-worktree")]
-            Some(target @ (ReviewTarget::Base(_) | ReviewTarget::Commit(_) | ReviewTarget::Uncommitted)) => {
+            Some(
+                target @ (ReviewTarget::Base(_)
+                | ReviewTarget::Commit(_)
+                | ReviewTarget::Uncommitted),
+            ) => {
                 let tool = crate::git::tool::GitTool::capture(
                     ctx.workspace.clone(),
                     ctx.sandbox.clone(),
@@ -391,13 +395,22 @@ mod tests {
             parse("--commit=abc1234").unwrap().target,
             Some(ReviewTarget::Commit("abc1234".into()))
         );
-        assert_eq!(parse("--uncommitted").unwrap().target, Some(ReviewTarget::Uncommitted));
-        assert_eq!(parse("--pr #12 --post").unwrap().target, Some(ReviewTarget::Pr(12)));
+        assert_eq!(
+            parse("--uncommitted").unwrap().target,
+            Some(ReviewTarget::Uncommitted)
+        );
+        assert_eq!(
+            parse("--pr #12 --post").unwrap().target,
+            Some(ReviewTarget::Pr(12))
+        );
         assert!(parse("--pr 12 --post").unwrap().post);
         assert!(parse("--security").unwrap().security);
         // Plain text is a focus, exactly as before.
         let plain = parse("check the parser").unwrap();
-        assert_eq!((plain.target, plain.text.as_str()), (None, "check the parser"));
+        assert_eq!(
+            (plain.target, plain.text.as_str()),
+            (None, "check the parser")
+        );
     }
 
     #[test]
@@ -422,7 +435,10 @@ mod tests {
         let request = parse("--base develop").unwrap();
         let big = TargetDiff {
             files: "M\tsrc/a.rs\n".into(),
-            diff: format!("diff --git a/src/a.rs b/src/a.rs\n{}", "+x\n".repeat(40_000)),
+            diff: format!(
+                "diff --git a/src/a.rs b/src/a.rs\n{}",
+                "+x\n".repeat(40_000)
+            ),
         };
         let message = build_message(&request, Some(&big));
         assert!(message.contains("`develop`") && message.contains("develop...HEAD"));
@@ -455,7 +471,11 @@ mod tests {
                 .args(args)
                 .output()
                 .unwrap();
-            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
         git(&["init", "--quiet", "-b", "main"]);
         git(&["config", "user.name", "t"]);
@@ -477,11 +497,15 @@ mod tests {
         git(&["add", "dirty.txt"]);
 
         let tool = crate::git::tool::GitTool::uncontained_for_test(&root);
-        let diff = resolve_target(&tool, &ReviewTarget::Base("main".into())).await.unwrap();
+        let diff = resolve_target(&tool, &ReviewTarget::Base("main".into()))
+            .await
+            .unwrap();
         assert!(diff.diff.contains("feature change"), "{}", diff.diff);
         assert!(!diff.diff.contains("main only"), "{}", diff.diff);
         assert!(diff.files.contains("feature.txt"));
-        let uncommitted = resolve_target(&tool, &ReviewTarget::Uncommitted).await.unwrap();
+        let uncommitted = resolve_target(&tool, &ReviewTarget::Uncommitted)
+            .await
+            .unwrap();
         assert!(uncommitted.files.contains("dirty.txt"));
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -1125,8 +1125,8 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
             }
             setup::SetupOutcome::Launch => {
                 // fall through to launch
-                if let Some(note) = dirs::home_dir()
-                    .and_then(|home| setup::import::detection_note(&home))
+                if let Some(note) =
+                    dirs::home_dir().and_then(|home| setup::import::detection_note(&home))
                 {
                     eprintln!("{note}");
                 }

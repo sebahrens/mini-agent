@@ -102,12 +102,21 @@ pub(crate) struct Ctx {
 /// How plugin sources are fetched: a git clone into a directory, returning the
 /// commit it resolved to.
 pub(crate) trait Fetcher {
-    fn clone_git(&mut self, url: &str, git_ref: Option<&str>, dest: &Path) -> Result<String, String>;
+    fn clone_git(
+        &mut self,
+        url: &str,
+        git_ref: Option<&str>,
+        dest: &Path,
+    ) -> Result<String, String>;
 }
 
 fn new_staging(ctx: &Ctx) -> Result<PathBuf, String> {
-    let dir = ctx.plugins_dir.join(format!(".staging-{}", &uuid::Uuid::new_v4().simple().to_string()[..12]));
-    std::fs::create_dir_all(&ctx.plugins_dir).map_err(|e| format!("cannot create {}: {e}", ctx.plugins_dir.display()))?;
+    let dir = ctx.plugins_dir.join(format!(
+        ".staging-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    ));
+    std::fs::create_dir_all(&ctx.plugins_dir)
+        .map_err(|e| format!("cannot create {}: {e}", ctx.plugins_dir.display()))?;
     std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
     Ok(dir)
 }
@@ -145,7 +154,8 @@ impl Ctx {
     fn save_registry(&self, registry: &Registry) -> Result<(), String> {
         std::fs::create_dir_all(&self.plugins_dir).map_err(|e| e.to_string())?;
         let json = serde_json::to_vec_pretty(registry).map_err(|e| e.to_string())?;
-        crate::fs::atomic_write_sync(&self.registry_path(), &json).map_err(|e| format!("cannot save the plugin list: {e}"))
+        crate::fs::atomic_write_sync(&self.registry_path(), &json)
+            .map_err(|e| format!("cannot save the plugin list: {e}"))
     }
 
     fn load_markets(&self) -> Marketplaces {
@@ -170,7 +180,10 @@ pub(crate) fn is_git_url(spec: &str) -> bool {
     }
     spec.starts_with("https://")
         || spec.starts_with("ssh://")
-        || (spec.contains('@') && spec.contains(':') && !spec.contains("://") && !spec.starts_with('/'))
+        || (spec.contains('@')
+            && spec.contains(':')
+            && !spec.contains("://")
+            && !spec.starts_with('/'))
 }
 
 /// A fetched plugin source: the directory to read and what to record.
@@ -194,7 +207,12 @@ fn fetch(
         match fetcher.clone_git(spec, git_ref, &dest) {
             Ok(commit) => Ok(Fetched {
                 dir: dest,
-                source: Source { location: spec.to_owned(), git_ref: git_ref.map(str::to_owned), commit: Some(commit), marketplace: None },
+                source: Source {
+                    location: spec.to_owned(),
+                    git_ref: git_ref.map(str::to_owned),
+                    commit: Some(commit),
+                    marketplace: None,
+                },
                 scratch: Some(scratch),
             }),
             Err(error) => {
@@ -203,14 +221,23 @@ fn fetch(
             }
         }
     } else {
-        let path = if Path::new(spec).is_absolute() { PathBuf::from(spec) } else { cwd.join(spec) };
+        let path = if Path::new(spec).is_absolute() {
+            PathBuf::from(spec)
+        } else {
+            cwd.join(spec)
+        };
         let path = path.canonicalize().map_err(|e| format!("{spec}: {e}"))?;
         if !path.is_dir() {
             return Err(format!("{} is not a directory", path.display()));
         }
         Ok(Fetched {
             dir: path.clone(),
-            source: Source { location: path.to_string_lossy().into_owned(), git_ref: None, commit: None, marketplace: None },
+            source: Source {
+                location: path.to_string_lossy().into_owned(),
+                git_ref: None,
+                commit: None,
+                marketplace: None,
+            },
             scratch: None,
         })
     }
@@ -272,7 +299,9 @@ fn install_dir(ctx: &Ctx, dir: &Path, source: Source) -> Result<Report, String> 
     let name = manifest.name.clone();
     let mut registry = ctx.load_registry();
     if registry.plugins.contains_key(&name) {
-        return Err(format!("plugin '{name}' is already installed (use `plugin update {name}`)"));
+        return Err(format!(
+            "plugin '{name}' is already installed (use `plugin update {name}`)"
+        ));
     }
     let staging = new_staging(ctx)?;
     let staged = staging.join("plugin");
@@ -289,28 +318,46 @@ fn install_dir(ctx: &Ctx, dir: &Path, source: Source) -> Result<Report, String> 
         let mut writes: Vec<(PathBuf, String)> = Vec::new();
         for command in &found.commands {
             let rel: PathBuf = command.name.split(':').collect();
-            let dest = ctx.commands_dir().join(&name).join(rel).with_extension("md");
-            writes.push((dest, std::fs::read_to_string(staged.join(&command.rel)).map_err(|e| e.to_string())?));
+            let dest = ctx
+                .commands_dir()
+                .join(&name)
+                .join(rel)
+                .with_extension("md");
+            writes.push((
+                dest,
+                std::fs::read_to_string(staged.join(&command.rel)).map_err(|e| e.to_string())?,
+            ));
         }
         for agent in &found.agents {
             let agent_name = format!("{name}-{}", agent.name);
             if !crate::context::agents::valid_agent_name(&agent_name) {
                 continue;
             }
-            let content = std::fs::read_to_string(staged.join(&agent.rel)).map_err(|e| e.to_string())?;
-            writes.push((ctx.agents_dir.join(format!("{agent_name}.md")), rewrite_agent_name(&content, &agent_name)));
+            let content =
+                std::fs::read_to_string(staged.join(&agent.rel)).map_err(|e| e.to_string())?;
+            writes.push((
+                ctx.agents_dir.join(format!("{agent_name}.md")),
+                rewrite_agent_name(&content, &agent_name),
+            ));
         }
         if let Some((existing, _)) = writes.iter().find(|(path, _)| path.exists()) {
-            return Err(format!("{} already exists; refusing to overwrite it", existing.display()));
+            return Err(format!(
+                "{} already exists; refusing to overwrite it",
+                existing.display()
+            ));
         }
-        std::fs::rename(&staged, &final_dir).map_err(|e| format!("cannot install into {}: {e}", final_dir.display()))?;
+        std::fs::rename(&staged, &final_dir)
+            .map_err(|e| format!("cannot install into {}: {e}", final_dir.display()))?;
         let mut files = Vec::new();
         for (path, content) in &writes {
             let outcome = path
                 .parent()
                 .map_or(Ok(()), std::fs::create_dir_all)
                 .map_err(|e| e.to_string())
-                .and_then(|_| crate::fs::atomic_write_sync(path, content.as_bytes()).map_err(|e| e.to_string()));
+                .and_then(|_| {
+                    crate::fs::atomic_write_sync(path, content.as_bytes())
+                        .map_err(|e| e.to_string())
+                });
             if let Err(error) = outcome {
                 for done in &files {
                     let _ = std::fs::remove_file(done);
@@ -362,8 +409,14 @@ fn substitute_root(value: &Value, root: &Path) -> Value {
             text.replace("${CLAUDE_PLUGIN_ROOT}", &root.to_string_lossy())
                 .replace("${MINI_AGENT_PLUGIN_ROOT}", &root.to_string_lossy()),
         ),
-        Value::Array(items) => Value::Array(items.iter().map(|v| substitute_root(v, root)).collect()),
-        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), substitute_root(v, root))).collect()),
+        Value::Array(items) => {
+            Value::Array(items.iter().map(|v| substitute_root(v, root)).collect())
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), substitute_root(v, root)))
+                .collect(),
+        ),
         other => other.clone(),
     }
 }
@@ -374,7 +427,12 @@ pub(crate) fn trust_preview(name: &str, components: &Components, root: &Path) ->
     for HookGroup { event, group } in &components.hooks {
         let group = substitute_root(group, root);
         let matcher = group.get("matcher").and_then(Value::as_str).unwrap_or("*");
-        for handler in group.get("hooks").and_then(Value::as_array).into_iter().flatten() {
+        for handler in group
+            .get("hooks")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let command = handler
                 .get("command")
                 .and_then(Value::as_str)
@@ -387,7 +445,10 @@ pub(crate) fn trust_preview(name: &str, components: &Components, root: &Path) ->
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect();
-            out.push_str(&format!("  hook  {event} [{matcher}]: {command} {}\n", args.join(" ")));
+            out.push_str(&format!(
+                "  hook  {event} [{matcher}]: {command} {}\n",
+                args.join(" ")
+            ));
         }
     }
     for (server, def) in &components.mcp {
@@ -397,10 +458,24 @@ pub(crate) fn trust_preview(name: &str, components: &Components, root: &Path) ->
             .and_then(Value::as_str)
             .map(str::to_owned)
             .unwrap_or_else(|| {
-                let args: Vec<&str> = def.get("args").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
-                format!("{} {}", def.get("command").and_then(Value::as_str).unwrap_or("?"), args.join(" "))
+                let args: Vec<&str> = def
+                    .get("args")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .collect();
+                format!(
+                    "{} {}",
+                    def.get("command").and_then(Value::as_str).unwrap_or("?"),
+                    args.join(" ")
+                )
             });
-        let env: Vec<&str> = def.get("env").and_then(Value::as_object).map(|e| e.keys().map(String::as_str).collect()).unwrap_or_default();
+        let env: Vec<&str> = def
+            .get("env")
+            .and_then(Value::as_object)
+            .map(|e| e.keys().map(String::as_str).collect())
+            .unwrap_or_default();
         out.push_str(&format!("  mcp   {name}.{server}: {target}"));
         if !env.is_empty() {
             out.push_str(&format!("  (env names: {})", env.join(", ")));
@@ -425,14 +500,21 @@ fn mcp_table(key: &str, def: &Value, root: &Path) -> toml::Table {
 
 fn read_settings(path: &Path) -> Result<Value, String> {
     match std::fs::read_to_string(path) {
-        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{} is not valid JSON ({e}); not touching it", path.display())),
+        Ok(text) => serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "{} is not valid JSON ({e}); not touching it",
+                path.display()
+            )
+        }),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Value::Object(Default::default())),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
 
 fn add_hooks(settings: &mut Value, groups: &[HookRecord]) -> Result<(), String> {
-    let root = settings.as_object_mut().ok_or("settings.json is not an object")?;
+    let root = settings
+        .as_object_mut()
+        .ok_or("settings.json is not an object")?;
     let hooks = root
         .entry("hooks")
         .or_insert_with(|| Value::Object(Default::default()))
@@ -452,7 +534,9 @@ fn add_hooks(settings: &mut Value, groups: &[HookRecord]) -> Result<(), String> 
 }
 
 fn remove_hooks(settings: &mut Value, groups: &[HookRecord]) {
-    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else { return };
+    let Some(hooks) = settings.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return;
+    };
     for record in groups {
         if let Some(list) = hooks.get_mut(&record.event).and_then(Value::as_array_mut) {
             list.retain(|group| group != &record.group);
@@ -470,7 +554,8 @@ fn write_json(path: &Path, value: &Value) -> Result<(), String> {
     }
     let mut bytes = serde_json::to_vec_pretty(value).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
-    crate::fs::atomic_write_sync(path, &bytes).map_err(|e| format!("cannot write {}: {e}", path.display()))
+    crate::fs::atomic_write_sync(path, &bytes)
+        .map_err(|e| format!("cannot write {}: {e}", path.display()))
 }
 
 /// Undo what `trust` activated for `name`.
@@ -484,26 +569,41 @@ fn deactivate(ctx: &Ctx, activated: &Activated) -> Result<(), String> {
     if !activated.mcp.is_empty() {
         let path = ctx.config_path();
         if let Ok(text) = std::fs::read_to_string(&path) {
-            let mut doc: toml_edit::DocumentMut = text.parse().map_err(|e| format!("{} does not parse: {e}", path.display()))?;
-            if let Some(servers) = doc.get_mut("mcp_servers").and_then(|s| s.as_table_like_mut()) {
+            let mut doc: toml_edit::DocumentMut = text
+                .parse()
+                .map_err(|e| format!("{} does not parse: {e}", path.display()))?;
+            if let Some(servers) = doc
+                .get_mut("mcp_servers")
+                .and_then(|s| s.as_table_like_mut())
+            {
                 for key in &activated.mcp {
                     servers.remove(key);
                 }
             }
-            crate::fs::atomic_write_sync(&path, doc.to_string().as_bytes()).map_err(|e| e.to_string())?;
+            crate::fs::atomic_write_sync(&path, doc.to_string().as_bytes())
+                .map_err(|e| e.to_string())?;
         }
     }
     Ok(())
 }
 
 /// Approve and activate the plugin's hooks and MCP servers.
-pub(crate) fn trust(ctx: &Ctx, name: &str, confirm: &mut dyn FnMut(&str) -> bool) -> Result<String, String> {
+pub(crate) fn trust(
+    ctx: &Ctx,
+    name: &str,
+    confirm: &mut dyn FnMut(&str) -> bool,
+) -> Result<String, String> {
     let mut registry = ctx.load_registry();
-    let record = registry.plugins.get_mut(name).ok_or_else(|| format!("plugin '{name}' is not installed"))?;
+    let record = registry
+        .plugins
+        .get_mut(name)
+        .ok_or_else(|| format!("plugin '{name}' is not installed"))?;
     let root = ctx.plugin_dir(name);
     let current = manifest::content_hash(&root)?;
     if current != record.hash {
-        return Err(format!("{name}: files changed since install; run `plugin update {name}` or reinstall"));
+        return Err(format!(
+            "{name}: files changed since install; run `plugin update {name}` or reinstall"
+        ));
     }
     let components = components_of(ctx, name)?;
     if components.hooks.is_empty() && components.mcp.is_empty() {
@@ -520,7 +620,10 @@ pub(crate) fn trust(ctx: &Ctx, name: &str, confirm: &mut dyn FnMut(&str) -> bool
     let hook_records: Vec<HookRecord> = components
         .hooks
         .iter()
-        .map(|h| HookRecord { event: h.event.clone(), group: substitute_root(&h.group, &root) })
+        .map(|h| HookRecord {
+            event: h.event.clone(),
+            group: substitute_root(&h.group, &root),
+        })
         .collect();
     if !hook_records.is_empty() {
         let path = ctx.settings_path();
@@ -544,7 +647,10 @@ pub(crate) fn trust(ctx: &Ctx, name: &str, confirm: &mut dyn FnMut(&str) -> bool
         crate::fs::atomic_write_sync(&path, updated.as_bytes()).map_err(|e| e.to_string())?;
     }
     record.trusted_hash = Some(current);
-    record.activated = Activated { mcp: mcp_keys, hooks: hook_records };
+    record.activated = Activated {
+        mcp: mcp_keys,
+        hooks: hook_records,
+    };
     let summary = format!(
         "Approved {name}: {} hook(s), {} MCP server(s) active (restart mini-agent to load them).",
         record.activated.hooks.len(),
@@ -557,14 +663,21 @@ pub(crate) fn trust(ctx: &Ctx, name: &str, confirm: &mut dyn FnMut(&str) -> bool
 /// Remove a plugin: its files, copied commands and agents, and any activation.
 pub(crate) fn remove(ctx: &Ctx, name: &str) -> Result<(), String> {
     let mut registry = ctx.load_registry();
-    let record = registry.plugins.get(name).cloned().ok_or_else(|| format!("plugin '{name}' is not installed"))?;
+    let record = registry
+        .plugins
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("plugin '{name}' is not installed"))?;
     deactivate(ctx, &record.activated)?;
     for file in &record.files {
         let _ = std::fs::remove_file(file);
         // Drop now-empty namespace directories below commands/.
         let mut dir = file.parent();
         while let Some(d) = dir {
-            if d == ctx.commands_dir() || !d.starts_with(ctx.commands_dir()) || std::fs::remove_dir(d).is_err() {
+            if d == ctx.commands_dir()
+                || !d.starts_with(ctx.commands_dir())
+                || std::fs::remove_dir(d).is_err()
+            {
                 break;
             }
             dir = d.parent();
@@ -601,14 +714,30 @@ pub(crate) fn install(
 
 /// Re-fetch an installed plugin from its recorded source; replace it when its
 /// content changed (revoking any approval).
-pub(crate) fn update(ctx: &Ctx, fetcher: &mut dyn Fetcher, name: &str, cwd: &Path) -> Result<Report, String> {
+pub(crate) fn update(
+    ctx: &Ctx,
+    fetcher: &mut dyn Fetcher,
+    name: &str,
+    cwd: &Path,
+) -> Result<Report, String> {
     let registry = ctx.load_registry();
-    let record = registry.plugins.get(name).cloned().ok_or_else(|| format!("plugin '{name}' is not installed"))?;
-    let fetched = fetch(ctx, fetcher, &record.source.location, record.source.git_ref.as_deref(), cwd)?;
+    let record = registry
+        .plugins
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("plugin '{name}' is not installed"))?;
+    let fetched = fetch(
+        ctx,
+        fetcher,
+        &record.source.location,
+        record.source.git_ref.as_deref(),
+        cwd,
+    )?;
     let result = (|| {
         let staging = new_staging(ctx)?;
         let probe = staging.join("probe");
-        let hash = manifest::copy_tree(&fetched.dir, &probe).and_then(|_| manifest::content_hash(&probe));
+        let hash =
+            manifest::copy_tree(&fetched.dir, &probe).and_then(|_| manifest::content_hash(&probe));
         let _ = std::fs::remove_dir_all(&staging);
         let hash = hash?;
         if hash == record.hash {
@@ -641,33 +770,55 @@ pub(crate) fn update(ctx: &Ctx, fetcher: &mut dyn Fetcher, name: &str, cwd: &Pat
 // ---- marketplaces --------------------------------------------------------
 
 fn index_path(dir: &Path) -> Option<PathBuf> {
-    [dir.join(".claude-plugin/marketplace.json"), dir.join("marketplace.json")]
-        .into_iter()
-        .find(|p| p.is_file())
+    [
+        dir.join(".claude-plugin/marketplace.json"),
+        dir.join("marketplace.json"),
+    ]
+    .into_iter()
+    .find(|p| p.is_file())
 }
 
 /// Add a marketplace from a local directory/file or a git URL.
-pub(crate) fn marketplace_add(ctx: &Ctx, fetcher: &mut dyn Fetcher, spec: &str, cwd: &Path) -> Result<String, String> {
+pub(crate) fn marketplace_add(
+    ctx: &Ctx,
+    fetcher: &mut dyn Fetcher,
+    spec: &str,
+    cwd: &Path,
+) -> Result<String, String> {
     let fetched = fetch(ctx, fetcher, spec, None, cwd);
     let (dir, source, scratch) = match fetched {
         Ok(f) => (f.dir, f.source.location, f.scratch),
         Err(error) => {
             // A single JSON file is also a marketplace.
-            let path = if Path::new(spec).is_absolute() { PathBuf::from(spec) } else { cwd.join(spec) };
+            let path = if Path::new(spec).is_absolute() {
+                PathBuf::from(spec)
+            } else {
+                cwd.join(spec)
+            };
             if path.is_file() {
                 let staging = new_staging(ctx)?;
-                std::fs::copy(&path, staging.join("marketplace.json")).map_err(|e| e.to_string())?;
-                (staging.clone(), path.to_string_lossy().into_owned(), Some(staging))
+                std::fs::copy(&path, staging.join("marketplace.json"))
+                    .map_err(|e| e.to_string())?;
+                (
+                    staging.clone(),
+                    path.to_string_lossy().into_owned(),
+                    Some(staging),
+                )
             } else {
                 return Err(error);
             }
         }
     };
     let result = (|| {
-        let index = index_path(&dir).ok_or("no .claude-plugin/marketplace.json (or marketplace.json) found")?;
+        let index = index_path(&dir)
+            .ok_or("no .claude-plugin/marketplace.json (or marketplace.json) found")?;
         let json = std::fs::read_to_string(&index).map_err(|e| e.to_string())?;
-        let value: Value = serde_json::from_str(&json).map_err(|e| format!("marketplace.json: {e}"))?;
-        let name = value.get("name").and_then(Value::as_str).ok_or("marketplace.json needs a name")?;
+        let value: Value =
+            serde_json::from_str(&json).map_err(|e| format!("marketplace.json: {e}"))?;
+        let name = value
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or("marketplace.json needs a name")?;
         if !manifest::valid_plugin_name(name) {
             return Err(format!("marketplace name '{name}' is not usable"));
         }
@@ -675,9 +826,14 @@ pub(crate) fn marketplace_add(ctx: &Ctx, fetcher: &mut dyn Fetcher, spec: &str, 
         let _ = std::fs::remove_dir_all(&dest);
         manifest::copy_tree(&dir, &dest)?;
         let mut markets = ctx.load_markets();
-        markets.marketplaces.insert(name.to_owned(), MarketplaceRecord { source });
+        markets
+            .marketplaces
+            .insert(name.to_owned(), MarketplaceRecord { source });
         ctx.save_markets(&markets)?;
-        let count = value.get("plugins").and_then(Value::as_array).map_or(0, Vec::len);
+        let count = value
+            .get("plugins")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
         Ok(format!("Added marketplace '{name}' ({count} plugin(s))."))
     })();
     if let Some(scratch) = scratch {
@@ -697,11 +853,15 @@ pub(crate) fn marketplace_remove(ctx: &Ctx, name: &str) -> Result<(), String> {
 }
 
 /// `(plugin, description)` rows of a registered marketplace.
-pub(crate) fn marketplace_plugins(ctx: &Ctx, market: &str) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn marketplace_plugins(
+    ctx: &Ctx,
+    market: &str,
+) -> Result<Vec<(String, String)>, String> {
     let dir = ctx.market_dir(market);
     let index = index_path(&dir).ok_or_else(|| format!("no marketplace named '{market}'"))?;
-    let value: Value = serde_json::from_str(&std::fs::read_to_string(index).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let value: Value =
+        serde_json::from_str(&std::fs::read_to_string(index).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
     Ok(value
         .get("plugins")
         .and_then(Value::as_array)
@@ -710,7 +870,12 @@ pub(crate) fn marketplace_plugins(ctx: &Ctx, market: &str) -> Result<Vec<(String
         .filter_map(|p| {
             Some((
                 p.get("name")?.as_str()?.to_owned(),
-                p.get("description").and_then(Value::as_str).unwrap_or("").chars().take(120).collect(),
+                p.get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect(),
             ))
         })
         .collect())
@@ -724,12 +889,15 @@ fn install_from_marketplace(
     cwd: &Path,
 ) -> Result<Report, String> {
     if !ctx.load_markets().marketplaces.contains_key(market) {
-        return Err(format!("no marketplace named '{market}' (add it with `plugin marketplace add`)"));
+        return Err(format!(
+            "no marketplace named '{market}' (add it with `plugin marketplace add`)"
+        ));
     }
     let dir = ctx.market_dir(market);
     let index = index_path(&dir).ok_or("the marketplace index is missing")?;
-    let value: Value = serde_json::from_str(&std::fs::read_to_string(index).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let value: Value =
+        serde_json::from_str(&std::fs::read_to_string(index).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
     let entry = value
         .get("plugins")
         .and_then(Value::as_array)
@@ -740,7 +908,10 @@ fn install_from_marketplace(
     let (spec, git_ref) = match entry.get("source") {
         Some(Value::String(rel)) => {
             let rel = PathBuf::from(rel.trim_start_matches("./"));
-            if rel.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+            if rel
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
                 return Err("the marketplace source path must stay inside the marketplace".into());
             }
             (dir.join(rel).to_string_lossy().into_owned(), None)
@@ -750,13 +921,19 @@ fn install_from_marketplace(
             match object.get("source").and_then(Value::as_str) {
                 Some("github") => {
                     let repo = object.get("repo").and_then(Value::as_str).unwrap_or("");
-                    if repo.split('/').count() != 2 || repo.contains(['\0', ' ', '.']) && repo.contains("..") {
+                    if repo.split('/').count() != 2
+                        || repo.contains(['\0', ' ', '.']) && repo.contains("..")
+                    {
                         return Err("the marketplace names an invalid GitHub repository".into());
                     }
                     (format!("https://github.com/{repo}.git"), git_ref)
                 }
                 Some("url" | "git") => (
-                    object.get("url").and_then(Value::as_str).unwrap_or("").to_owned(),
+                    object
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_owned(),
                     git_ref,
                 ),
                 _ => return Err("the marketplace entry has an unsupported source".into()),
@@ -796,11 +973,36 @@ pub(crate) fn describe(ctx: &Ctx) -> String {
         ));
         if let Ok(components) = components_of(ctx, name) {
             let list = |label: &str, names: Vec<String>| {
-                if names.is_empty() { String::new() } else { format!("  {label}: {}\n", names.join(", ")) }
+                if names.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {label}: {}\n", names.join(", "))
+                }
             };
-            out.push_str(&list("commands", components.commands.iter().map(|c| format!("/{name}:{}", c.name)).collect()));
-            out.push_str(&list("agents", components.agents.iter().map(|a| format!("{name}-{}", a.name)).collect()));
-            out.push_str(&list("skills", components.skills.iter().map(|s| format!("{name}:{}", s.name)).collect()));
+            out.push_str(&list(
+                "commands",
+                components
+                    .commands
+                    .iter()
+                    .map(|c| format!("/{name}:{}", c.name))
+                    .collect(),
+            ));
+            out.push_str(&list(
+                "agents",
+                components
+                    .agents
+                    .iter()
+                    .map(|a| format!("{name}-{}", a.name))
+                    .collect(),
+            ));
+            out.push_str(&list(
+                "skills",
+                components
+                    .skills
+                    .iter()
+                    .map(|s| format!("{name}:{}", s.name))
+                    .collect(),
+            ));
             if !components.hooks.is_empty() || !components.mcp.is_empty() {
                 out.push_str(&format!(
                     "  hooks: {}, MCP servers: {} ({state})\n",
@@ -839,11 +1041,17 @@ pub(crate) fn describe_for_paths(paths: &crate::paths::AppPaths) -> String {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Command {
-    Install { spec: String, git_ref: Option<String> },
+    Install {
+        spec: String,
+        git_ref: Option<String>,
+    },
     List,
     Remove(String),
     Update(Option<String>),
-    Trust { name: String, yes: bool },
+    Trust {
+        name: String,
+        yes: bool,
+    },
     MarketplaceAdd(String),
     MarketplaceList,
     MarketplaceRemove(String),
@@ -877,7 +1085,10 @@ pub(crate) fn parse_invocation(args: &[std::ffi::OsString]) -> Option<Invocation
         return None;
     }
     let sub = words.get(2).copied().flatten()?;
-    if !matches!(sub, "install" | "list" | "remove" | "update" | "trust" | "marketplace" | "-h" | "--help") {
+    if !matches!(
+        sub,
+        "install" | "list" | "remove" | "update" | "trust" | "marketplace" | "-h" | "--help"
+    ) {
         return None;
     }
     let Some(rest) = words[3..].iter().copied().collect::<Option<Vec<&str>>>() else {
@@ -890,19 +1101,35 @@ pub(crate) fn parse_invocation(args: &[std::ffi::OsString]) -> Option<Invocation
         ("remove", [name]) => Some(Invocation::Run(Command::Remove((*name).to_owned()))),
         ("update", []) => Some(Invocation::Run(Command::Update(None))),
         ("update", [name]) => Some(Invocation::Run(Command::Update(Some((*name).to_owned())))),
-        ("trust", [name]) => Some(Invocation::Run(Command::Trust { name: (*name).to_owned(), yes: false })),
+        ("trust", [name]) => Some(Invocation::Run(Command::Trust {
+            name: (*name).to_owned(),
+            yes: false,
+        })),
         ("trust", [name, "--yes"]) | ("trust", ["--yes", name]) => {
-            Some(Invocation::Run(Command::Trust { name: (*name).to_owned(), yes: true }))
+            Some(Invocation::Run(Command::Trust {
+                name: (*name).to_owned(),
+                yes: true,
+            }))
         }
-        ("install", [spec]) if !spec.starts_with('-') => {
-            Some(Invocation::Run(Command::Install { spec: (*spec).to_owned(), git_ref: None }))
+        ("install", [spec]) if !spec.starts_with('-') => Some(Invocation::Run(Command::Install {
+            spec: (*spec).to_owned(),
+            git_ref: None,
+        })),
+        ("install", [spec, "--ref", git_ref])
+            if !spec.starts_with('-') && !git_ref.starts_with('-') =>
+        {
+            Some(Invocation::Run(Command::Install {
+                spec: (*spec).to_owned(),
+                git_ref: Some((*git_ref).to_owned()),
+            }))
         }
-        ("install", [spec, "--ref", git_ref]) if !spec.starts_with('-') && !git_ref.starts_with('-') => {
-            Some(Invocation::Run(Command::Install { spec: (*spec).to_owned(), git_ref: Some((*git_ref).to_owned()) }))
+        ("marketplace", ["add", spec]) if !spec.starts_with('-') => {
+            Some(Invocation::Run(Command::MarketplaceAdd((*spec).to_owned())))
         }
-        ("marketplace", ["add", spec]) if !spec.starts_with('-') => Some(Invocation::Run(Command::MarketplaceAdd((*spec).to_owned()))),
         ("marketplace", ["list"]) => Some(Invocation::Run(Command::MarketplaceList)),
-        ("marketplace", ["remove", name]) => Some(Invocation::Run(Command::MarketplaceRemove((*name).to_owned()))),
+        ("marketplace", ["remove", name]) => Some(Invocation::Run(Command::MarketplaceRemove(
+            (*name).to_owned(),
+        ))),
         _ => invalid(&format!("invalid arguments for plugin {sub}")),
     }
 }
@@ -912,27 +1139,58 @@ pub(crate) fn parse_invocation(args: &[std::ffi::OsString]) -> Option<Invocation
 struct GitFetcher;
 
 impl Fetcher for GitFetcher {
-    fn clone_git(&mut self, url: &str, git_ref: Option<&str>, dest: &Path) -> Result<String, String> {
+    fn clone_git(
+        &mut self,
+        url: &str,
+        git_ref: Option<&str>,
+        dest: &Path,
+    ) -> Result<String, String> {
         use crate::extras::schedule::launch_process_with_env;
         let log = dest.with_extension("log");
         let env = [("GIT_TERMINAL_PROMPT", "0")];
-        let mut argv: Vec<String> = ["git", "-c", "protocol.ext.allow=never", "-c", "protocol.file.allow=never", "clone", "--depth", "1", "--no-tags", "--single-branch"]
-            .iter()
-            .map(|s| (*s).to_owned())
-            .collect();
+        let mut argv: Vec<String> = [
+            "git",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "protocol.file.allow=never",
+            "clone",
+            "--depth",
+            "1",
+            "--no-tags",
+            "--single-branch",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
         if let Some(git_ref) = git_ref {
             argv.extend(["--branch".into(), git_ref.to_owned()]);
         }
-        argv.extend(["--".into(), url.to_owned(), dest.to_string_lossy().into_owned()]);
+        argv.extend([
+            "--".into(),
+            url.to_owned(),
+            dest.to_string_lossy().into_owned(),
+        ]);
         match launch_process_with_env(&argv, None, Some(&log), Duration::from_secs(180), &env)? {
             (Some(0), false) => {}
             (_, true) => return Err("git clone timed out".into()),
-            (code, _) => return Err(format!("git clone failed ({})", code.map_or("signal".into(), |c| format!("exit {c}")))),
+            (code, _) => {
+                return Err(format!(
+                    "git clone failed ({})",
+                    code.map_or("signal".into(), |c| format!("exit {c}"))
+                ));
+            }
         }
-        let argv: Vec<String> = ["git", "-C", &dest.to_string_lossy(), "rev-parse", "HEAD"].iter().map(|s| (*s).to_owned()).collect();
+        let argv: Vec<String> = ["git", "-C", &dest.to_string_lossy(), "rev-parse", "HEAD"]
+            .iter()
+            .map(|s| (*s).to_owned())
+            .collect();
         let rev_log = dest.with_extension("rev");
         launch_process_with_env(&argv, None, Some(&rev_log), Duration::from_secs(20), &env)?;
-        let rev = std::fs::read_to_string(&rev_log).unwrap_or_default().trim().to_owned();
+        let rev = std::fs::read_to_string(&rev_log)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
         if rev.len() < 7 || !rev.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err("could not resolve the cloned commit".into());
         }
@@ -973,13 +1231,15 @@ pub(crate) fn run(command: Command) -> i32 {
         1
     };
     match command {
-        Command::Install { spec, git_ref } => match install(&ctx, &mut GitFetcher, &spec, git_ref.as_deref(), &cwd) {
-            Ok(report) => {
-                println!("Installed {}", report.summary());
-                0
+        Command::Install { spec, git_ref } => {
+            match install(&ctx, &mut GitFetcher, &spec, git_ref.as_deref(), &cwd) {
+                Ok(report) => {
+                    println!("Installed {}", report.summary());
+                    0
+                }
+                Err(error) => fail(error),
             }
-            Err(error) => fail(error),
-        },
+        }
         Command::List => {
             print!("{}", describe(&ctx));
             0
@@ -1010,7 +1270,14 @@ pub(crate) fn run(command: Command) -> i32 {
             code
         }
         Command::Trust { name, yes } => {
-            let mut confirm = |preview: &str| if yes { println!("{preview}"); true } else { confirm_on_terminal(preview) };
+            let mut confirm = |preview: &str| {
+                if yes {
+                    println!("{preview}");
+                    true
+                } else {
+                    confirm_on_terminal(preview)
+                }
+            };
             match trust(&ctx, &name, &mut confirm) {
                 Ok(message) => {
                     println!("{message}");
@@ -1019,17 +1286,21 @@ pub(crate) fn run(command: Command) -> i32 {
                 Err(error) => fail(error),
             }
         }
-        Command::MarketplaceAdd(spec) => match marketplace_add(&ctx, &mut GitFetcher, &spec, &cwd) {
-            Ok(message) => {
-                println!("{message}");
-                0
+        Command::MarketplaceAdd(spec) => {
+            match marketplace_add(&ctx, &mut GitFetcher, &spec, &cwd) {
+                Ok(message) => {
+                    println!("{message}");
+                    0
+                }
+                Err(error) => fail(error),
             }
-            Err(error) => fail(error),
-        },
+        }
         Command::MarketplaceList => {
             let markets = ctx.load_markets();
             if markets.marketplaces.is_empty() {
-                println!("No marketplaces. Add one with `mini-agent plugin marketplace add <path|git-url>`.");
+                println!(
+                    "No marketplaces. Add one with `mini-agent plugin marketplace add <path|git-url>`."
+                );
             }
             for (name, record) in markets.marketplaces {
                 println!("{name}  ({})", record.source);
@@ -1071,7 +1342,8 @@ mod tests {
     }
 
     fn fixture() -> (PathBuf, Ctx) {
-        let root = std::env::temp_dir().join(format!("mini-agent-plugins-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("mini-agent-plugins-{}", uuid::Uuid::new_v4()));
         let ctx = Ctx {
             plugins_dir: root.join("data/plugins"),
             config_dir: root.join("config"),
@@ -1087,7 +1359,13 @@ mod tests {
         write_plugin(&root.join("src/acme"), "acme");
         let report = install(&ctx, &mut NoGit, "src/acme", None, &root).unwrap();
         assert_eq!(
-            (report.commands, report.agents, report.skills, report.hooks, report.mcp),
+            (
+                report.commands,
+                report.agents,
+                report.skills,
+                report.hooks,
+                report.mcp
+            ),
             (1, 1, 1, 1, 1)
         );
         // Commands and agents are namespaced files.
@@ -1095,9 +1373,16 @@ mod tests {
         let agent = std::fs::read_to_string(root.join("data/agents/acme-reviewer.md")).unwrap();
         assert!(agent.contains("name: acme-reviewer"), "{agent}");
         // The skill is discoverable from the installed directory.
-        assert_eq!(installed_skill_dirs(&ctx.plugins_dir), vec![ctx.plugin_dir("acme")]);
+        assert_eq!(
+            installed_skill_dirs(&ctx.plugins_dir),
+            vec![ctx.plugin_dir("acme")]
+        );
         let listing = describe(&ctx);
-        assert!(listing.contains("/acme:ship") && listing.contains("acme-reviewer") && listing.contains("acme:lint"));
+        assert!(
+            listing.contains("/acme:ship")
+                && listing.contains("acme-reviewer")
+                && listing.contains("acme:lint")
+        );
         // Hooks and MCP stay inactive until trust.
         assert!(!ctx.settings_path().exists() && !ctx.config_path().exists());
         assert!(listing.contains("not approved"));
@@ -1108,7 +1393,8 @@ mod tests {
     }
 
     #[test]
-    fn trust_requires_confirmation_activates_exactly_the_reviewed_components_and_remove_undoes_all() {
+    fn trust_requires_confirmation_activates_exactly_the_reviewed_components_and_remove_undoes_all()
+    {
         let (root, ctx) = fixture();
         write_plugin(&root.join("src/acme"), "acme");
         std::fs::create_dir_all(&ctx.config_dir).unwrap();
@@ -1118,23 +1404,47 @@ mod tests {
 
         // Declining activates nothing.
         let mut shown = String::new();
-        assert!(trust(&ctx, "acme", &mut |preview| { shown = preview.to_owned(); false }).is_err());
-        assert!(shown.contains("PreToolUse") && shown.contains("guard.sh") && shown.contains("acme.tools"));
+        assert!(
+            trust(&ctx, "acme", &mut |preview| {
+                shown = preview.to_owned();
+                false
+            })
+            .is_err()
+        );
+        assert!(
+            shown.contains("PreToolUse")
+                && shown.contains("guard.sh")
+                && shown.contains("acme.tools")
+        );
         assert!(!shown.contains("sk-secret-value"), "{shown}");
-        assert!(!std::fs::read_to_string(ctx.config_path()).unwrap().contains("acme.tools"));
+        assert!(
+            !std::fs::read_to_string(ctx.config_path())
+                .unwrap()
+                .contains("acme.tools")
+        );
 
         trust(&ctx, "acme", &mut |_| true).unwrap();
         let config = std::fs::read_to_string(ctx.config_path()).unwrap();
         assert!(config.starts_with("model = \"openai/x\""));
         assert!(config.contains("[mcp_servers.\"acme.tools\"]"), "{config}");
         let reparsed: toml::Table = config.parse().unwrap();
-        assert!(reparsed["mcp_servers"].as_table().unwrap().contains_key("acme.tools"));
+        assert!(
+            reparsed["mcp_servers"]
+                .as_table()
+                .unwrap()
+                .contains_key("acme.tools")
+        );
         assert!(!config.contains("sk-secret-value"), "{config}");
         let root_dir = ctx.plugin_dir("acme").to_string_lossy().into_owned();
         assert!(config.contains(&root_dir), "{config}");
-        let settings: Value = serde_json::from_str(&std::fs::read_to_string(ctx.settings_path()).unwrap()).unwrap();
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(ctx.settings_path()).unwrap()).unwrap();
         assert_eq!(settings["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
-        assert!(settings["hooks"]["PreToolUse"][0].to_string().contains(&root_dir));
+        assert!(
+            settings["hooks"]["PreToolUse"][0]
+                .to_string()
+                .contains(&root_dir)
+        );
         assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1);
         assert!(describe(&ctx).contains("approved") && !describe(&ctx).contains("not approved"));
 
@@ -1142,10 +1452,19 @@ mod tests {
         assert!(!ctx.plugin_dir("acme").exists());
         assert!(!root.join("config/commands/acme").exists());
         assert!(!root.join("data/agents/acme-reviewer.md").exists());
-        assert!(!std::fs::read_to_string(ctx.config_path()).unwrap().contains("acme"));
-        let settings: Value = serde_json::from_str(&std::fs::read_to_string(ctx.settings_path()).unwrap()).unwrap();
+        assert!(
+            !std::fs::read_to_string(ctx.config_path())
+                .unwrap()
+                .contains("acme")
+        );
+        let settings: Value =
+            serde_json::from_str(&std::fs::read_to_string(ctx.settings_path()).unwrap()).unwrap();
         assert!(settings["hooks"].get("PreToolUse").is_none());
-        assert_eq!(settings["hooks"]["Stop"].as_array().unwrap().len(), 1, "the user's own hook stays");
+        assert_eq!(
+            settings["hooks"]["Stop"].as_array().unwrap().len(),
+            1,
+            "the user's own hook stays"
+        );
         assert!(describe(&ctx).starts_with("No plugins installed"));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1167,7 +1486,11 @@ mod tests {
         assert!(!settings.contains("guard.sh"), "{settings}");
         // Tampering with installed files blocks a stale approval.
         std::fs::write(ctx.plugin_dir("acme").join("guard.sh"), "evil").unwrap();
-        assert!(trust(&ctx, "acme", &mut |_| true).unwrap_err().contains("changed"));
+        assert!(
+            trust(&ctx, "acme", &mut |_| true)
+                .unwrap_err()
+                .contains("changed")
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1189,45 +1512,107 @@ mod tests {
         assert_eq!(marketplace_plugins(&ctx, "team").unwrap()[0].0, "local-one");
         let local = install(&ctx, &mut NoGit, "local-one@team", None, &root).unwrap();
         assert_eq!(local.name, "local-one");
-        assert_eq!(ctx.load_registry().plugins["local-one"].source.marketplace.as_deref(), Some("team"));
+        assert_eq!(
+            ctx.load_registry().plugins["local-one"]
+                .source
+                .marketplace
+                .as_deref(),
+            Some("team")
+        );
         assert!(install(&ctx, &mut NoGit, "evil@team", None, &root).is_err());
         assert!(install(&ctx, &mut NoGit, "missing@team", None, &root).is_err());
         assert!(install(&ctx, &mut NoGit, "x@nomarket", None, &root).is_err());
         // The github entry goes through the git fetcher.
-        let remote = install(&ctx, &mut FakeGit("remote-one"), "remote-one@team", None, &root).unwrap();
+        let remote = install(
+            &ctx,
+            &mut FakeGit("remote-one"),
+            "remote-one@team",
+            None,
+            &root,
+        )
+        .unwrap();
         assert_eq!(remote.name, "remote-one");
         let record = &ctx.load_registry().plugins["remote-one"];
         assert_eq!(record.source.location, "https://github.com/o/r.git");
-        assert_eq!(record.source.commit.as_deref(), Some("0123456789abcdef0123456789abcdef01234567"));
+        assert_eq!(
+            record.source.commit.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
         // Direct git install with a ref.
-        let direct = install(&ctx, &mut FakeGit("direct-one"), "https://example.com/x.git", Some("v1"), &root).unwrap();
-        assert_eq!(ctx.load_registry().plugins[&direct.name].source.git_ref.as_deref(), Some("v1"));
+        let direct = install(
+            &ctx,
+            &mut FakeGit("direct-one"),
+            "https://example.com/x.git",
+            Some("v1"),
+            &root,
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.load_registry().plugins[&direct.name]
+                .source
+                .git_ref
+                .as_deref(),
+            Some("v1")
+        );
         marketplace_remove(&ctx, "team").unwrap();
         assert!(marketplace_plugins(&ctx, "team").is_err());
         // No scratch directories are left behind.
-        assert!(std::fs::read_dir(&ctx.plugins_dir).unwrap().flatten().all(|e| !e.file_name().to_string_lossy().starts_with(".staging")));
+        assert!(
+            std::fs::read_dir(&ctx.plugins_dir)
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().starts_with(".staging"))
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
     fn git_locations_are_restricted_and_commands_parse() {
-        for ok in ["https://github.com/o/r.git", "ssh://git@host/o/r", "git@github.com:o/r.git"] {
+        for ok in [
+            "https://github.com/o/r.git",
+            "ssh://git@host/o/r",
+            "git@github.com:o/r.git",
+        ] {
             assert!(is_git_url(ok), "{ok}");
         }
-        for bad in ["--upload-pack=x", "ext::sh -c x", "file:///etc", "/local/path", "http://insecure/x", "a b"] {
+        for bad in [
+            "--upload-pack=x",
+            "ext::sh -c x",
+            "file:///etc",
+            "/local/path",
+            "http://insecure/x",
+            "a b",
+        ] {
             assert!(!is_git_url(bad), "{bad}");
         }
-        let args = |line: &str| std::iter::once("mini-agent").chain(line.split_whitespace()).map(std::ffi::OsString::from).collect::<Vec<_>>();
+        let args = |line: &str| {
+            std::iter::once("mini-agent")
+                .chain(line.split_whitespace())
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
         assert!(parse_invocation(&args("plugin the release")).is_none());
         assert_eq!(
             parse_invocation(&args("plugin install ./p --ref v2")),
-            Some(Invocation::Run(Command::Install { spec: "./p".into(), git_ref: Some("v2".into()) }))
+            Some(Invocation::Run(Command::Install {
+                spec: "./p".into(),
+                git_ref: Some("v2".into())
+            }))
         );
         assert_eq!(
             parse_invocation(&args("plugin trust acme --yes")),
-            Some(Invocation::Run(Command::Trust { name: "acme".into(), yes: true }))
+            Some(Invocation::Run(Command::Trust {
+                name: "acme".into(),
+                yes: true
+            }))
         );
-        assert!(matches!(parse_invocation(&args("plugin install --evil")), Some(Invocation::Invalid(_))));
-        assert_eq!(parse_invocation(&args("plugin marketplace list")), Some(Invocation::Run(Command::MarketplaceList)));
+        assert!(matches!(
+            parse_invocation(&args("plugin install --evil")),
+            Some(Invocation::Invalid(_))
+        ));
+        assert_eq!(
+            parse_invocation(&args("plugin marketplace list")),
+            Some(Invocation::Run(Command::MarketplaceList))
+        );
     }
 }

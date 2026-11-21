@@ -81,6 +81,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Added: ACP answers `max_turn_requests` for a spent turn cap and `max_tokens` for a spent token budget or a final answer cut off at the output limit, instead of a JSON-RPC internal error or `end_turn`; the explanation arrives as a thought chunk (mini-agent-nvnkx.273).
 - `shell-auto-allow-sandboxed` (global-only, default off; a managed policy can force it off with `forbid_shell_auto_allow`) lets standard mode run unmatched shell commands without a prompt while an enforced `workspace`/`host-read` sandbox with network `deny`/`allowlist` contains them; deny and ask rules, destructive commands and escalation still prompt, and `/sandbox` and the status line show the state (mini-agent-nvnkx.62).
 - `--add-workspace-dir DIR` (and `--add-dir` under `add_dir_tool_access = true`) gives DIR to the file tools and the shell sandbox write roots together, and `/add-dir DIR` grants file-tool access for the running session (mini-agent-nvnkx.71).
+- `mini-agent import-settings <claude|codex|opencode> [--dry-run] [--yes]` previews and, after confirmation, converts another agent's user settings (MCP servers, permission rules, model, commands, agents) into `config.toml`; credentials become `${NAME}` references, hooks are never imported, `--setup` points to it (mini-agent-nvnkx.129).
+- `mini-agent plugin install|list|remove|update|trust` and `plugin marketplace add|list|remove` install plugin bundles (commands, agents, skills, hooks, MCP servers) with a content hash; hooks and MCP servers stay inactive until `plugin trust` approves their exact content; `/plugins` lists them (mini-agent-nvnkx.126).
+- A `[[statusline.lines.segments]]` item `command` shows the first line of a program's output (interval, timeout, JSON on stdin, global config only) (mini-agent-nvnkx.134).
+- `/review --base|--commit|--uncommitted|--pr [--post] [--security]` reviews an explicit change set with a bounded diff in the message; `--post` only drafts and asks before `gh pr review` (mini-agent-nvnkx.137).
+- `/feedback [--open] [text]` drafts a redacted issue and opens the prefilled new-issue page; `/release-notes` prints the running version's changelog section, mentioned after `mini-agent update` (mini-agent-nvnkx.145).
+- `/unshare` deletes the session's shared gist, a second `/share confirm` updates it, and `gh auth token` is the credential fallback when no token variable is set (mini-agent-nvnkx.55).
+- `mini-agent schedule add|list|remove|run` installs launchd, systemd user-timer or Task Scheduler entries that run a headless turn and record its result (mini-agent-nvnkx.138).
 
 ### Fixed
 
