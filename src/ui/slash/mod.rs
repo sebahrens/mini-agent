@@ -616,10 +616,6 @@ async fn handle_compress_unfloored(
         TuiCompactionGate::Cut(cut_idx) => cut_idx,
     };
 
-    #[cfg(feature = "hooks")]
-    crate::startup::heap_future(|| crate::extras::hooks::dispatch_pre_compact(auto, instructions))
-        .await;
-
     // Announce only once we know compression will actually run.
     if auto {
         renderer.write_line(
@@ -681,18 +677,44 @@ async fn handle_compress_unfloored(
     // or stalled summarizer can be abandoned; history is only touched after the
     // summary arrives, so a cancelled compaction leaves it intact.
     let cancel = crate::ui::CompactionCancel::begin();
-    let compaction = compact_session_with_restoring(
+    let pre_compact_sent = std::sync::atomic::AtomicBool::new(false);
+    let mut observer =
+        crate::session::compaction_run::StageObserver::new(|summary, first_kept_index| {
+            #[cfg(feature = "memory")]
+            if let Some(pending) = run.pending_turn.as_mut() {
+                pending.stage_memory_summary(summary.to_string(), Some(first_kept_index));
+            } else {
+                crate::extras::memory::flush_compaction_summary(
+                    &crate::extras::memory::Mem::open(),
+                    summary,
+                    Some(first_kept_index),
+                );
+            }
+            #[cfg(not(feature = "memory"))]
+            let _ = (summary, first_kept_index);
+        });
+    let compaction = crate::session::compaction_run::run(
         ui.session,
-        cut_idx,
-        summarizer_input_budget,
-        reserve,
-        restore_read_tokens,
-        |model, messages, previous_summary, input_budget, response_budget| async move {
-            let model = compaction_model.unwrap_or(model);
+        crate::session::compaction_run::Plan {
+            cut_idx,
+            input_token_budget: summarizer_input_budget,
+            response_token_budget: reserve,
+            restore_read_tokens,
+            auto,
+            instructions,
+            fork_keep_recent_tool_results: None,
+            pre_compact_sent: &pre_compact_sent,
+            snap: None,
+        },
+        &mut observer,
+        |request| async move {
+            let model = compaction_model.unwrap_or(request.model);
+            let messages = request.messages;
+            let previous_summary = request.previous_summary;
             let (input_budget, response_budget) = crate::config::CompactionBudgetCap::apply(
                 budget_cap,
-                input_budget,
-                response_budget,
+                request.input_token_budget,
+                request.response_token_budget,
             );
             if let Some((agent, history)) = cache_fork {
                 match agent
@@ -728,27 +750,17 @@ async fn handle_compress_unfloored(
                 )
                 .await
         },
-        |summary, first_kept_index| {
-            #[cfg(feature = "memory")]
-            if let Some(pending) = run.pending_turn.as_mut() {
-                pending.stage_memory_summary(summary.to_string(), Some(first_kept_index));
-            } else {
-                crate::extras::memory::flush_compaction_summary(
-                    &crate::extras::memory::Mem::open(),
-                    summary,
-                    Some(first_kept_index),
-                );
-            }
-            #[cfg(not(feature = "memory"))]
-            let _ = (summary, first_kept_index);
-        },
     );
     let compacted = tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(anyhow::anyhow!(
             "compaction cancelled; the history is unchanged"
         )),
-        result = compaction => result,
+        result = compaction => result.map_err(anyhow::Error::from).map(|compacted| (
+            compacted.first_kept_index,
+            compacted.tokens_before,
+            compacted.usage,
+        )),
     };
     drop(cancel);
     let (first_kept_index, tokens_before, usage) = match compacted {
@@ -774,19 +786,6 @@ async fn handle_compress_unfloored(
     #[cfg(feature = "goal")]
     if let Some(collector) = run.goal_round.as_mut() {
         collector.add_usage(usage);
-    }
-
-    #[cfg(feature = "hooks")]
-    {
-        let summary = ui.session.compacted_context().0.map(str::to_owned);
-        crate::startup::heap_future(|| {
-            crate::extras::hooks::dispatch_post_compact(auto, summary.as_deref())
-        })
-        .await;
-        let notices =
-            crate::startup::heap_future(|| crate::extras::hooks::dispatch_session_start("compact"))
-                .await;
-        crate::extras::hooks::append_context_session(ui.session, &notices.into_notices());
     }
 
     // A native thinking chain was built over the pre-compaction transcript:
@@ -958,7 +957,9 @@ async fn cache_fork_input(
 }
 
 /// As [`compact_session_with`], re-attaching the newest file windows read in
-/// the compacted prefix within `restore_read_tokens` (mini-agent-xzt6g).
+/// the compacted prefix within `restore_read_tokens` (mini-agent-xzt6g). A thin
+/// test shim over the shared driver; usage is returned, not charged.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn compact_session_with_restoring<S, F>(
     session: &mut Session,
@@ -973,37 +974,38 @@ where
     S: FnOnce(String, Vec<crate::session::SessionMessage>, Option<String>, u64, u64) -> F,
     F: std::future::Future<Output = anyhow::Result<crate::provider::CompactionOutput>>,
 {
-    let model = session.model.to_string();
-    #[cfg(feature = "subagents")]
-    let _background_pause = match &session.background_pool {
-        Some(pool) => Some(pool.pause_for_history().await?),
-        None => None,
-    };
-    let (skipped, messages) = session.compaction_input(cut_idx);
-    let previous_summary = session.previous_summary_prose();
-    let crate::provider::CompactionOutput {
-        summary,
-        summary_byte_budget,
-        messages_included,
-        usage,
-    } = summarize(
-        model,
-        messages,
-        previous_summary,
-        input_token_budget,
-        response_token_budget,
+    let pre_compact_sent = std::sync::atomic::AtomicBool::new(false);
+    let mut observer = crate::session::compaction_run::StageObserver::new(stage_summary);
+    let compacted = crate::session::compaction_run::run(
+        session,
+        crate::session::compaction_run::Plan {
+            cut_idx,
+            input_token_budget,
+            response_token_budget,
+            restore_read_tokens,
+            auto: false,
+            instructions: None,
+            fork_keep_recent_tool_results: None,
+            pre_compact_sent: &pre_compact_sent,
+            snap: None,
+        },
+        &mut observer,
+        |request| {
+            summarize(
+                request.model,
+                request.messages,
+                request.previous_summary,
+                request.input_token_budget,
+                request.response_token_budget,
+            )
+        },
     )
     .await?;
-    let (first_kept_index, tokens_before) = session.commit_summarized_cut(
-        skipped,
-        cut_idx,
-        summary,
-        summary_byte_budget,
-        messages_included,
-        restore_read_tokens,
-        stage_summary,
-    )?;
-    Ok((first_kept_index, tokens_before, usage))
+    Ok((
+        compacted.first_kept_index,
+        compacted.tokens_before,
+        compacted.usage,
+    ))
 }
 
 pub(crate) fn is_readonly_diagnostic(text: &str) -> bool {

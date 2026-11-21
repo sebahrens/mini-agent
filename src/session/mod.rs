@@ -4,6 +4,7 @@ pub(crate) mod catalogue;
 pub mod chat_history;
 pub(crate) mod compaction;
 pub(crate) mod compaction_images;
+pub(crate) mod compaction_run;
 pub(crate) mod environment;
 pub(crate) mod file_checkpoints;
 pub mod lock;
@@ -3427,6 +3428,7 @@ impl Session {
     /// compaction. `stage_summary` observes the summary and drain length
     /// before the session is mutated. Returns the drain length and the
     /// estimated tokens it removed.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn commit_summarized_cut(
         &mut self,

@@ -1059,20 +1059,6 @@ async fn settle_housekeeping(handle: Option<std::thread::JoinHandle<()>>) {
     }
 }
 
-/// Dispatch `PreCompact` unless this compaction already did.
-#[cfg(feature = "hooks")]
-async fn dispatch_pre_compact_once(
-    sent: &std::sync::atomic::AtomicBool,
-    instructions: Option<&str>,
-) {
-    if !sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        crate::startup::heap_future(|| {
-            crate::extras::hooks::dispatch_pre_compact(true, instructions)
-        })
-        .await;
-    }
-}
-
 /// Compact the headless session; `force` is context relief (see
 /// [`headless_compaction_plan_with`]). Returns the summarizer usage (already
 /// charged to the session) and whether any history was compacted.
@@ -1115,16 +1101,12 @@ async fn compact_headless_session(
     let request_observer = observed.clone();
     // Same model on a native prompt-cache route: fork the conversation's own
     // request instead of re-serializing it (mini-agent-o2nut).
-    // `PreCompact` fires once, before the first summarizer request of either
-    // path, so a successful fork still announces itself (mini-agent-sskdu.239).
-    #[cfg(feature = "hooks")]
-    let pre_compact_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // `PreCompact` fires once per compaction, from the shared driver, before
+    // the first summarizer request of either path (mini-agent-sskdu.239).
     let fork: Option<HeadlessFork<'_>> = agent
         .filter(|agent| compaction_model.is_none() && agent.supports_cache_fork())
         .map(|agent| {
             let observed = observed.clone();
-            #[cfg(feature = "hooks")]
-            let pre_compact_sent = pre_compact_sent.clone();
             Box::new(
                 move |history, messages_included, input_token_budget, response_token_budget| {
                     let (input_token_budget, response_token_budget) =
@@ -1133,11 +1115,7 @@ async fn compact_headless_session(
                             input_token_budget,
                             response_token_budget,
                         );
-                    #[cfg(feature = "hooks")]
-                    let pre_compact_sent = pre_compact_sent.clone();
                     Box::pin(async move {
-                        #[cfg(feature = "hooks")]
-                        dispatch_pre_compact_once(&pre_compact_sent, instructions).await;
                         agent
                             .compress_forked(
                                 history,
@@ -1162,9 +1140,8 @@ async fn compact_headless_session(
         memory,
         force,
         fork,
+        instructions,
         |model, messages, previous_summary, input_token_budget, response_token_budget| async move {
-            #[cfg(feature = "hooks")]
-            dispatch_pre_compact_once(&pre_compact_sent, instructions).await;
             let model = compaction_model.unwrap_or(model);
             let (input_token_budget, response_token_budget) =
                 crate::config::CompactionBudgetCap::apply(
@@ -1202,29 +1179,6 @@ async fn compact_headless_session(
         }
     };
 
-    #[cfg(feature = "hooks")]
-    if let Some(compacted) = &compacted {
-        crate::startup::heap_future(|| {
-            crate::extras::hooks::dispatch_post_compact(
-                true,
-                session.compacted_context().0.or(Some(&compacted.summary)),
-            )
-        })
-        .await;
-        let notices =
-            crate::startup::heap_future(|| crate::extras::hooks::dispatch_session_start("compact"))
-                .await;
-        crate::extras::hooks::append_context_session(session, &notices.into_notices());
-    }
-
-    #[cfg(feature = "memory")]
-    if let Some(compacted) = &compacted {
-        crate::extras::memory::flush_compaction_summary(
-            &crate::extras::memory::Mem::open(),
-            &compacted.summary,
-            Some(compacted.first_kept_index),
-        );
-    }
     let happened = compacted.is_some();
     if let Some(compacted) = &compacted {
         // The auto-compacting line announced the work; say what it did so a
@@ -1266,10 +1220,10 @@ type HeadlessFork<'a> = Box<
 /// (normalized for the session's provider).
 #[derive(Debug)]
 struct HeadlessCompaction {
-    // Read by the memory flush and by tests.
-    #[cfg_attr(not(feature = "memory"), allow(dead_code))]
+    // Read by tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     summary: String,
-    #[cfg_attr(not(feature = "memory"), allow(dead_code))]
+    #[cfg_attr(not(test), allow(dead_code))]
     first_kept_index: usize,
     usage: crate::event::UsageDelta,
 }
@@ -1294,11 +1248,52 @@ where
         memory,
         false,
         None,
+        None,
         summarize,
     )
     .await
 }
 
+/// Charges the summarizer at the session's prices and, in a real run, copies
+/// the summary to daily memory as the TUI does.
+struct HeadlessObserver<'a> {
+    cfg: &'a Config,
+    summary: Option<String>,
+}
+
+impl crate::session::compaction_run::Observer for HeadlessObserver<'_> {
+    fn paused(&mut self, notice: &str) {
+        eprintln!("{notice}");
+    }
+
+    fn charge(
+        &mut self,
+        session: &mut Session,
+        usage: crate::event::UsageDelta,
+    ) -> crate::event::UsageDelta {
+        // Every rolling summarizer request ran on the session's model, so it is
+        // charged at the session's prices like any other completion
+        // (mini-agent-i6q98).
+        let usage = self.cfg.normalize_usage(&session.provider, usage);
+        session.charge_usage_delta(usage, self.cfg.is_anthropic_native(&session.provider));
+        usage
+    }
+
+    fn memory_summary(&mut self, summary: &str, first_kept_index: usize) {
+        // Tests never write to the operator's real daily log.
+        #[cfg(all(feature = "memory", not(test)))]
+        crate::extras::memory::flush_compaction_summary(
+            &crate::extras::memory::Mem::open(),
+            summary,
+            Some(first_kept_index),
+        );
+        #[cfg(not(all(feature = "memory", not(test))))]
+        let _ = first_kept_index;
+        self.summary = Some(summary.to_owned());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn compact_headless_session_with_force<S, F>(
     session: &mut Session,
     cfg: &Config,
@@ -1306,6 +1301,7 @@ async fn compact_headless_session_with_force<S, F>(
     #[cfg(feature = "memory")] memory: Option<&str>,
     force: bool,
     fork: Option<HeadlessFork<'_>>,
+    instructions: Option<&str>,
     summarize: S,
 ) -> anyhow::Result<Option<HeadlessCompaction>>
 where
@@ -1323,83 +1319,59 @@ where
         return Ok(None);
     };
 
-    #[cfg(feature = "subagents")]
-    let _background_pause = match &session.background_pool {
-        Some(pool) => Some(pool.pause_for_history().await?),
-        None => None,
-    };
     eprintln!("auto-compacting headless session...");
-    #[cfg(feature = "subagents")]
-    if let Some(Some(notice)) = _background_pause.as_ref().map(|pause| pause.notice()) {
-        eprintln!("{notice}");
-    }
-    let model = session.model.to_string();
-    let (skipped, messages) = session.compaction_input(plan.cut_idx);
-    let previous_summary = session.previous_summary_prose();
-    let keep_recent_tool_results = cfg.resolve_keep_recent_tool_results();
-    let mut output = None;
-    if let Some(fork) = fork
-        && let Some(history) = crate::agent::runner::cache_fork_history(
-            session,
-            plan.cut_idx,
-            keep_recent_tool_results,
-            plan.input_token_budget,
-        )
-    {
-        match fork(
-            history,
-            messages.len(),
-            plan.input_token_budget,
-            plan.response_token_budget,
-        )
-        .await
-        {
-            Ok(forked) => output = Some(forked),
-            Err(error) => {
-                tracing::warn!(
-                    "cache-reusing compaction failed, using the text summarizer: {error}"
-                )
-            }
-        }
-    }
-    let output = match output {
-        Some(output) => output,
-        None => {
-            summarize(
-                model,
-                messages,
-                previous_summary,
-                plan.input_token_budget,
-                plan.response_token_budget,
-            )
-            .await?
-        }
-    };
-    let provider::CompactionOutput {
-        summary,
-        summary_byte_budget,
-        messages_included,
-        usage,
-    } = output;
-    // Every rolling summarizer request ran on the session's model, so it is
-    // charged at the session's prices like any other completion
-    // (mini-agent-i6q98).
-    let usage = cfg.normalize_usage(&session.provider, usage);
-    session.charge_usage_delta(usage, cfg.is_anthropic_native(&session.provider));
+    let pre_compact_sent = std::sync::atomic::AtomicBool::new(false);
+    let mut observer = HeadlessObserver { cfg, summary: None };
     let restore_read_tokens = cfg.resolve_compact_restore_read_tokens(session.context_window);
-    let (first_kept_index, _) = session.commit_summarized_cut(
-        skipped,
-        plan.cut_idx,
-        summary.clone(),
-        summary_byte_budget,
-        messages_included,
-        restore_read_tokens,
-        |_, _| {},
-    )?;
+    let compacted = crate::session::compaction_run::run(
+        session,
+        crate::session::compaction_run::Plan {
+            cut_idx: plan.cut_idx,
+            input_token_budget: plan.input_token_budget,
+            response_token_budget: plan.response_token_budget,
+            restore_read_tokens,
+            auto: true,
+            instructions,
+            fork_keep_recent_tool_results: fork
+                .is_some()
+                .then(|| cfg.resolve_keep_recent_tool_results()),
+            pre_compact_sent: &pre_compact_sent,
+            snap: None,
+        },
+        &mut observer,
+        |request| async move {
+            if let Some(fork) = fork
+                && let Some(history) = request.fork_history
+            {
+                match fork(
+                    history,
+                    request.messages.len(),
+                    request.input_token_budget,
+                    request.response_token_budget,
+                )
+                .await
+                {
+                    Ok(forked) => return Ok(forked),
+                    Err(error) => tracing::warn!(
+                        "cache-reusing compaction failed, using the text summarizer: {error}"
+                    ),
+                }
+            }
+            summarize(
+                request.model,
+                request.messages,
+                request.previous_summary,
+                request.input_token_budget,
+                request.response_token_budget,
+            )
+            .await
+        },
+    )
+    .await?;
     Ok(Some(HeadlessCompaction {
-        summary,
-        first_kept_index,
-        usage,
+        summary: observer.summary.unwrap_or_default(),
+        first_kept_index: compacted.first_kept_index,
+        usage: compacted.usage,
     }))
 }
 
@@ -7178,6 +7150,7 @@ mod tests {
             None,
             false,
             Some(fork),
+            None,
             |_, _, _, _, _| async { panic!("the text summarizer must not run") },
         )
         .await
@@ -7220,6 +7193,7 @@ mod tests {
             None,
             false,
             Some(fork),
+            None,
             |_, messages, _, _, _| async move {
                 Ok(crate::provider::CompactionOutput {
                     summary_byte_budget: 16 * 1024,
@@ -9250,20 +9224,5 @@ mod headless_session_lifetime_tests {
             next_pool.ensure_open().is_err(),
             "EOF closes admission for the same retained pool"
         );
-    }
-}
-
-#[cfg(all(test, feature = "hooks"))]
-mod pre_compact_once_tests {
-    #[tokio::test]
-    async fn pre_compact_is_announced_once_per_compaction() {
-        // mini-agent-sskdu.239: the fork and the text path share one flag.
-        let sent = std::sync::atomic::AtomicBool::new(false);
-        super::dispatch_pre_compact_once(&sent, None).await;
-        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
-        // A second request of the same compaction must not dispatch again; the
-        // flag staying set is the observable contract.
-        super::dispatch_pre_compact_once(&sent, None).await;
-        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
     }
 }
