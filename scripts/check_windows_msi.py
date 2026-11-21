@@ -194,6 +194,42 @@ def validate(root: Path) -> list[str]:
             "VS Code custom action must be restricted to a first per-user install",
         )
 
+    for env_id, system, scope_condition in (
+        ("PathUser", "no", "NOT ALLUSERS = 1"),
+        ("PathMachine", "yes", "ALLUSERS = 1"),
+    ):
+        environment = source.find(f".//wix:Environment[@Id='{env_id}']", NS)
+        _require(errors, environment is not None, f"MSI must define the {env_id} PATH entry")
+        if environment is not None:
+            expected_env = {
+                "Name": "PATH",
+                "Value": "[INSTALLFOLDER]",
+                "Part": "last",
+                "Action": "set",
+                "Permanent": "no",
+                "System": system,
+            }
+            for name, value in expected_env.items():
+                _require(
+                    errors,
+                    environment.attrib.get(name) == value,
+                    f"MSI {env_id} PATH entry must set {name}={value}",
+                )
+        component_id = f"{env_id}Component"
+        component = components.get(component_id)
+        _require(
+            errors,
+            component is not None
+            and component.attrib.get("Condition") == scope_condition
+            and component.find(f"wix:Environment[@Id='{env_id}']", NS) is not None,
+            f"MSI component {component_id} must own {env_id} under condition {scope_condition!r}",
+        )
+        _require(
+            errors,
+            component_id in component_refs,
+            f"MSI feature must install component {component_id}",
+        )
+
     helper = helper_path.read_text(encoding="utf-8")
     for fragment in (
         "where code.cmd",
@@ -218,6 +254,8 @@ def validate(root: Path) -> list[str]:
         "mini-agent-windows-x64.msi",
         "& $installed --print-config",
         "startup/configuration smoke",
+        "PATH smoke: bare-name resolution",
+        "PATH smoke: uninstall removed the entry",
     ):
         _require(errors, fragment in workflow, f"release workflow is missing MSI gate {fragment!r}")
     _require(
