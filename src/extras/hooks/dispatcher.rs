@@ -1406,14 +1406,36 @@ fn handler_label(kind: &str, command: &str) -> String {
     }
 }
 
-static HOOK_PROBLEMS: std::sync::Mutex<(Vec<String>, std::collections::BTreeSet<String>)> =
+type HookProblemState = (Vec<String>, std::collections::BTreeSet<String>);
+
+#[cfg(not(test))]
+static HOOK_PROBLEMS: std::sync::Mutex<HookProblemState> =
     std::sync::Mutex::new((Vec::new(), std::collections::BTreeSet::new()));
+
+// Tests run concurrently in one process and on current-thread runtimes, so the
+// queue is per test thread: a test sees only the notices its own dispatch made.
+#[cfg(test)]
+thread_local! {
+    static HOOK_PROBLEMS_TEST: std::cell::RefCell<HookProblemState> =
+        const { std::cell::RefCell::new((Vec::new(), std::collections::BTreeSet::new())) };
+}
+
+fn with_hook_problems<R>(f: impl FnOnce(&mut HookProblemState) -> R) -> R {
+    #[cfg(not(test))]
+    {
+        f(&mut HOOK_PROBLEMS.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+    #[cfg(test)]
+    {
+        HOOK_PROBLEMS_TEST.with(|state| f(&mut state.borrow_mut()))
+    }
+}
 
 /// One-line notices about hooks that failed or timed out on an event that
 /// fails open, queued since the last call. Each (event, handler, problem) is
 /// reported once per process.
 pub(crate) fn take_hook_problem_notices() -> Vec<String> {
-    std::mem::take(&mut HOOK_PROBLEMS.lock().unwrap_or_else(|e| e.into_inner()).0)
+    with_hook_problems(|state| std::mem::take(&mut state.0))
 }
 
 /// Records a user-visible notice for every handler whose infrastructure
@@ -1442,10 +1464,11 @@ fn report_hook_problems(event: &str, outputs: &[(String, HookOutput)]) {
 
 /// Queues one user notice, deduplicated per process and bounded.
 fn record_hook_problem(notice: String) {
-    let mut state = HOOK_PROBLEMS.lock().unwrap_or_else(|e| e.into_inner());
-    if state.1.len() < 256 && state.1.insert(notice.clone()) {
-        state.0.push(notice);
-    }
+    with_hook_problems(|state| {
+        if state.1.len() < 256 && state.1.insert(notice.clone()) {
+            state.0.push(notice);
+        }
+    });
 }
 
 /// Exit statuses a shell uses for "the condition could not be evaluated"
