@@ -322,6 +322,9 @@ pub(crate) struct GitTool {
     /// refused before any permission prompt or process.
     read_only: bool,
     filter_drivers: Arc<FilterDriverCache>,
+    /// Canonical common Git directory keying the per-repository mutation lock,
+    /// resolved once: the tool is bound to one immutable workspace.
+    mutation_key: Arc<std::sync::OnceLock<std::path::PathBuf>>,
     #[cfg(test)]
     test_uncontained: bool,
 }
@@ -426,6 +429,7 @@ impl GitTool {
             exact_files: false,
             read_only: false,
             filter_drivers: Arc::default(),
+            mutation_key: Arc::default(),
             #[cfg(test)]
             test_uncontained: false,
         })
@@ -862,6 +866,21 @@ impl GitTool {
         });
     }
 
+    /// The per-repository mutation lock; the common-dir identity query runs
+    /// once per tool instance.
+    async fn acquire_mutation(&self) -> Result<tokio::sync::OwnedMutexGuard<()>, ToolError> {
+        if let Some(key) = self.mutation_key.get() {
+            return Ok(self.runner.lock_repository(key).await);
+        }
+        let key = self
+            .runner
+            .repository_key(self.workspace.root())
+            .await
+            .map_err(ToolError::Msg)?;
+        let _ = self.mutation_key.set(key.clone());
+        Ok(self.runner.lock_repository(&key).await)
+    }
+
     async fn head_id(&self) -> Option<String> {
         let output = self
             .run(
@@ -1107,11 +1126,7 @@ impl GitTool {
         reject_irrelevant_fields(&args, false, false, false)?;
         require_paths(&args.paths, "stage")?;
         let paths = self.validate_paths(&args.paths, Some("git/stage")).await?;
-        let _mutation = self
-            .runner
-            .acquire_mutation(self.workspace.root())
-            .await
-            .map_err(ToolError::Msg)?;
+        let _mutation = self.acquire_mutation().await?;
         let guard = self.filter_guard("stage").await?;
         let before = self.status_snapshot(&guard).await?;
         self.reject_recursive_paths(&paths)?;
@@ -1144,11 +1159,7 @@ impl GitTool {
         let paths = self
             .validate_paths(&args.paths, Some("git/unstage"))
             .await?;
-        let _mutation = self
-            .runner
-            .acquire_mutation(self.workspace.root())
-            .await
-            .map_err(ToolError::Msg)?;
+        let _mutation = self.acquire_mutation().await?;
         let guard = self.filter_guard("unstage").await?;
         let before = self.status_snapshot(&guard).await?;
         let head = self
@@ -1208,11 +1219,7 @@ impl GitTool {
             let amend_coaching = self.permission("git/amend", message).await?;
             coaching = coaching.or(amend_coaching);
         }
-        let _mutation = self
-            .runner
-            .acquire_mutation(self.workspace.root())
-            .await
-            .map_err(ToolError::Msg)?;
+        let _mutation = self.acquire_mutation().await?;
         // `git commit` itself refreshes the index before writing the tree.
         let guard = self.filter_guard("commit").await?;
         let before = self.status_snapshot(&guard).await?;
@@ -1247,14 +1254,19 @@ impl GitTool {
                 LOCAL_MUTATION_LIMITS,
             )
             .await?;
+        let after = self.status_snapshot(&guard).await?;
         let commit_id = if output.status == CommandStatus::Completed
             && output.exit_status.is_some_and(|status| status.success())
         {
-            self.head_id().await
+            // The status header already names the resulting HEAD; only fall
+            // back to a separate rev-parse when it does not.
+            match head_from_snapshot(&after) {
+                Some(id) => Some(id),
+                None => self.head_id().await,
+            }
         } else {
             None
         };
-        let after = self.status_snapshot(&guard).await?;
         let mut result = render_mutation_result("commit", coaching, before, after, output);
         result["commit_id"] = serde_json::json!(commit_id);
         result["amended"] = serde_json::json!(amend);
@@ -1440,11 +1452,7 @@ impl GitTool {
             None => name.to_string(),
         };
         let coaching = self.permission("git/branch", &identity).await?;
-        let _mutation = self
-            .runner
-            .acquire_mutation(self.workspace.root())
-            .await
-            .map_err(ToolError::Msg)?;
+        let _mutation = self.acquire_mutation().await?;
         let mut command = vec!["branch".into(), "--no-track".into(), name.to_string()];
         if let Some(revision) = args.revision {
             command.push(revision);
@@ -1461,11 +1469,7 @@ impl GitTool {
         let name = Self::required_name(&args, "switch")?;
         self.validate_ref_name(name, "branch").await?;
         let coaching = self.permission("git/switch", name).await?;
-        let _mutation = self
-            .runner
-            .acquire_mutation(self.workspace.root())
-            .await
-            .map_err(ToolError::Msg)?;
+        let _mutation = self.acquire_mutation().await?;
         // Updating the working tree runs checkout conversion (smudge).
         let guard = self.filter_guard("switch").await?;
         let before = self.status_snapshot(&guard).await?;
@@ -1545,11 +1549,7 @@ impl GitTool {
             ("stash_pop", "pop".to_string())
         };
         let coaching = self.permission("git/stash", &identity).await?;
-        let _mutation = self
-            .runner
-            .acquire_mutation(self.workspace.root())
-            .await
-            .map_err(ToolError::Msg)?;
+        let _mutation = self.acquire_mutation().await?;
         let guard = self.filter_guard(label).await?;
         let before = self.status_snapshot(&guard).await?;
         let mut command = vec!["stash".into()];
@@ -1608,11 +1608,7 @@ impl GitTool {
                 .unwrap_or_default()
         );
         let coaching = self.permission("git/tag", &identity).await?;
-        let _mutation = self
-            .runner
-            .acquire_mutation(self.workspace.root())
-            .await
-            .map_err(ToolError::Msg)?;
+        let _mutation = self.acquire_mutation().await?;
         let mut command = vec!["tag".into()];
         if message.is_some() {
             command.push("--annotate".into());
@@ -1652,11 +1648,7 @@ impl GitTool {
             "paths": paths,
         }))?;
         let coaching = self.permission("git/restore", &identity).await?;
-        let _mutation = self
-            .runner
-            .acquire_mutation(self.workspace.root())
-            .await
-            .map_err(ToolError::Msg)?;
+        let _mutation = self.acquire_mutation().await?;
         let guard = self.filter_guard("restore").await?;
         let before = self.status_snapshot(&guard).await?;
         self.reject_recursive_paths(&paths)?;
@@ -2550,6 +2542,18 @@ fn parse_status_records(stdout: &[u8], truncated: bool) -> (Vec<String>, usize, 
     (records, changed, untracked)
 }
 
+/// The commit id in a status snapshot's `# branch.oid` header, if it names one
+/// (an unborn branch reports `(initial)`).
+fn head_from_snapshot(snapshot: &serde_json::Value) -> Option<String> {
+    let id = snapshot
+        .get("records")?
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .find_map(|record| record.strip_prefix("# branch.oid "))?;
+    (id.len() >= 40 && id.bytes().all(|byte| byte.is_ascii_hexdigit())).then(|| id.to_string())
+}
+
 /// A porcelain-v2 changed entry reduced to `<kind> <XY> <path>`: the two modes,
 /// three submodule flags and two object ids (about 115 bytes an entry) are
 /// never needed by the model, which can ask for a diff or `status` details.
@@ -2719,6 +2723,7 @@ mod tests {
                 exact_files: false,
                 read_only: false,
                 filter_drivers: Arc::default(),
+                mutation_key: Arc::default(),
                 test_uncontained: true,
             }
         }
@@ -3009,6 +3014,16 @@ mod tests {
         assert_eq!(rendered["after"]["records_omitted"], 150);
         assert_eq!(rendered["before"]["counts"]["changed"], 200);
         assert!(rendered["before"].get("records").is_none());
+    }
+
+    #[test]
+    fn resulting_head_is_read_from_the_status_header() {
+        let oid = "a".repeat(40);
+        let snapshot =
+            serde_json::json!({"records": [format!("# branch.oid {oid}"), "# branch.head main"]});
+        assert_eq!(super::head_from_snapshot(&snapshot), Some(oid));
+        let unborn = serde_json::json!({"records": ["# branch.oid (initial)"]});
+        assert_eq!(super::head_from_snapshot(&unborn), None);
     }
 
     #[tokio::test]

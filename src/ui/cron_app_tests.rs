@@ -841,3 +841,57 @@ async fn cron_allowlisted_slash_payload_fires_without_a_model_request() {
     drop(app);
     provider.finish().await;
 }
+
+/// A background `task` that finishes while the session is idle wakes it like a
+/// finished shell job: one transcript line, then an ordinary scheduled turn.
+#[cfg(feature = "subagents")]
+#[tokio::test]
+async fn finished_background_task_wakes_an_idle_session() {
+    #[cfg(feature = "hooks")]
+    let _hooks = crate::tests::fake_model::dispatcher_guard::acquire();
+    let roots = Roots::new();
+    let provider = Provider::new(vec!["WAKE_DONE"]).await;
+    let cfg = provider.config();
+    let cli = cli();
+    let mut session = session(&roots);
+    let mut context = crate::context::load(true).for_workspace_binding(true, &roots.workspace());
+    let mut app = app_for(&cli, &cfg, &mut session, &mut context, &roots);
+
+    let ui_cfg = app.ui.cfg;
+    app.ui.session.working_dir = app.ui.workspace.root().to_str().unwrap().into();
+    let run = crate::spend::run::Run::for_session(
+        app.ui.session,
+        ui_cfg,
+        crate::spend::RequestKind::Turn,
+    );
+    let pool = crate::extras::subagents::background::Pool::for_session(app.ui.session, 2).unwrap();
+    let recorder = app
+        .ui
+        .session
+        .file_checkpoints
+        .recorder(&app.ui.session.id, 0, false);
+    let admission = pool
+        .reserve(&app.ui.workspace, &run, &recorder)
+        .unwrap();
+    admission.describe("audit the parser", None, 1);
+    let id = admission
+        .start(async { Ok("report".to_string()) }, run)
+        .unwrap();
+    pool.wait_result(&id, Duration::from_secs(5)).await.unwrap();
+
+    // Nothing reported yet while we have not woken.
+    assert!(provider.calls().is_empty());
+    crate::startup::heap_future(|| app.wake_for_task_notices())
+        .await
+        .unwrap();
+    assert!(app.run.is_running, "an idle session starts a turn");
+    let output = app.renderer.captured_output();
+    assert!(
+        output.contains("background task reported: audit the parser completed"),
+        "{output}"
+    );
+    assert!(settle(&mut app).await);
+    assert_eq!(provider.calls().len(), 1);
+    drop(app);
+    provider.finish().await;
+}

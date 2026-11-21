@@ -1265,6 +1265,13 @@ impl GitRunner {
         &self,
         repo_path: &Path,
     ) -> Result<OwnedMutexGuard<()>, String> {
+        let key = self.repository_key(repo_path).await?;
+        Ok(self.lock_repository(&key).await)
+    }
+
+    /// The canonical common Git directory that keys the mutation lock.
+    #[cfg(any(test, feature = "git-worktree"))]
+    pub(crate) async fn repository_key(&self, repo_path: &Path) -> Result<PathBuf, String> {
         let output = self
             .run(
                 repo_path,
@@ -1274,9 +1281,14 @@ impl GitRunner {
             )
             .await
             .map_err(|error| format!("cannot establish repository identity: {error}"))?;
-        let key = output_path(&output.stdout)
+        output_path(&output.stdout)
             .canonicalize()
-            .map_err(|error| format!("failed to resolve common Git directory: {error}"))?;
+            .map_err(|error| format!("failed to resolve common Git directory: {error}"))
+    }
+
+    #[cfg(any(test, feature = "git-worktree"))]
+    pub(crate) async fn lock_repository(&self, key: &Path) -> OwnedMutexGuard<()> {
+        let key = key.to_path_buf();
         let lock = repository_mutation_lock(&key).lock_owned();
         #[cfg(all(test, feature = "git-worktree", unix))]
         let lock = async {
@@ -1294,7 +1306,7 @@ impl GitRunner {
             })
             .await
         };
-        Ok(lock.await)
+        lock.await
     }
 
     #[cfg(feature = "git-worktree")]

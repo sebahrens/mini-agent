@@ -452,6 +452,88 @@ impl TaskLimits {
     }
 }
 
+/// The persona MCP connection of one `task` call, opened by its first child and
+/// shared by the rest. Every child still derives its own tool wrappers and an
+/// independent permission checker; only the server processes and their
+/// initialize/list exchanges are shared. Isolated children (a different
+/// workspace) own their connection instead.
+#[cfg(feature = "mcp")]
+#[derive(Clone, Default)]
+struct SharedPersonaMcp(Arc<tokio::sync::Mutex<Option<SharedConnection>>>);
+
+/// The outcome of the call's one connection attempt: the manager and its
+/// connection notices, or the error every child then reports.
+#[cfg(feature = "mcp")]
+type SharedConnection =
+    Result<Option<(Arc<crate::extras::mcp::McpClientManager>, Vec<String>)>, String>;
+
+#[cfg(feature = "mcp")]
+impl SharedPersonaMcp {
+    #[allow(clippy::type_complexity)]
+    async fn tools_for(
+        &self,
+        persona: &builder::PersonaExecution,
+        config: &crate::config::Config,
+        authorization: &SubagentAuthorization,
+    ) -> Result<
+        (
+            Option<Arc<crate::extras::mcp::McpClientManager>>,
+            Vec<Box<dyn rig::tool::ToolDyn>>,
+            builder::GrantedMcp,
+        ),
+        String,
+    > {
+        let manager = {
+            let mut state = self.0.lock().await;
+            if state.is_none() {
+                let connected = match authorization.workspace() {
+                    Some(workspace) => builder::connect_persona_mcp(persona, config, workspace)
+                        .await
+                        .map(|manager| {
+                            manager.map(|mut manager| {
+                                let notices = builder::take_notice_text(&mut manager);
+                                (Arc::new(manager), notices)
+                            })
+                        }),
+                    None if persona
+                        .mcp_servers
+                        .as_ref()
+                        .is_none_or(std::collections::BTreeMap::is_empty) =>
+                    {
+                        Ok(None)
+                    }
+                    None => Err("task: persona MCP requires a captured workspace".to_string()),
+                };
+                *state = Some(connected);
+            }
+            state.clone().expect("initialized above")?
+        };
+        let Some((manager, notices)) = manager else {
+            return Ok((None, Vec::new(), Default::default()));
+        };
+        let (tools, granted) =
+            builder::persona_mcp_tools(&manager, &notices, persona, config, authorization).await?;
+        Ok((Some(manager), tools, granted))
+    }
+
+    /// Shut the shared servers down once the call's children are done, off
+    /// the result path; the owning scope joins it before retiring.
+    fn shutdown_off_path(&self) {
+        let state = self.0.clone();
+        drop(crate::agent::runner::spawn_async_scoped(async move {
+            let taken = state.lock().await.take();
+            if let Some(Ok(Some((manager, _)))) = taken {
+                match Arc::try_unwrap(manager) {
+                    Ok(manager) => manager.shutdown().await,
+                    // A straggling holder keeps the servers alive; dropping
+                    // the last clone tears them down.
+                    Err(_) => tracing::debug!("persona MCP connection still referenced"),
+                }
+            }
+        }));
+    }
+}
+
 /// The resolved defaults the tool schema quotes to the model.
 struct SchemaDefaults {
     max_turns: usize,
@@ -2010,7 +2092,13 @@ editing in a known location, grepping for a literal you will act on immediately.
         let resume_history = resumed.map(|stored| Arc::new(stored.history));
         let job_inbox = admission.as_ref().map(super::background::Admission::inbox);
         let resume_agent_type = agent_type.clone();
+        #[cfg(feature = "mcp")]
+        let shared_mcp = SharedPersonaMcp::default();
+        #[cfg(feature = "mcp")]
+        let executor_mcp = shared_mcp.clone();
         let executor: TaskExecutor = Arc::new(move |index, prompt_text| {
+            #[cfg(feature = "mcp")]
+            let shared_mcp = executor_mcp.clone();
             let details_sink = executor_sink.clone();
             let resume_history = resume_history.clone();
             let resume_store = resume_store.clone();
@@ -2070,6 +2158,7 @@ editing in a known location, grepping for a literal you will act on immediately.
             let authorization = authorization.clone();
             let lane_workspace = lane_workspace.clone();
             let isolation = isolation.clone();
+            let isolated_child = isolation.is_some();
             #[cfg(feature = "skills")]
             let skill_services = skill_services
                 .as_ref()
@@ -2207,9 +2296,11 @@ editing in a known location, grepping for a literal you will act on immediately.
                 // the trusted persona names, with an independent permission
                 // checker; outer-agent MCP connections are never inherited.
                 #[cfg(feature = "mcp")]
-                let (mcp_manager, mcp_tools, mcp_granted) =
+                let (mcp_manager, mcp_shared, mcp_tools, mcp_granted) = if isolated_child {
+                    // An isolated child's workspace differs: it owns its
+                    // connection.
                     match builder::build_persona_mcp(&persona, &config, &authorization).await {
-                        Ok(runtime) => runtime,
+                        Ok((manager, tools, granted)) => (manager, None, tools, granted),
                         Err(error) => {
                             return ChildExecution {
                                 output: Err(error),
@@ -2217,7 +2308,25 @@ editing in a known location, grepping for a literal you will act on immediately.
                                 host_suffix: None,
                             };
                         }
-                    };
+                    }
+                } else {
+                    // One connection per `task` call, shared by its children;
+                    // each child still derives its own tools and an
+                    // independent permission checker.
+                    match shared_mcp
+                        .tools_for(&persona, &config, &authorization)
+                        .await
+                    {
+                        Ok((shared, tools, granted)) => (None, shared, tools, granted),
+                        Err(error) => {
+                            return ChildExecution {
+                                output: Err(error),
+                                cost_units: 0,
+                                host_suffix: None,
+                            };
+                        }
+                    }
+                };
                 // Evidence is re-judged by the parent later: anchor relative
                 // paths at THIS child's directory (a worktree when isolated)
                 // and remember which MCP tools it could call.
@@ -2233,6 +2342,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         mcp_manager
                             .as_ref()
                             .map(|manager| manager.hook_peers())
+                            .or_else(|| mcp_shared.as_ref().map(|manager| manager.hook_peers()))
                             .unwrap_or_default(),
                     ),
                 };
@@ -2630,6 +2740,8 @@ editing in a known location, grepping for a literal you will act on immediately.
                             Some(cancel_scope),
                         )
                         .await;
+                        #[cfg(feature = "mcp")]
+                        shared_mcp.shutdown_off_path();
                         let failed = report.failed();
                         let mut rendered = report.render();
                         if let Some(section) = abandoned.render().await {
@@ -2661,6 +2773,8 @@ editing in a known location, grepping for a literal you will act on immediately.
         }
         // Only the host builds the envelope: the quoted text report first,
         // the admitted images appended after it, in prompt order.
+        #[cfg(feature = "mcp")]
+        shared_mcp.shutdown_off_path();
         let images = inline_sink.take(&report);
         let mut rendered = report.render();
         if let Some(section) = abandoned.render().await {
@@ -6198,6 +6312,46 @@ fn main() {
             hook_identity(None, None),
             ("explore".to_string(), "compiled-in explorer".to_string())
         );
+    }
+
+    #[cfg(feature = "mcp")]
+    #[tokio::test]
+    async fn one_mcp_connection_attempt_serves_every_child_of_a_call() {
+        let persona = builder::PersonaExecution {
+            mcp_servers: Some(std::collections::BTreeMap::from([(
+                "missing".to_string(),
+                Vec::new(),
+            )])),
+            ..Default::default()
+        };
+        let config = crate::config::Config {
+            mcp_servers: Some(std::collections::HashMap::new()),
+            ..Default::default()
+        };
+        let workspace = Arc::new(
+            crate::paths::WorkspaceBinding::capture(&std::env::current_dir().unwrap()).unwrap(),
+        );
+        let authorization =
+            SubagentAuthorization::new(None, None, true).with_workspace_binding(Some(workspace));
+        let shared = SharedPersonaMcp::default();
+        for _ in 0..3 {
+            let error = shared
+                .tools_for(&persona, &config, &authorization)
+                .await
+                .err()
+                .expect("unconfigured server");
+            assert!(error.contains("not configured"), "{error}");
+        }
+        // The attempt was made once and its outcome kept for later children.
+        assert!(shared.0.lock().await.as_ref().is_some_and(Result::is_err));
+        // A persona with no MCP servers connects nothing, for any child.
+        let none = SharedPersonaMcp::default();
+        let (manager, tools, granted) = none
+            .tools_for(&Default::default(), &config, &authorization)
+            .await
+            .ok()
+            .unwrap();
+        assert!(manager.is_none() && tools.is_empty() && granted.is_empty());
     }
 
     #[test]

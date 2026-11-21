@@ -3157,6 +3157,15 @@ impl<'a> App<'a> {
             self.loop_state.frames += 1;
         }
         self.input.set_file_workspace(self.ui.workspace.clone());
+        #[cfg(feature = "subagents")]
+        self.input.set_task_ids(
+            self.ui
+                .session
+                .background_tasks()
+                .iter()
+                .map(|row| crate::extras::subagents::background::short_id(&row.id).to_string())
+                .collect(),
+        );
         self.sync_live_model_names(false);
         let cron_label = self.cron_status_label();
         refresh_display(

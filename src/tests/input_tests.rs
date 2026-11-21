@@ -64,6 +64,25 @@ fn every_finite_argument_command_supports_shell_style_tab_completion() {
     }
 }
 
+#[cfg(feature = "subagents")]
+#[test]
+fn tasks_tab_completion_offers_verbs_and_live_task_ids() {
+    let mut editor = InputEditor::new();
+    editor.set_task_ids(vec!["3f2a9c10".to_string()]);
+    editor.load_text("/tasks");
+    editor.handle_key(press(KeyCode::Tab));
+    match editor.picker.as_ref() {
+        Some(Picker::Prefixed(picker, prefix)) => {
+            assert_eq!(*prefix, "/tasks ");
+            assert_eq!(
+                picker.matches().collect::<Vec<_>>(),
+                ["result", "cancel", "clear", "3f2a9c10"]
+            );
+        }
+        _ => panic!("Tab should open the tasks picker"),
+    }
+}
+
 #[test]
 fn model_tab_completion_uses_provider_models_for_singular_command() {
     let mut editor = InputEditor::new();

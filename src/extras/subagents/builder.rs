@@ -681,26 +681,25 @@ impl SubagentAuthorization {
     }
 }
 
+/// The exact server -> tool names a persona was granted, with a bare
+/// server-name reference (an empty list) resolved to the tools it exposes.
 #[cfg(feature = "mcp")]
-pub(crate) async fn build_persona_mcp(
+pub(crate) type GrantedMcp = std::collections::BTreeMap<String, Vec<String>>;
+
+/// Connect the MCP servers a persona names (none when it names none). The
+/// connection can be shared by every child of a call; each child then derives
+/// its own tools and permission checker with [`persona_mcp_tools`].
+#[cfg(feature = "mcp")]
+pub(crate) async fn connect_persona_mcp(
     persona: &PersonaExecution,
     cfg: &crate::config::Config,
-    authorization: &SubagentAuthorization,
-) -> Result<
-    (
-        Option<crate::extras::mcp::McpClientManager>,
-        Vec<Box<dyn rig::tool::ToolDyn>>,
-        // The exact server -> tool names granted, with a bare server-name
-        // reference (an empty list) resolved to the tools it exposes.
-        std::collections::BTreeMap<String, Vec<String>>,
-    ),
-    String,
-> {
+    workspace: &std::sync::Arc<crate::paths::WorkspaceBinding>,
+) -> Result<Option<crate::extras::mcp::McpClientManager>, String> {
     let Some(allowlist) = persona.mcp_servers.as_ref() else {
-        return Ok((None, Vec::new(), Default::default()));
+        return Ok(None);
     };
     if allowlist.is_empty() {
-        return Ok((None, Vec::new(), Default::default()));
+        return Ok(None);
     }
     let configured = cfg
         .mcp_servers
@@ -713,16 +712,31 @@ pub(crate) async fn build_persona_mcp(
             .ok_or_else(|| format!("task: persona MCP server '{server}' is not configured"))?;
         selected.insert(server.clone(), config.clone());
     }
-    let workspace = authorization
-        .workspace
-        .as_ref()
-        .ok_or_else(|| "task: persona MCP requires a captured workspace".to_string())?;
-    let mut manager =
-        crate::extras::mcp::McpClientManager::connect_all_in_binding(&selected, workspace).await;
+    Ok(Some(
+        crate::extras::mcp::McpClientManager::connect_all_in_binding(&selected, workspace).await,
+    ))
+}
+
+/// The persona's allowlisted MCP tools over an existing connection, each with
+/// an independent permission checker, plus the exact grants. Fails (without
+/// shutting the connection down) when the allowlist names an unavailable tool.
+#[cfg(feature = "mcp")]
+pub(crate) async fn persona_mcp_tools(
+    manager: &crate::extras::mcp::McpClientManager,
+    // Connection notices taken when the servers were connected, quoted when
+    // the allowlist names a tool that is unavailable.
+    notices: &[String],
+    persona: &PersonaExecution,
+    cfg: &crate::config::Config,
+    authorization: &SubagentAuthorization,
+) -> Result<(Vec<Box<dyn rig::tool::ToolDyn>>, GrantedMcp), String> {
+    let Some(allowlist) = persona.mcp_servers.as_ref() else {
+        return Ok((Vec::new(), Default::default()));
+    };
     let permission = authorization.independent_mcp_permission(cfg)?;
     let timeouts = crate::extras::mcp::McpToolTimeouts::from_config_secs(cfg.mcp_tool_timeout_secs);
     let mut tools = crate::agent::builder::collect_mcp_tools(
-        &manager,
+        manager,
         permission,
         authorization.ask_tx.clone(),
         timeouts,
@@ -756,12 +770,6 @@ pub(crate) async fn build_persona_mcp(
             .map(|(server, _)| format!("{server}:*")),
     );
     if !missing.is_empty() {
-        let notices = manager
-            .take_notices()
-            .into_iter()
-            .map(|notice| notice.to_string())
-            .collect::<Vec<_>>();
-        manager.shutdown().await;
         let detail = if notices.is_empty() {
             String::new()
         } else {
@@ -776,11 +784,60 @@ pub(crate) async fn build_persona_mcp(
         .into_iter()
         .map(|tool| Box::new(tool) as Box<dyn rig::tool::ToolDyn>)
         .collect();
-    let mut granted = std::collections::BTreeMap::<String, Vec<String>>::new();
+    let mut granted = GrantedMcp::new();
     for (server, name) in discovered {
         granted.entry(server).or_default().push(name);
     }
-    Ok((Some(manager), tools, granted))
+    Ok((tools, granted))
+}
+
+/// The connection notices of a freshly connected manager, as text.
+#[cfg(feature = "mcp")]
+pub(crate) fn take_notice_text(manager: &mut crate::extras::mcp::McpClientManager) -> Vec<String> {
+    manager
+        .take_notices()
+        .into_iter()
+        .map(|notice| notice.to_string())
+        .collect()
+}
+
+/// Connect and derive in one step, for a child that owns its connection (an
+/// isolated child, whose workspace differs from the call's).
+#[cfg(feature = "mcp")]
+pub(crate) async fn build_persona_mcp(
+    persona: &PersonaExecution,
+    cfg: &crate::config::Config,
+    authorization: &SubagentAuthorization,
+) -> Result<
+    (
+        Option<crate::extras::mcp::McpClientManager>,
+        Vec<Box<dyn rig::tool::ToolDyn>>,
+        GrantedMcp,
+    ),
+    String,
+> {
+    if persona
+        .mcp_servers
+        .as_ref()
+        .is_none_or(std::collections::BTreeMap::is_empty)
+    {
+        return Ok((None, Vec::new(), Default::default()));
+    }
+    let workspace = authorization
+        .workspace
+        .as_ref()
+        .ok_or_else(|| "task: persona MCP requires a captured workspace".to_string())?;
+    let Some(mut manager) = connect_persona_mcp(persona, cfg, workspace).await? else {
+        return Ok((None, Vec::new(), Default::default()));
+    };
+    let notices = take_notice_text(&mut manager);
+    match persona_mcp_tools(&manager, &notices, persona, cfg, authorization).await {
+        Ok((tools, granted)) => Ok((Some(manager), tools, granted)),
+        Err(error) => {
+            manager.shutdown().await;
+            Err(error)
+        }
+    }
 }
 
 /// The memory tools a subagent is granted: read-only access ONLY
