@@ -225,8 +225,10 @@ that failed, was interrupted, or was retried away before a final response report
 nothing. Tokens, not cost, are what the bound measures, so a judge on a cheaper model counts the
 same per token.
 
-Tokens spent by subagents (`task` children) are not on the parent's event stream and so are not
-counted by `max_tokens` or the `tokens:` line; `max_rounds` and `max_active_secs` still bound the work they do.
+Tokens spent by foreground subagents (`task` children) are reported on the parent's event stream when
+each child finishes and count toward `max_tokens` and the `tokens:` line in the terminal UI. Background
+children and the headless and editor surfaces do not report them; `max_rounds` and `max_active_secs`
+still bound the work they do.
 
 The terminal and headless surfaces also charge each judge call to the session's token and cost
 counters, at the judge model's own prices: the session's prices when the judge is the session

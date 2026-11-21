@@ -2183,6 +2183,16 @@ editing in a known location, grepping for a literal you will act on immediately.
             let cancellation_relief_usage = relief_usage.clone();
             let cancellation_repair_usage = repair_usage.clone();
             let cancellation_writeup_usage = writeup_usage.clone();
+            // Foreground children report their usage to the parent's event
+            // stream so goal token bounds and the `tokens:` line count them.
+            let report_tx = subagent_event_tx.clone();
+            let report_ledgers = [
+                initial_usage.clone(),
+                retry_usage.clone(),
+                relief_usage.clone(),
+                repair_usage.clone(),
+                writeup_usage.clone(),
+            ];
             let cancellation_cost = Arc::new(move || {
                 // Streaming usage may be known before ModelTurnFinished. Keep
                 // it when cancellation retires an in-flight request, without
@@ -2703,6 +2713,19 @@ editing in a known location, grepping for a literal you will act on immediately.
                     drop(crate::agent::runner::spawn_async_scoped(async move {
                         manager.shutdown().await;
                     }));
+                }
+                if let Some(event_tx) = &report_tx {
+                    let total = report_ledgers.iter().fold(Usage::new(), |sum, ledger| {
+                        usage_saturating_add(sum, ledger.total())
+                    });
+                    if total.has_values() {
+                        let _ = event_tx
+                            .send(crate::event::AgentEvent::SubagentUsage {
+                                usage: total.into(),
+                                outer: crate::agent::tools::bash::current_tool_call_id(),
+                            })
+                            .await;
+                    }
                 }
                 ChildExecution {
                     output,

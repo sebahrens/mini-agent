@@ -91,6 +91,11 @@ impl RoundCollector {
                 self.input_tokens += usage.input_tokens;
                 self.output_tokens += usage.output_tokens;
             }
+            #[cfg(feature = "subagents")]
+            AgentEvent::SubagentUsage { usage, .. } => {
+                self.input_tokens += usage.input_tokens;
+                self.output_tokens += usage.output_tokens;
+            }
             AgentEvent::Error { message, .. } => {
                 self.failure = Some(message.to_string());
             }
@@ -855,6 +860,33 @@ mod tests {
         });
         let summary = collector.finish(&goal(), RoundEnd::Done, 0);
         assert_eq!(summary.tokens_used, 5_600);
+    }
+
+    /// A finished foreground subagent's usage counts toward the round's
+    /// tokens (mini-agent-sskdu.266).
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn subagent_usage_counts_toward_the_round_tokens() {
+        let mut collector = RoundCollector::new();
+        collector.observe(&AgentEvent::UsageDelta {
+            usage: crate::event::UsageDelta {
+                input_tokens: 100,
+                output_tokens: 20,
+                ..crate::event::UsageDelta::default()
+            },
+            context_complete: true,
+            awaits_compaction_decision: false,
+        });
+        collector.observe(&AgentEvent::SubagentUsage {
+            usage: crate::event::UsageDelta {
+                input_tokens: 3_000,
+                output_tokens: 400,
+                ..crate::event::UsageDelta::default()
+            },
+            outer: None,
+        });
+        let summary = collector.finish(&goal(), RoundEnd::Done, 0);
+        assert_eq!(summary.tokens_used, 3_520);
     }
 
     #[test]

@@ -7267,6 +7267,8 @@ async fn relay_prompt_events(
                 }
             }
             #[cfg(feature = "subagents")]
+            AgentEvent::SubagentUsage { .. } => {}
+            #[cfg(feature = "subagents")]
             AgentEvent::SubagentStarted {
                 agent_type,
                 source,

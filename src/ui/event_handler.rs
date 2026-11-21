@@ -354,6 +354,10 @@ pub async fn handle_agent_event(
             );
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
+        // Counted by the goal round collector (fed above); the child's own
+        // spend is already charged through the spend account.
+        #[cfg(feature = "subagents")]
+        AgentEvent::SubagentUsage { .. } => {}
         #[cfg(feature = "subagents")]
         AgentEvent::SubagentStarted { agent_type, source, .. } => {
             renderer.write_line(
