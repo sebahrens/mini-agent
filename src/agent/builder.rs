@@ -1941,8 +1941,8 @@ fn spill_hook(
 }
 
 /// Builds the isolated `/btw` agent: a lightweight read-only Q&A helper with the
-/// project context for reference, NO tools, and a single turn. Never mutates the
-/// session.
+/// project context for reference, read-only tools only, and at most
+/// `BTW_MAX_TURNS` model turns. Never mutates the session.
 #[allow(clippy::too_many_arguments)]
 pub async fn build_btw_agent_inner<M: CompletionModel + 'static>(
     model: M,

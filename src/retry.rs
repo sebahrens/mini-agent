@@ -637,7 +637,7 @@ pub fn with_provider_error_hint_for(
     }
     match provider_retry_hint(error, SystemTime::now()) {
         Some(wait) if !wait.is_zero() => format!(
-            "{message}\nThe provider's rate limit resets in about {}s.",
+            "{message}\nThe provider asks to retry in about {}s.",
             wait.as_secs().max(1)
         ),
         _ => message,
@@ -1175,7 +1175,7 @@ mod tests {
         );
         let overloaded = hinted(529, &[("x-ratelimit-reset-tokens", "6m0s")]);
         assert_eq!(provider_retry_hint(&overloaded, now), None);
-        assert!(with_provider_error_hint(&openai).contains("resets in about 360s"));
+        assert!(with_provider_error_hint(&openai).contains("retry in about 360s"));
         for (value, expected) in [
             ("20ms", Some(Duration::from_millis(20))),
             ("1h2m3s", Some(Duration::from_secs(3723))),

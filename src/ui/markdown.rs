@@ -56,7 +56,16 @@ fn word_wrap_each(text: &str, max_width: usize, mut emit: impl FnMut(CompactStri
     let mut line = String::new();
     let mut line_width: usize = 0;
 
-    for word in text.split_inclusive(char::is_whitespace) {
+    // Keep a line's own indentation on its first row (a line that fits keeps
+    // it through the fast path above); cap it so the text still gets room.
+    let body = text.trim_start_matches(' ');
+    let indent = (text.len() - body.len()).min(max_width / 2);
+    if indent > 0 && !body.is_empty() {
+        line.push_str(&text[..indent]);
+        line_width = indent;
+    }
+
+    for word in body.split_inclusive(char::is_whitespace) {
         // `split_inclusive` ends each piece at its first whitespace character,
         // so a word carries at most one trailing whitespace character: measure
         // once and subtract that character's width instead of re-measuring.
@@ -1129,5 +1138,16 @@ mod narrow_table_tests {
     fn a_double_width_glyph_does_not_overflow_a_one_column_wrap() {
         let lines = word_wrap("界", 1);
         assert!(lines.iter().all(|line| display_width(line) <= 1));
+    }
+
+    #[test]
+    fn a_wrapped_line_keeps_its_first_row_indentation() {
+        let lines = word_wrap("    alpha beta gamma delta", 15);
+        assert_eq!(lines[0].as_str(), "    alpha beta");
+        assert!(lines.len() >= 2);
+        // Indentation wider than half the width is capped, never the whole row.
+        let lines = word_wrap("                    word another", 10);
+        assert!(lines.iter().all(|l| display_width(l) <= 10));
+        assert!(lines.iter().any(|l| l.contains("another")));
     }
 }
