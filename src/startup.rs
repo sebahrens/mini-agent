@@ -1080,7 +1080,7 @@ async fn dispatch_pre_compact_once(
     clippy::too_many_arguments,
     reason = "headless compaction context plus the optional fork agent"
 )]
-async fn compact_headless_session(
+pub(crate) async fn compact_headless_session(
     session: &mut Session,
     client: &AnyClient,
     cfg: &Config,

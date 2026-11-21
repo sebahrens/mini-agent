@@ -15053,6 +15053,114 @@ brainstorm = "no-such-quick-model"
             .unwrap();
     }
 
+    /// mini-agent-sskdu.239: ACP fires `PreCompact` once, then `PostCompact`
+    /// with the stored summary, then `SessionStart(compact)`, like every other
+    /// front end. The provider is a one-shot local server.
+    #[cfg(all(feature = "hooks", unix))]
+    #[tokio::test]
+    async fn acp_compact_fires_the_compaction_hooks_once() {
+        use crate::extras::hooks::dispatcher::HookDispatcher;
+        use crate::extras::hooks::settings::{HookGroup, HookHandler, HookTrust, HooksConfig};
+        use std::io::{Read, Write};
+        let _guard = crate::tests::fake_model::dispatcher_guard::acquire();
+        let workspace = ProtocolTempDir::new();
+        let log = workspace.path().join("compaction-hooks.log");
+        let mut config = HooksConfig::new();
+        for event in ["PreCompact", "PostCompact", "SessionStart"] {
+            config.insert(event.into(), vec![HookGroup { matcher:None, hooks:vec![HookHandler {
+                kind:"command".into(), command:Some("/bin/sh".into()),
+                args:Some(vec!["-c".into(), "{ cat; printf '\\n'; } >> \"$1\"".into(), "record".into(), log.display().to_string()]),
+                timeout:Some(10), is_async:false, condition:None, once:false, trust:HookTrust::Trusted, env:Default::default(),
+            }] }]);
+        }
+        crate::extras::hooks::init_dispatcher(HookDispatcher::from_config(&config).unwrap());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(15)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0, "provider request closed early");
+                bytes.extend_from_slice(&chunk[..count]);
+                let Some(header) = bytes.windows(4).position(|part| part == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&bytes[..header]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap()))
+                    .unwrap();
+                if bytes.len() >= header + 4 + length {
+                    break;
+                }
+            }
+            let first = serde_json::json!({"id":"acp-hook","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"HOOK_SUMMARY"},"finish_reason":null}]});
+            let last = serde_json::json!({"id":"acp-hook","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":9,"completion_tokens":4,"total_tokens":13}});
+            let body = format!("data: {first}\n\ndata: {last}\n\ndata: [DONE]\n\n");
+            let wire = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            stream.write_all(wire.as_bytes()).unwrap();
+        });
+        let cfg = format!(
+            "provider = \"plan80\"\nmodel = \"owned-model\"\n[api_keys]\nplan80 = \"unused-key\"\n[custom_providers.plan80]\nprovider_type = \"openai\"\nbase_url = \"http://{address}/v1\"\napi_style = \"completions\"\n"
+        );
+        let mut state = persona_state(&cfg, counting_fixture(Arc::new(AtomicUsize::new(0))));
+        let owned = Arc::get_mut(&mut state).unwrap();
+        owned.prompt_fixture = None; // Exercise the production compaction path.
+        owned.cli.no_sandbox = true;
+        owned.cli.tools = vec!["read".into()];
+        let inspect = state.clone();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                {
+                    let sessions = inspect.sessions.lock().await;
+                    let mut history = sessions[&session].history.lock().await;
+                    history
+                        .session
+                        .add_message(crate::session::MessageRole::User, &"x".repeat(2_000));
+                    history
+                        .session
+                        .add_message(crate::session::MessageRole::Assistant, &"y".repeat(2_000));
+                }
+                cx.send_request(prompt(session.clone(), "/compact"))
+                    .block_task()
+                    .await?;
+                let events: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+                    .unwrap_or_default()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                let names: Vec<&str> = events
+                    .iter()
+                    .filter_map(|event| event["hook_event_name"].as_str())
+                    .collect();
+                assert_eq!(names, ["PreCompact", "PostCompact", "SessionStart"], "{events:?}");
+                let sessions = inspect.sessions.lock().await;
+                let history = sessions[&session].history.lock().await;
+                let stored = history.session.compacted_context().0.unwrap().to_owned();
+                assert!(stored.contains("HOOK_SUMMARY"));
+                assert_eq!(events[1]["compact_summary"], stored);
+                assert_eq!(events[2]["source"], "compact");
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn model_slash_uses_raw_aliases_while_picker_uses_encoded_ids() {
         let turns = Arc::new(AtomicUsize::new(0));
