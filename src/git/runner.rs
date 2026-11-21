@@ -782,7 +782,7 @@ impl GitRunner {
             .await
             .map_err(|error| spawn_error(operation, &error))?;
         if output.status != CommandStatus::Completed {
-            return command_result(operation, QUERY_LIMITS, output).map(|_| Vec::new());
+            return Ok(command_result(operation, QUERY_LIMITS, output).map(|_| Vec::new())?);
         }
         match output.exit_status.and_then(|status| status.code()) {
             Some(0) => {
@@ -797,7 +797,7 @@ impl GitRunner {
                 }
                 Ok(entries)
             }
-            _ => Err(command_failure(operation, &output)),
+            _ => Err(command_failure(operation, &output).into()),
         }
     }
 
@@ -1013,7 +1013,7 @@ impl GitRunner {
             .await
             .map_err(|error| spawn_error(operation, &error))?;
         if output.status != CommandStatus::Completed {
-            return command_result(operation, GITLINK_PROBE_LIMITS, output).map(|_| Vec::new());
+            return Ok(command_result(operation, GITLINK_PROBE_LIMITS, output).map(|_| Vec::new())?);
         }
         if !output.exit_status.is_some_and(|status| status.success()) {
             // No index Git could read (not a repository, a bare one, or a
@@ -1177,7 +1177,7 @@ impl GitRunner {
                 _ => {}
             }
         }
-        command_result("config", QUERY_LIMITS, output).map(|_| None)
+        Ok(command_result("config", QUERY_LIMITS, output).map(|_| None)?)
     }
 
     pub(crate) async fn run<I, S>(
@@ -1186,7 +1186,7 @@ impl GitRunner {
         operation: &'static str,
         args: I,
         limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1206,7 +1206,7 @@ impl GitRunner {
         operation: &'static str,
         args: I,
         limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1223,7 +1223,7 @@ impl GitRunner {
         args: I,
         input: Vec<u8>,
         limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1245,7 +1245,7 @@ impl GitRunner {
         args: I,
         limits: CommandLimits,
         profile: InternalProfile,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1317,7 +1317,7 @@ impl GitRunner {
         args: I,
         input: Vec<u8>,
         limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1339,7 +1339,7 @@ impl GitRunner {
         operation: &'static str,
         args: I,
         limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1369,7 +1369,7 @@ impl GitRunner {
         operation: &'static str,
         args: I,
         limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1391,7 +1391,7 @@ impl GitRunner {
         args: I,
         input: Vec<u8>,
         limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1414,7 +1414,7 @@ impl GitRunner {
         args: I,
         limits: CommandLimits,
         allow_nonzero_or_truncated: bool,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1443,7 +1443,7 @@ impl GitRunner {
         operation: &'static str,
         args: I,
         limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -1464,7 +1464,7 @@ impl GitRunner {
         args: I,
         input: Vec<u8>,
         limits: CommandLimits,
-    ) -> Result<CommandOutput, String>
+    ) -> Result<CommandOutput, GitRunError>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
@@ -2148,6 +2148,9 @@ pub(crate) enum GitRunError {
         operation: String,
         stderr: String,
     },
+    /// A host-side refusal or setup failure before any process ran (paths
+    /// unavailable, identity changed, unresolved commit identity).
+    Refused(String),
 }
 
 /// The class of a [`GitRunError`], recoverable from its rendered message.
@@ -2179,6 +2182,7 @@ impl std::fmt::Display for GitRunError {
             Self::OutputLimit { operation, limit } => {
                 write!(f, "git {operation} {OUTPUT_LIMIT_MARKER} ({limit})")
             }
+            Self::Refused(message) => f.write_str(message),
             Self::Failed { operation, stderr } => {
                 if stderr.is_empty() {
                     write!(f, "git {operation} failed")
@@ -2197,40 +2201,13 @@ const OUTPUT_LIMIT_MARKER: &str = "exceeded bounded output limit";
 
 #[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
 impl GitRunError {
-    #[cfg(test)]
     pub(crate) fn kind(&self) -> GitRunErrorKind {
         match self {
             Self::Spawn { .. } => GitRunErrorKind::Spawn,
             Self::TimedOut { .. } => GitRunErrorKind::TimedOut,
             Self::Cancelled { .. } => GitRunErrorKind::Cancelled,
             Self::OutputLimit { .. } => GitRunErrorKind::OutputLimit,
-            Self::Failed { .. } => GitRunErrorKind::Failed,
-        }
-    }
-
-    /// The class of an already rendered runner message. This is the only
-    /// place that reads message text; everything else asks for a kind. A
-    /// marker only counts directly after `git <operation>`, so Git's own
-    /// stderr (which is quoted only after `failed:`) never reads as a
-    /// cut-off command.
-    pub(crate) fn classify(message: &str) -> GitRunErrorKind {
-        let has = |marker: &str| {
-            message.match_indices(marker).any(|(at, _)| {
-                let before = message[..at].trim_end_matches(' ');
-                let before_operation = before.rsplit_once(' ').map_or("", |(rest, _)| rest);
-                before_operation == "git" || before_operation.ends_with(" git")
-            })
-        };
-        if has(TIMED_OUT_MARKER) {
-            GitRunErrorKind::TimedOut
-        } else if has(CANCELLED_MARKER) {
-            GitRunErrorKind::Cancelled
-        } else if has(OUTPUT_LIMIT_MARKER) {
-            GitRunErrorKind::OutputLimit
-        } else if has(SPAWN_MARKER) {
-            GitRunErrorKind::Spawn
-        } else {
-            GitRunErrorKind::Failed
+            Self::Failed { .. } | Self::Refused(_) => GitRunErrorKind::Failed,
         }
     }
 
@@ -2242,6 +2219,18 @@ impl GitRunError {
     }
 }
 
+impl From<String> for GitRunError {
+    fn from(message: String) -> Self {
+        Self::Refused(message)
+    }
+}
+
+impl From<&str> for GitRunError {
+    fn from(message: &str) -> Self {
+        Self::Refused(message.to_string())
+    }
+}
+
 impl From<GitRunError> for String {
     fn from(error: GitRunError) -> Self {
         error.to_string()
@@ -2250,20 +2239,19 @@ impl From<GitRunError> for String {
 
 /// The error for a launch that failed in the sandbox or spawn layer; keeps the
 /// OS error that says what is wrong.
-fn spawn_error(operation: &str, source: &std::io::Error) -> String {
+fn spawn_error(operation: &str, source: &std::io::Error) -> GitRunError {
     tracing::warn!(operation, error = %source, "git command could not be launched");
     GitRunError::Spawn {
         operation: operation.to_string(),
         source: std::io::Error::new(source.kind(), source.to_string()),
     }
-    .to_string()
 }
 
 pub(crate) fn command_result(
     operation: &str,
     limits: CommandLimits,
     output: CommandOutput,
-) -> Result<CommandOutput, String> {
+) -> Result<CommandOutput, GitRunError> {
     let operation_owned = operation.to_string();
     match output.status {
         CommandStatus::Completed if output.exit_status.is_some_and(|status| status.success()) => {
@@ -2275,17 +2263,14 @@ pub(crate) fn command_result(
         CommandStatus::TimedOut => Err(GitRunError::TimedOut {
             operation: operation_owned,
             millis: limits.timeout.as_millis(),
-        }
-        .into()),
+        }),
         CommandStatus::Cancelled => Err(GitRunError::Cancelled {
             operation: operation_owned,
-        }
-        .into()),
+        }),
         CommandStatus::OutputLimitExceeded(limit) => Err(GitRunError::OutputLimit {
             operation: operation_owned,
             limit: format!("{limit:?}"),
-        }
-        .into()),
+        }),
     }
 }
 
@@ -2299,12 +2284,11 @@ fn is_silent_failure(output: &CommandOutput) -> bool {
         && !output.stderr.iter().all(u8::is_ascii_whitespace)
 }
 
-pub(crate) fn command_failure(operation: &str, output: &CommandOutput) -> String {
+pub(crate) fn command_failure(operation: &str, output: &CommandOutput) -> GitRunError {
     GitRunError::Failed {
         operation: operation.to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
     }
-    .into()
 }
 
 fn find_git_executable(path: Option<&OsStr>) -> Option<PathBuf> {
@@ -2360,45 +2344,61 @@ mod tests {
     }
 
     #[test]
-    fn run_error_classes_round_trip_through_their_rendered_message() {
+    fn run_error_kinds_come_from_the_variant_not_the_message() {
         use super::{GitRunError, GitRunErrorKind};
-        let errors = [
-            GitRunError::Spawn {
-                operation: "status".into(),
-                source: std::io::Error::from(std::io::ErrorKind::NotFound),
-            },
-            GitRunError::TimedOut {
-                operation: "log".into(),
-                millis: 10,
-            },
-            GitRunError::Cancelled {
-                operation: "diff".into(),
-            },
-            GitRunError::OutputLimit {
-                operation: "show".into(),
-                limit: "Stdout".into(),
-            },
-            GitRunError::Failed {
-                operation: "commit".into(),
-                stderr: "nothing to commit".into(),
-            },
+        let cases = [
+            (
+                GitRunError::Spawn {
+                    operation: "status".into(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                },
+                GitRunErrorKind::Spawn,
+            ),
+            (
+                GitRunError::TimedOut {
+                    operation: "log".into(),
+                    millis: 10,
+                },
+                GitRunErrorKind::TimedOut,
+            ),
+            (
+                GitRunError::Cancelled {
+                    operation: "diff".into(),
+                },
+                GitRunErrorKind::Cancelled,
+            ),
+            (
+                GitRunError::OutputLimit {
+                    operation: "show".into(),
+                    limit: "Stdout".into(),
+                },
+                GitRunErrorKind::OutputLimit,
+            ),
+            (
+                GitRunError::Failed {
+                    operation: "commit".into(),
+                    stderr: "nothing to commit".into(),
+                },
+                GitRunErrorKind::Failed,
+            ),
+            (
+                GitRunError::Refused("refusing git status".into()),
+                GitRunErrorKind::Failed,
+            ),
         ];
-        for error in errors {
-            assert_eq!(GitRunError::classify(&error.to_string()), error.kind());
+        for (error, kind) in cases {
+            assert_eq!(error.kind(), kind);
+            assert_eq!(
+                GitRunError::kind_is_uncertain(kind),
+                kind != GitRunErrorKind::Failed
+            );
         }
-        // Git's own stderr never reads as a cut-off command.
+        // Git's own stderr mentioning a marker is still a definite refusal.
         let refused = GitRunError::Failed {
             operation: "commit".into(),
             stderr: "fatal: pathspec 'timed out.txt' did not match".into(),
         };
-        assert_eq!(
-            GitRunError::classify(&refused.to_string()),
-            GitRunErrorKind::Failed
-        );
         assert!(!GitRunError::kind_is_uncertain(refused.kind()));
-        assert!(GitRunError::kind_is_uncertain(GitRunErrorKind::TimedOut));
-        assert!(GitRunError::kind_is_uncertain(GitRunErrorKind::Spawn));
-        assert!(!GitRunError::kind_is_uncertain(GitRunErrorKind::Failed));
     }
 
     #[test]
@@ -2406,14 +2406,16 @@ mod tests {
         let message = super::spawn_error(
             "status",
             &std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory"),
-        );
+        )
+        .to_string();
         assert!(message.contains("git status runner failed"), "{message}");
         assert!(message.contains("program not found"), "{message}");
         assert!(message.contains("No such file or directory"), "{message}");
         let denied = super::spawn_error(
             "log",
             &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        );
+        )
+        .to_string();
         assert!(denied.contains("permission denied"), "{denied}");
     }
 
@@ -2459,7 +2461,7 @@ mod tests {
     #[test]
     fn command_failure_empty_stderr() {
         let out = make_output(CommandStatus::Failed, b"");
-        assert_eq!(command_failure("log", &out), "git log failed");
+        assert_eq!(command_failure("log", &out).to_string(), "git log failed");
     }
 
     #[test]
@@ -2495,7 +2497,7 @@ mod tests {
     fn command_failure_strips_whitespace_from_stderr() {
         let out = make_output(CommandStatus::Failed, b"  not a repository  \n");
         assert_eq!(
-            command_failure("log", &out),
+            command_failure("log", &out).to_string(),
             "git log failed: not a repository"
         );
     }
@@ -2504,7 +2506,8 @@ mod tests {
     fn command_result_timed_out() {
         let err = command_result("fetch", limits(), make_output(CommandStatus::TimedOut, b""))
             .err()
-            .expect("expected Err");
+            .expect("expected Err")
+            .to_string();
         assert!(err.contains("timed out"), "unexpected: {err}");
         assert!(err.contains("fetch"), "unexpected: {err}");
     }
@@ -2517,7 +2520,8 @@ mod tests {
             make_output(CommandStatus::Cancelled, b""),
         )
         .err()
-        .expect("expected Err");
+        .expect("expected Err")
+        .to_string();
         assert!(err.contains("cancelled"), "unexpected: {err}");
     }
 
@@ -2532,7 +2536,8 @@ mod tests {
             ),
         )
         .err()
-        .expect("expected Err");
+        .expect("expected Err")
+        .to_string();
         assert!(
             err.contains("exceeded bounded output limit"),
             "unexpected: {err}"
@@ -2547,7 +2552,8 @@ mod tests {
             make_output(CommandStatus::Failed, b"access denied"),
         )
         .err()
-        .expect("expected Err");
+        .expect("expected Err")
+        .to_string();
         assert!(err.contains("access denied"), "unexpected: {err}");
     }
 
@@ -2582,7 +2588,7 @@ mod tests {
             .await;
         for result in [internal, contained] {
             assert_eq!(
-                result.err().as_deref(),
+                result.err().map(|error| error.to_string()).as_deref(),
                 Some("Git executable is unavailable or unsupported")
             );
         }
@@ -3325,7 +3331,8 @@ mod configuration_encoding_tests {
             .await;
         let error = result
             .err()
-            .expect("undecodable filter configuration must refuse add");
+            .expect("undecodable filter configuration must refuse add")
+            .to_string();
         assert!(error.contains("executable Git configuration"), "{error}");
         assert!(!marker.exists(), "non-UTF8 filter ran outside containment");
         let index = runner

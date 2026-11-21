@@ -404,7 +404,13 @@ pub(crate) async fn repair_rounds(
     for attempt in 0..=MAX_REPAIRS {
         // An ephemeral stream still owns one live conversation: record and
         // charge every attempt in memory, and only skip the disk save.
-        crate::print::persist_headless_turn(session, &prompt, &response, &interactions);
+        if attempt == 0 {
+            crate::print::persist_headless_turn(session, &prompt, &response, &interactions);
+        } else {
+            // A repair is host-started: a short System note plus the repaired
+            // answer, never a user-role prompt carrying the schema.
+            crate::print::persist_headless_host_turn(session, &prompt, &response, &interactions);
+        }
         let usage = cfg.normalize_usage(&session.provider, attempt_usage.into());
         session.charge_usage_delta(usage, cfg.is_anthropic_native(&session.provider));
         if !cli.no_session

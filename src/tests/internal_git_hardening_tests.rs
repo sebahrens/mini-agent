@@ -387,7 +387,8 @@ async fn init_does_not_treat_broken_git_metadata_as_unborn() {
         .run(&unborn, "init", ["init", "--quiet"], LOCAL_MUTATION_LIMITS)
         .await
         .err()
-        .expect("a broken existing .git entry must fail closed");
+        .expect("a broken existing .git entry must fail closed")
+        .to_string();
     assert!(error.contains("git init"), "{error}");
     assert_eq!(
         std::fs::read_to_string(unborn.join(".git")).unwrap(),
@@ -585,7 +586,8 @@ async fn network_fetch_refuses_repository_upload_pack() {
         .run_network(&fixture.repo, "fetch", ["fetch", "origin"], QUERY_LIMITS)
         .await
         .err()
-        .expect("repository upload-pack refuses the fetch");
+        .expect("repository upload-pack refuses the fetch")
+        .to_string();
     assert!(error.contains("remote.origin.uploadpack"), "{error}");
     assert_not_run(std::slice::from_ref(&marker));
 
