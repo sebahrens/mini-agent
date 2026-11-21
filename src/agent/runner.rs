@@ -963,6 +963,7 @@ impl std::error::Error for HeadlessInterrupted {}
 /// Whether `error` is an operator interrupt. Typed errors are found anywhere in
 /// the chain; the message is still accepted for a failure that crossed a text
 /// boundary (a rendered or re-wrapped error) before reaching the caller.
+#[cfg(feature = "goal")]
 pub fn is_headless_interrupt(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| cause.is::<HeadlessInterrupted>())
         || error.to_string().contains(HEADLESS_INTERRUPTED)

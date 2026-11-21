@@ -4990,7 +4990,7 @@ async fn run_command(
             history.session.name = name.as_str().into();
             Some(format!("Session renamed to {name}."))
         }
-        commands::Command::Cost => Some(cost_summary(state, &history)),
+        commands::Command::Cost => Some(cost_summary(state, history)),
         commands::Command::Model(_) | commands::Command::Effort(_) => {
             let (config_id, argument) = match command {
                 commands::Command::Model(argument) => (model_options::MODEL_CONFIG_ID, argument),
@@ -4999,18 +4999,17 @@ async fn run_command(
             };
             let native = crate::session::native_publication::is_native_bearing(&history.session);
             let line = if argument.is_empty() {
-                selection_summary(state, &session_id, config_id).await
+                selection_summary(state, session_id, config_id).await
             } else {
                 let command_value = if config_id == model_options::MODEL_CONFIG_ID {
                     model_options::command_model_value(argument)
                 } else {
                     argument.to_owned()
                 };
-                match set_model_override(state, &session_id, config_id, &command_value, native)
-                    .await
+                match set_model_override(state, session_id, config_id, &command_value, native).await
                 {
                     Ok(line) => {
-                        let options = persona_config_options(state, &session_id).await;
+                        let options = persona_config_options(state, session_id).await;
                         let _ = cx.send_notification(SessionNotification::new(
                             session_id.clone(),
                             SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
