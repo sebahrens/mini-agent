@@ -1222,16 +1222,17 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             )));
         }
 
-        base_tools.push(Box::new(
-            tools::ReadTool::new_with_tracker(
-                permission.clone(),
-                ask_tx.clone(),
-                max_text_file_size,
-                max_read_lines,
-                read_tracker.clone(),
-            )
-            .with_workspace_binding(workspace.clone()),
-        ));
+        let read_tool = tools::ReadTool::new_with_tracker(
+            permission.clone(),
+            ask_tx.clone(),
+            max_text_file_size,
+            max_read_lines,
+            read_tracker.clone(),
+        )
+        .with_workspace_binding(workspace.clone());
+        #[cfg(feature = "lsp")]
+        let read_tool = read_tool.with_lsp(lsp_manager.clone());
+        base_tools.push(Box::new(read_tool));
         base_tools.push(Box::new(write_tool));
         base_tools.push(Box::new(edit_tool));
         base_tools.push(Box::new(tools::ask_user::AskUserTool::new(

@@ -5113,6 +5113,11 @@ where
                         let hook_notices = crate::extras::hooks::take_hook_problem_notices();
                         #[cfg(not(feature = "hooks"))]
                         let hook_notices: Vec<String> = Vec::new();
+                        #[cfg(feature = "lsp")]
+                        let hook_notices: Vec<String> = hook_notices
+                            .into_iter()
+                            .chain(crate::extras::lsp::take_user_notices())
+                            .collect();
                         for notice in crate::agent::image_budget::take_notices()
                             .into_iter()
                             .chain(hook_notices)

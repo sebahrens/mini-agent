@@ -166,6 +166,21 @@ struct StartingServer {
     noted: Arc<std::sync::atomic::AtomicBool>,
 }
 
+static USER_NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// One-line notices for the user (a language server failed to start, or
+/// recovered), queued since the last call. The runner shows them in the feed.
+pub(crate) fn take_user_notices() -> Vec<String> {
+    std::mem::take(&mut *USER_NOTICES.lock().unwrap_or_else(|e| e.into_inner()))
+}
+
+fn push_user_notice(notice: String) {
+    let mut queue = USER_NOTICES.lock().unwrap_or_else(|e| e.into_inner());
+    if queue.len() < 16 {
+        queue.push(notice);
+    }
+}
+
 /// How long the first edit of a language waits for the server's handshake
 /// before returning without diagnostics. The spawn continues in the
 /// background and the next edit uses the ready client.
@@ -684,6 +699,32 @@ impl LspManager {
         }
     }
 
+    /// Starts the server for `path` in the background without waiting, so a
+    /// later edit finds it ready. A no-op when none claims the path, one is
+    /// running or starting, or it is cooling down after a failure.
+    pub(crate) async fn prewarm(&self, path: &Path) {
+        if self.inner.workspace.validate().is_err()
+            || !path.starts_with(self.inner.workspace.root())
+        {
+            return;
+        }
+        let Some((name, cfg)) = registry::server_for_path(&self.inner.servers, path) else {
+            return;
+        };
+        let clients = self.inner.clients.lock().await;
+        if clients.get(name).is_some_and(|client| client.is_usable())
+            || self.server_is_cooling_down(name)
+        {
+            return;
+        }
+        self.inner
+            .starting
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(name.clone())
+            .or_insert_with(|| self.start_in_background(name, cfg));
+    }
+
     /// Spawns `name` on a background task that installs the client when its
     /// handshake completes (or records the failure). Called with the
     /// `clients` lock held, which the task needs to finish, so a caller can
@@ -707,8 +748,19 @@ impl LspManager {
             )
             .await;
             let mut clients = manager.inner.clients.lock().await;
+            let had_failed = manager
+                .inner
+                .failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .contains_key(&name);
             let result = match spawned {
                 Some(spawned) => {
+                    if had_failed {
+                        push_user_notice(format!(
+                            "LSP ({name}): server recovered; diagnostics resumed"
+                        ));
+                    }
                     manager
                         .inner
                         .failures
@@ -726,6 +778,11 @@ impl LspManager {
                     Some(spawned)
                 }
                 None => {
+                    if !had_failed {
+                        push_user_notice(format!(
+                            "LSP ({name}): server failed to start; edits will not report diagnostics (see /doctor)"
+                        ));
+                    }
                     manager.record_server_failure(&name);
                     None
                 }
