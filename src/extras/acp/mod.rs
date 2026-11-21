@@ -7327,6 +7327,8 @@ async fn relay_prompt_events(
             }
             // Display-only hint for the TUI; ACP clients get the call when it completes.
             AgentEvent::ToolCallArgsStreaming { .. } => {}
+            // Display-only row update for the TUI.
+            AgentEvent::ToolInputRewritten { .. } => {}
             AgentEvent::ToolProgress { id, text } => {
                 // Throttled by the runner; one update on the same call, never
                 // a new tool call. The result update stays canonical.

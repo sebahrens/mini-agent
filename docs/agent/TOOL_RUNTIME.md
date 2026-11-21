@@ -440,7 +440,12 @@ advertises `readOnlyHint: true`. Other mutating tools (`write`, `edit`,
 tools use exclusive access. Consequently independent reads overlap, results remain
 in the model's original call order, mutations remain serialized, and reads do
 not observe a concurrent mutation. Tool hooks are inside the same lane so a
-guard-rail command cannot race another tool operation.
+guard-rail command cannot race another tool operation. A call is admitted on the lane
+its model-proposed arguments need; when a `PreToolUse` hook rewrites the input, the
+hook decorator re-derives the lease from the rewritten arguments before anything runs
+(a read rewritten into a write takes the exclusive lane, a write rewritten into a read
+shares it), and the TUI row shows the effective call through `AgentEvent::ToolInputRewritten`
+while the transcript keeps the model's original call.
 
 File tools (`read`, `write`, `edit`, `list_dir`, `grep`, `find_files`) resolve their path
 argument once through `resolve_tool_target` in `src/agent/tools/mod.rs`. Home expansion (`~/`,

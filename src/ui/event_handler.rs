@@ -320,6 +320,14 @@ pub async fn handle_agent_event(
                 renderer.write_line_anchored(&id, &sanitize_output(&line), C_TOOL)?;
             }
         }
+        AgentEvent::ToolInputRewritten { id, name, args } => {
+            // The row shows what runs; the transcript keeps what the model sent.
+            let line = format!(
+                "◈ {} (input rewritten by a hook)",
+                crate::ui::utils::format_tool_call_display(&name, &args)
+            );
+            renderer.replace_anchored_line(&id, &sanitize_output(&line))?;
+        }
         AgentEvent::ToolCallArgsStreaming { id, name, bytes } => {
             run.was_reasoning = false;
             finalize_response_segment(renderer, run)?;
