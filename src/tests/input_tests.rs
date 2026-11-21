@@ -44,7 +44,9 @@ fn command_picker_hands_permissions_to_its_argument_picker() {
             assert_eq!(*prefix, "/permissions ");
             assert_eq!(
                 picker.matches().collect::<Vec<_>>(),
-                ["yolo", "auto", "manual", "rules", "forget"]
+                [
+                    "yolo", "auto", "manual", "rules", "forget", "session", "revoke"
+                ]
             );
         }
         _ => panic!("the command picker should hand off to the permissions picker"),

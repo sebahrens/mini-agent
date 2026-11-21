@@ -2824,11 +2824,11 @@ impl Startup {
                     self.workspace.root(),
                 ) {
                     Ok(rules) => {
-                        let rules: Vec<(String, String)> = rules
-                            .into_iter()
-                            .map(|rule| (rule.tool, rule.pattern))
-                            .collect();
-                        guard.load_session_allowlist(&rules);
+                        // Approved network hosts feed the allowlist proxy.
+                        let (rules, hosts) =
+                            crate::permission::project_approvals::split_network_hosts(rules);
+                        guard.load_project_allowlist(&rules);
+                        self.sandbox.set_project_network_hosts(hosts);
                     }
                     Err(error) => tracing::warn!("project approvals not loaded: {error:#}"),
                 }

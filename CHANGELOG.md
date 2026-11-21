@@ -97,6 +97,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `/worktree` names submodules that `git worktree add` left unpopulated and the command that fills them (mini-agent-nvnkx.220)
 - Background task completion notices carry the task's report when it is small (up to 12 KiB each, 32 KiB per request), so the model needs no `task_result` round trip; larger reports keep the pointer plus a short head (mini-agent-nvnkx.177)
 - `/wt-merge --pull` syncs the target with its remote before squashing, and `-m <message>` sets the squash commit message (mini-agent-nvnkx.216, .318)
+- `sandbox-network-hosts` accepts presets `@cargo`, `@npm`, `@pypi`, `@github` and `@go` that expand to fixed host sets (shown by `/sandbox`, bounded by a managed `allowed_hosts` pin); the `sandbox_network` prompt's `(p)` stores the approved `host:port` in the per-project approvals so a later session allows it without asking (mini-agent-nvnkx.189).
+- The allowlist proxy's command environment adds `NODE_USE_ENV_PROXY=1`, `npm_config_proxy` and `npm_config_https_proxy`; the shell tool description and CONFIG.md state which client families work and give a JVM recipe (mini-agent-nvnkx.188).
+- Global-only `sandbox-network-private-hosts` lets exact listed intranet hosts resolve to RFC 1918 addresses (loopback, link-local and metadata stay refused) and global-only `sandbox-network-upstream-proxy` chains the allowlist proxy through a corporate HTTP proxy with `CONNECT` after its own decision (mini-agent-nvnkx.187).
+- `/permissions session` lists the running session's grants in plain words and `/permissions revoke <n|all>` removes them (checker rebuilt, session saved); `/permissions rules` also shows configured rules and built-ins, and `forget` now applies to the running session (mini-agent-nvnkx.67).
+- The approval prompt offers `(r)` (prefix) and `(d)` (folder) project-scoped variants of `(x)` and `(f)` under `persist_project_approvals`; project approvals live in their own checker list that `/resume` no longer clears (mini-agent-nvnkx.68).
 
 ### Fixed
 

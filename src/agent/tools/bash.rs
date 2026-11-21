@@ -435,7 +435,7 @@ impl Tool for ShellTool {
         if self.sandbox.containment_requested() {
             if self.sandbox.shell_network_proxied() {
                 description.push_str(
-                    " Network: shell commands reach only the hosts in sandbox-network-hosts plus hosts the user approves at a prompt; a refused host is named in the result.",
+                    " Network: shell commands reach only the hosts in sandbox-network-hosts plus hosts the user approves at a prompt; a refused host is named in the result. Only HTTP(S)-proxy-aware clients work (curl, git over https, cargo, pip, npm, Node fetch); JVM tools need -Dhttps.proxyHost/-Dhttps.proxyPort from HTTPS_PROXY, and SSH remotes cannot be used, so prefer https remotes.",
                 );
             } else if !self.sandbox.shell_network_effective() {
                 description.push_str(

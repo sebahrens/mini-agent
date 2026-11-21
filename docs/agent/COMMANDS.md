@@ -155,8 +155,10 @@ built-in prompts, or create a custom `code.md` prompt).
 | `/permissions` | Open the approval-mode picker. |
 | `/permissions auto` | Auto-approve workspace-safe operations; equivalent to `/mode standard`. `auto-approval` is accepted as an alias. |
 | `/permissions manual` | Ask before every operation; equivalent to `/mode restrictive`. `manual-approval` is accepted as an alias. |
-| `/permissions rules` | List this project's persisted `(p)` approvals (see `persist_project_approvals` in CONFIG.md). |
-| `/permissions forget <n\|all>` | Remove persisted project approval `n` (from `/permissions rules`) or all of them; effective at the next interactive start. |
+| `/permissions rules` | List this project's persisted `(p)`/`(r)`/`(d)` approvals (see `persist_project_approvals` in CONFIG.md) plus the configured allow/ask/deny rules and built-ins. |
+| `/permissions forget <n\|all>` | Remove persisted project approval `n` (from `/permissions rules`) or all of them, in the store and in the running session. |
+| `/permissions session` | Numbered list of the grants the running session auto-allows (prefix, folder, workspace-edit, exact and web-origin grants), restored on `--resume`. |
+| `/permissions revoke <n\|all>` | Remove session grant `n` (or all); the checker is rebuilt and the session saved, so the next matching call asks again. |
 | `/permissions yolo` | Allow everything except destructive shell commands, which still ask; equivalent to `/mode yolo`. |
 | `/mode accept` | Alias for `/mode standard`, matching `default_permission_mode`. |
 | `/sandbox` | Show the current ordinary command filesystem profile and describe `workspace`, `host-read` and `host-full`. Works while the agent runs. |

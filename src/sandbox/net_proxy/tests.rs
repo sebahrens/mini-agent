@@ -303,6 +303,8 @@ fn shared_with_prompt(
     let shared = Shared {
         refusals: Mutex::default(),
         rules,
+        private_hosts: Vec::new(),
+        upstream: None,
         session: Mutex::default(),
         prompt,
         inflight: Mutex::default(),
@@ -686,4 +688,160 @@ async fn a_denied_connect_records_one_refusal_naming_the_host() {
     assert_eq!(refusals[0].host_port, "blocked.example:443");
     assert_eq!(refusals[0].reason, RefusalReason::NotAllowed);
     assert_eq!(proxy.recent_refusals().len(), 1);
+}
+
+#[test]
+fn presets_expand_to_their_fixed_host_sets_and_unknown_ones_are_rejected() {
+    let list = rules(&["@cargo", "example.com"]);
+    let allowed = |host: &str| list.iter().any(|rule| rule.matches(host, 443));
+    for host in ["index.crates.io", "static.crates.io", "crates.io"] {
+        assert!(allowed(host), "{host}");
+    }
+    assert!(allowed("example.com") && !allowed("pypi.org"));
+    assert!(!allowed("evil.crates.io"), "a preset is exact hosts");
+    assert!(parse_rules(&["@nope".to_string()]).is_err());
+    assert_eq!(
+        describe_presets(&["@pypi".to_string(), "a.example".to_string()]),
+        ["@pypi = pypi.org, files.pythonhosted.org"]
+    );
+    for (name, hosts) in PRESETS {
+        assert!(name.starts_with('@') && !hosts.is_empty());
+        assert!(parse_rules(&[name.to_string()]).is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn private_hosts_may_resolve_to_private_ranges_but_never_loopback_or_metadata() {
+    let addr = |ip: &str| SocketAddr::new(ip.parse().unwrap(), 443);
+    let private = vec![addr("10.0.0.5"), addr("172.16.3.4"), addr("fd00::5")];
+    assert!(usable_addrs(private.clone(), false).is_empty());
+    assert_eq!(usable_addrs(private.clone(), true), private);
+    for ip in [
+        "127.0.0.1",
+        "169.254.169.254",
+        "168.63.129.16",
+        "::1",
+        "fe80::1",
+        "fd00::ec2",
+        "::ffff:127.0.0.1",
+        "0.0.0.0",
+    ] {
+        let forbidden = ip != "fd00::ec2";
+        assert_eq!(
+            usable_addrs(vec![addr(ip)], true).is_empty(),
+            forbidden,
+            "{ip}"
+        );
+    }
+}
+
+#[test]
+fn command_environment_carries_the_node_and_npm_proxy_switches() {
+    let proxy = NetworkProxy::start(Vec::new(), Arc::default()).unwrap();
+    let env = proxy.env();
+    let get = |name: &str| env.iter().find(|(key, _)| key == name).map(|(_, v)| v);
+    assert_eq!(get("NODE_USE_ENV_PROXY").map(String::as_str), Some("1"));
+    assert_eq!(get("npm_config_proxy"), get("HTTPS_PROXY"));
+    assert_eq!(get("npm_config_https_proxy"), get("HTTPS_PROXY"));
+}
+
+#[test]
+fn upstream_proxy_urls_parse_with_optional_credentials() {
+    let plain = Upstream::parse("http://proxy.corp.example:3128").unwrap();
+    assert_eq!(plain.display(), "proxy.corp.example:3128");
+    assert!(plain.auth.is_none());
+    let authed = Upstream::parse("http://user:pw@10.1.1.1:8080/").unwrap();
+    assert_eq!(authed.display(), "10.1.1.1:8080");
+    assert!(authed.auth.as_deref().unwrap().starts_with("Basic "));
+    assert!(
+        !format!("{authed:?}").contains("pw"),
+        "credentials stay out of Debug"
+    );
+    for bad in [
+        "",
+        "https://p:1",
+        "proxy:3128",
+        "http://p",
+        "http://p:1/x",
+        "http://:80",
+    ] {
+        assert!(Upstream::parse(bad).is_err(), "{bad:?}");
+    }
+}
+
+#[tokio::test]
+async fn an_upstream_proxy_receives_connect_after_the_allowlist_decision() {
+    let fake = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let fake_port = fake.local_addr().unwrap().port();
+    let seen = tokio::spawn(async move {
+        let (mut stream, _) = fake.accept().await.unwrap();
+        let (head, _) = read_head(&mut stream).await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nhello")
+            .await
+            .unwrap();
+        let _ = stream.shutdown().await;
+        String::from_utf8(head).unwrap()
+    });
+    let options = ProxyOptions {
+        private_hosts: Vec::new(),
+        upstream: Some(Upstream::parse(&format!("http://u:p@127.0.0.1:{fake_port}")).unwrap()),
+    };
+    let proxy = NetworkProxy::start_with_options(
+        rules(&["registry.corp.example"]),
+        Arc::default(),
+        false,
+        options,
+    )
+    .unwrap();
+    let response = exchange(
+        &proxy,
+        &format!(
+            "CONNECT registry.corp.example:443 HTTP/1.1\r\n{}\r\n",
+            auth(&proxy)
+        ),
+    )
+    .await;
+    assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    assert!(response.ends_with("hello"), "{response}");
+    let head = seen.await.unwrap();
+    assert!(
+        head.starts_with("CONNECT registry.corp.example:443 HTTP/1.1"),
+        "{head}"
+    );
+    assert!(head.contains("Proxy-Authorization: Basic "), "{head}");
+
+    // The hard refusals still apply before the upstream is contacted.
+    let proxy = NetworkProxy::start_with_options(
+        rules(&["localhost", "169.254.169.254"]),
+        Arc::default(),
+        false,
+        ProxyOptions {
+            private_hosts: rules(&["localhost", "169.254.169.254"]),
+            upstream: Some(Upstream::parse("http://127.0.0.1:9").unwrap()),
+        },
+    )
+    .unwrap();
+    for target in ["localhost:443", "169.254.169.254:80"] {
+        let response = exchange(
+            &proxy,
+            &format!("CONNECT {target} HTTP/1.1\r\n{}\r\n", auth(&proxy)),
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "{target}: {response}");
+    }
+}
+
+#[tokio::test]
+async fn a_persisted_project_host_is_allowed_by_a_fresh_proxy_without_asking() {
+    let proxy = NetworkProxy::start(Vec::new(), Arc::default()).unwrap();
+    assert!(proxy.shared.decide("index.crates.io", 443).await.is_err());
+    proxy.allow_for_session("Index.crates.io:443");
+    proxy.shared.decide("index.crates.io", 443).await.unwrap();
+    assert!(
+        proxy.shared.decide("index.crates.io", 8443).await.is_err(),
+        "the stored approval is for that port only"
+    );
 }

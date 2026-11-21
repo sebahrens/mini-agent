@@ -306,7 +306,9 @@ pub(crate) fn argument_picker_spec(
 ) -> Option<(&'static [&'static str], &'static str)> {
     match command {
         "/permissions" => Some((
-            &["yolo", "auto", "manual", "rules", "forget"],
+            &[
+                "yolo", "auto", "manual", "rules", "forget", "session", "revoke",
+            ],
             "/permissions ",
         )),
         "/mode" => Some((
@@ -1020,7 +1022,12 @@ mod tests {
     #[test]
     fn finite_argument_commands_open_consistent_sub_pickers() {
         let (permissions, prefix) = argument_picker_spec("/permissions").unwrap();
-        assert_eq!(permissions, ["yolo", "auto", "manual", "rules", "forget"]);
+        assert_eq!(
+            permissions,
+            [
+                "yolo", "auto", "manual", "rules", "forget", "session", "revoke"
+            ]
+        );
         assert_eq!(prefix, "/permissions ");
 
         let (modes, prefix) = argument_picker_spec("/mode").unwrap();

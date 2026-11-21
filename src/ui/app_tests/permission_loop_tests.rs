@@ -603,6 +603,113 @@ async fn actual_project_approval_key_is_inert_by_default_and_persists_when_enabl
     }
 }
 
+// mini-agent-nvnkx.68, .189: `(r)` remembers a prefix and `(p)` an approved
+// network host per project; a restarted checker applies the prefix and keeps
+// it across a session replacement.
+#[tokio::test]
+async fn actual_project_prefix_and_network_host_approvals_persist_and_reload() {
+    use crate::permission::checker::{CheckResult, PermissionChecker};
+    let root = crate::tests::OwnedTestDirectory::new("permission-project-prefix");
+    let _environment = environment(&root);
+    let workspace_path = root.path().join("workspace");
+    std::fs::create_dir_all(&workspace_path).unwrap();
+    let cli = crate::cli::Cli {
+        no_session: true,
+        no_tools: true,
+        no_sandbox: true,
+        ..Default::default()
+    };
+    let mut cfg = fixture_config();
+    cfg.persist_project_approvals = Some(true);
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(&workspace_path).unwrap());
+    let root_path = workspace.root().to_path_buf();
+    let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+    let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+    let new_checker = || {
+        PermissionChecker::new(
+            &crate::permission::PermissionConfigs::default(),
+            crate::permission::SecurityMode::Standard,
+            Some(workspace_path.clone()),
+            None,
+        )
+        .unwrap()
+    };
+    let permission = Arc::new(std::sync::Mutex::new(new_checker()));
+    let mut ui = fixture_ui(&cli, &cfg, &mut session, &mut context, workspace);
+    ui.permission = Some(permission.clone());
+    let mut app = fixture_app(ui);
+    let pending = PendingMainTurn::capture(app.ui.session, "project prefix");
+    crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+    app.run.is_running = true;
+    let (asks, receiver) = mpsc::channel(4);
+    app.ask_rx = Some(receiver);
+
+    let (ask, decision) = request("cargo test --lib");
+    sent(&asks, ask.into()).await;
+    drain(&mut app).await;
+    assert!(
+        app.renderer
+            .permission_prompt
+            .as_ref()
+            .is_some_and(|prompt| prompt.options.contains(
+                "(r) always allow commands starting with \"cargo test\" in this project"
+            ))
+    );
+    sent(
+        &app.user_tx,
+        UserEvent::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)),
+    )
+    .await;
+    drain(&mut app).await;
+    assert!(matches!(replied(decision).await, UserDecision::AllowOnce));
+
+    let (mut ask, decision) = request("index.crates.io:443");
+    ask.tool = "sandbox_network".into();
+    sent(&asks, ask.into()).await;
+    drain(&mut app).await;
+    sent(
+        &app.user_tx,
+        UserEvent::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE)),
+    )
+    .await;
+    drain(&mut app).await;
+    assert!(matches!(
+        replied(decision).await,
+        UserDecision::AllowAlways(_)
+    ));
+    assert!(
+        app.ui
+            .session
+            .permission_allowlist
+            .iter()
+            .all(|entry| entry.tool != "sandbox_network"),
+        "a host is the proxy's grant, not a checker entry"
+    );
+
+    let state = &crate::paths::process_paths_ref().unwrap().state_dir;
+    let stored = crate::permission::project_approvals::load(state, &root_path).unwrap();
+    let (rules, hosts) = crate::permission::project_approvals::split_network_hosts(stored);
+    assert_eq!(
+        rules,
+        [("shell_prefix".to_string(), "cargo test".to_string())]
+    );
+    assert_eq!(hosts, ["index.crates.io:443"]);
+
+    // A restarted checker loads the store and keeps it over a /resume.
+    let mut fresh = new_checker();
+    fresh.load_project_allowlist(&rules);
+    assert_eq!(fresh.check("shell", "cargo test foo"), CheckResult::Allowed);
+    fresh.replace_session_allowlist(&[]);
+    assert_eq!(fresh.check("shell", "cargo test foo"), CheckResult::Allowed);
+    assert_eq!(fresh.check("shell", "cargo publish"), CheckResult::Ask);
+
+    sent(&app.user_tx, UserEvent::Quit).await;
+    tokio::time::timeout(Duration::from_secs(2), app.run_inner())
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 #[tokio::test]
 async fn actual_permission_stages_preserve_prompt_folder_and_explicit_session_grants() {
     use crate::permission::checker::{CheckResult, PermissionChecker, PromptGrantOffer};

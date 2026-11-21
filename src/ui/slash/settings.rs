@@ -378,6 +378,9 @@ async fn handle_sandbox(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resul
         write_ok(ctx.renderer, ctx.sandbox.status_line());
         write_result(ctx.renderer, shell_network_line(ctx.sandbox));
         write_result(ctx.renderer, shell_auto_allow_line(ctx));
+        for line in network_policy_lines(ctx.sandbox) {
+            write_result(ctx.renderer, line);
+        }
         write_result(
             ctx.renderer,
             format!(
@@ -513,7 +516,39 @@ async fn handle_sandbox_network(args: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow
         format!("sandbox network: {network} (this session only; not saved to configuration)"),
     );
     write_result(ctx.renderer, shell_network_line(ctx.sandbox));
+    for line in network_policy_lines(ctx.sandbox) {
+        write_result(ctx.renderer, line);
+    }
     Ok(())
+}
+
+/// Detail lines under the network line: preset expansions, approved project
+/// hosts, intranet exceptions and the upstream proxy.
+fn network_policy_lines(sandbox: &crate::sandbox::Sandbox) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !sandbox.network().is_allowlist() {
+        return lines;
+    }
+    for line in crate::sandbox::net_proxy::describe_presets(sandbox.network_hosts()) {
+        lines.push(format!("    preset {line}"));
+    }
+    let project = sandbox.project_network_hosts();
+    if !project.is_empty() {
+        lines.push(format!(
+            "    approved for this project: {}",
+            project.join(", ")
+        ));
+    }
+    if !sandbox.network_private_hosts().is_empty() {
+        lines.push(format!(
+            "    may resolve to private addresses: {}",
+            sandbox.network_private_hosts().join(", ")
+        ));
+    }
+    if let Some(upstream) = sandbox.network_upstream_display() {
+        lines.push(format!("    upstream proxy: {upstream}"));
+    }
+    lines
 }
 
 /// Recent hosts the allowlist proxy refused, newest last, for `/sandbox`.
@@ -617,13 +652,45 @@ async fn handle_permissions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::R
         return Ok(());
     }
 
+    if parts[1] == "session" {
+        for line in session_grant_lines(&ctx.session.permission_allowlist) {
+            write_result(ctx.renderer, crate::ui::events::sanitize_output(&line));
+        }
+        return Ok(());
+    }
+    if parts[1] == "revoke" {
+        return revoke_session_grants(ctx, parts.get(2).copied());
+    }
     if matches!(parts[1], "rules" | "forget") {
         let Ok(paths) = crate::paths::process_paths_ref() else {
             write_error(ctx.renderer, "application paths unavailable");
             return Ok(());
         };
         let root = ctx.workspace.root();
-        for line in project_approval_lines(&paths.state_dir, root, &parts[1..]) {
+        let before =
+            crate::permission::project_approvals::load(&paths.state_dir, root).unwrap_or_default();
+        let mut lines = project_approval_lines(&paths.state_dir, root, &parts[1..]);
+        if parts[1] == "forget" {
+            // The running session drops what the store dropped.
+            let after = crate::permission::project_approvals::load(&paths.state_dir, root)
+                .unwrap_or_default();
+            let removed: Vec<(String, String)> = before
+                .into_iter()
+                .filter(|rule| !after.contains(rule))
+                .map(|rule| (rule.tool, rule.pattern))
+                .collect();
+            if !removed.is_empty() {
+                apply_forgotten_approvals(ctx, &removed);
+            }
+        } else if let Some(permission) = ctx.permission {
+            let checker = permission.lock().unwrap_or_else(|error| error.into_inner());
+            let configured = checker.effective_rule_lines();
+            if !configured.is_empty() {
+                lines.push("  configured rules and built-ins (deny wins):".into());
+                lines.extend(configured.into_iter().map(|line| format!("    {line}")));
+            }
+        }
+        for line in lines {
             write_result(ctx.renderer, crate::ui::events::sanitize_output(&line));
         }
         return Ok(());
@@ -633,12 +700,130 @@ async fn handle_permissions(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::R
         None => write_error(
             ctx.renderer,
             format!(
-                "unknown permissions argument: {} (use yolo, auto, manual, rules, or forget)",
+                "unknown permissions argument: {} (use yolo, auto, manual, rules, forget, session, or revoke)",
                 parts[1]
             ),
         ),
     }
     Ok(())
+}
+
+/// Plain-words scope of one session grant entry.
+pub(crate) fn session_grant_scope(entry: &crate::session::PermissionAllowEntry) -> String {
+    let (tool, pattern) = (entry.tool.as_str(), entry.pattern.as_str());
+    match tool {
+        crate::permission::checker::SESSION_SHELL_PREFIX_TOOL => {
+            format!("shell commands starting with \"{pattern}\"")
+        }
+        "shell" | "bash" => format!(
+            "shell: {}",
+            crate::permission::pattern::describe_allow_pattern(pattern)
+        ),
+        _ => crate::ui::permission_handler::grant_scope(tool, "", pattern),
+    }
+}
+
+/// Numbered `/permissions session` listing.
+pub(crate) fn session_grant_lines(entries: &[crate::session::PermissionAllowEntry]) -> Vec<String> {
+    if entries.is_empty() {
+        return vec![
+            "  no grants in this session (they are made with (a), (x), (f), (w) at prompts)".into(),
+        ];
+    }
+    let mut lines = vec!["  grants active in this session (restored on --resume):".to_string()];
+    lines.extend(entries.iter().enumerate().map(|(index, entry)| {
+        format!(
+            "  {}. {}",
+            index + 1,
+            session_grant_scope(entry).replace(['\r', '\n'], " ")
+        )
+    }));
+    lines.push("  remove with /permissions revoke <n|all>".into());
+    lines
+}
+
+/// Remove entry `which` (1-based, or every entry with `all`) from `entries`.
+pub(crate) fn take_session_grants(
+    entries: &mut Vec<crate::session::PermissionAllowEntry>,
+    which: Option<&str>,
+) -> Result<Vec<crate::session::PermissionAllowEntry>, String> {
+    match which {
+        Some("all") => Ok(std::mem::take(entries)),
+        Some(number) => match number.parse::<usize>() {
+            Ok(index) if (1..=entries.len()).contains(&index) => {
+                Ok(vec![entries.remove(index - 1)])
+            }
+            _ => Err(format!(
+                "no session grant #{number}; see /permissions session"
+            )),
+        },
+        None => Err("usage: /permissions revoke <n|all>".into()),
+    }
+}
+
+/// Entries as the checker's `(tool, pattern)` pairs.
+fn grant_pairs(entries: &[crate::session::PermissionAllowEntry]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .map(|entry| (entry.tool.to_string(), entry.pattern.to_string()))
+        .collect()
+}
+
+/// `/permissions revoke <n|all>`: drop session grants, rebuild the checker's
+/// lists from what is left and save the session.
+fn revoke_session_grants(ctx: &mut SlashCtx<'_>, which: Option<&str>) -> anyhow::Result<()> {
+    let Some(permission) = ctx.permission else {
+        write_error(ctx.renderer, PERMISSION_SYSTEM_DISABLED);
+        return Ok(());
+    };
+    let removed = match take_session_grants(&mut ctx.session.permission_allowlist, which) {
+        Ok(removed) => removed,
+        Err(message) => {
+            write_error(ctx.renderer, message);
+            return Ok(());
+        }
+    };
+    permission
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .replace_session_allowlist(&grant_pairs(&ctx.session.permission_allowlist));
+    if !*ctx.is_running && !ctx.cli.no_session {
+        let renderer = &mut *ctx.renderer;
+        if let Err(error) =
+            crate::session::storage::save_session_recovering(ctx.session, |notice| {
+                write_error(renderer, format!("warning: {notice}"));
+            })
+        {
+            write_error(ctx.renderer, format!("failed to save session: {error}"));
+        }
+    }
+    write_ok(
+        ctx.renderer,
+        format!("revoked {} session grant(s)", removed.len()),
+    );
+    Ok(())
+}
+
+/// Drop forgotten project approvals from the running checker, from the
+/// session's own grant copies and from the allowlist proxy's stored hosts.
+fn apply_forgotten_approvals(ctx: &mut SlashCtx<'_>, removed: &[(String, String)]) {
+    ctx.session
+        .permission_allowlist
+        .retain(|entry| !removed.contains(&(entry.tool.to_string(), entry.pattern.to_string())));
+    if let Some(permission) = ctx.permission {
+        permission
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .forget_project_allowlist(removed, &grant_pairs(&ctx.session.permission_allowlist));
+    }
+    let mut hosts = ctx.sandbox.project_network_hosts();
+    hosts.retain(|host| {
+        !removed.contains(&(
+            crate::permission::project_approvals::NETWORK_TOOL.to_string(),
+            host.clone(),
+        ))
+    });
+    ctx.sandbox.set_project_network_hosts(hosts);
 }
 
 /// `/permissions rules` lists this project's persisted `(p)` approvals;
@@ -683,13 +868,13 @@ pub(crate) fn project_approval_lines(
             };
             match project_approvals::remove(state_dir, root, index) {
                 Ok(removed) => vec![format!(
-                    "  removed {} project approval(s); takes effect at the next interactive start",
+                    "  removed {} project approval(s) from this project and the running session (a network host approved in the proxy stays until restart)",
                     removed.len()
                 )],
                 Err(error) => vec![format!("  error: {error}")],
             }
         }
-        _ => vec!["  usage: /permissions rules | /permissions forget <n|all>".into()],
+        _ => vec!["  usage: /permissions rules | forget <n|all> | session | revoke <n|all>".into()],
     }
 }
 
@@ -1588,6 +1773,70 @@ mod i7aog4_tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod nvnkx67_tests {
+    use crate::session::PermissionAllowEntry;
+
+    fn entry(tool: &str, pattern: &str) -> PermissionAllowEntry {
+        PermissionAllowEntry {
+            tool: tool.into(),
+            pattern: pattern.into(),
+        }
+    }
+
+    #[test]
+    fn session_grants_are_listed_with_scope_and_revoked_by_number() {
+        let mut entries = vec![entry("shell_prefix", "git push"), entry("edit", "src/**")];
+        let lines = super::session_grant_lines(&entries);
+        assert!(
+            lines[1].starts_with("  1. shell commands starting with \"git push\""),
+            "{lines:?}"
+        );
+        assert!(lines[2].starts_with("  2. "), "{lines:?}");
+        assert!(super::take_session_grants(&mut entries, Some("9")).is_err());
+        assert!(super::take_session_grants(&mut entries, None).is_err());
+        let removed = super::take_session_grants(&mut entries, Some("1")).unwrap();
+        assert_eq!(removed[0].pattern.as_str(), "git push");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            super::take_session_grants(&mut entries, Some("all"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(super::session_grant_lines(&entries)[0].contains("no grants"));
+    }
+
+    #[test]
+    fn a_revoked_prefix_asks_again_and_the_saved_entries_lose_it() {
+        use crate::permission::SecurityMode;
+        use crate::permission::checker::CheckResult;
+        let mut checker = crate::permission::checker::PermissionChecker::new(
+            &crate::permission::PermissionConfigs::default(),
+            SecurityMode::Standard,
+            None,
+            None,
+        )
+        .unwrap();
+        let added = checker.add_session_shell_prefix("git push");
+        let mut entries: Vec<PermissionAllowEntry> = added
+            .into_iter()
+            .map(|(tool, pattern)| entry(&tool, &pattern))
+            .collect();
+        assert_eq!(
+            checker.check("shell", "git push origin x"),
+            CheckResult::Allowed
+        );
+        super::take_session_grants(&mut entries, Some("1")).unwrap();
+        checker.replace_session_allowlist(&super::grant_pairs(&entries));
+        assert_eq!(
+            checker.check("shell", "git push origin x"),
+            CheckResult::Ask
+        );
+        assert!(entries.is_empty());
     }
 }
 
