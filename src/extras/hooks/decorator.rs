@@ -84,7 +84,6 @@ impl HookedTool {
         // A PreToolUse hook may rewrite the arguments the inner tool
         // actually runs with. Multiple rewrites are folded upstream in
         // declared order; this applies the folded result.
-        let original_args = pre.updated_input.is_some().then(|| args.clone());
         let call_args = match &pre.updated_input {
             Some(rewritten) => serde_json::to_string(rewritten).unwrap_or(args),
             None => args,
@@ -94,24 +93,18 @@ impl HookedTool {
         // the arguments the model originally proposed.
         let input_rewritten = pre.updated_input.is_some();
         if input_rewritten && !matches!(pre.verdict, Verdict::Deny) {
-            if crate::agent::tools::concurrency::rewrite_needs_stronger_lane(
-                &tool_name,
-                original_args.as_deref().unwrap_or_default(),
-                &call_args,
-            ) {
-                return Err(ToolError::ToolCallError(Box::new(LocalToolError::Msg(
-                    "A PreToolUse hook rewrote this call into one that needs exclusive access, but it was admitted as a shared read. It was not executed; send the call again.".to_string(),
-                ))));
-            }
+            // The call was admitted on the lane its original arguments need;
+            // take the lane the effective ones need before anything runs.
+            crate::agent::tools::concurrency::readmit_for_effective_args(&call_args).await;
             // Show and fingerprint what will actually run, not what the model
             // proposed.
             if let Some(id) = crate::agent::tools::bash::current_any_call_id() {
                 crate::agent::runner::record_effective_args(&id, &call_args);
                 if let Some(events) = crate::agent::tools::mutation_diff::scoped_event_sender() {
-                    let shown: String = call_args.chars().take(200).collect();
-                    let _ = events.try_send(crate::event::AgentEvent::ToolProgress {
+                    let _ = events.try_send(crate::event::AgentEvent::ToolInputRewritten {
                         id,
-                        text: format!("input rewritten by a PreToolUse hook: {shown}").into(),
+                        name: tool_name.as_str().into(),
+                        args: serde_json::from_str(&call_args).unwrap_or(serde_json::Value::Null),
                     });
                 }
             }

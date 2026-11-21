@@ -131,6 +131,16 @@ pub enum AgentEvent {
         name: CompactString,
         bytes: usize,
     },
+    /// A `PreToolUse` hook rewrote the call's input before it ran. `args` is
+    /// what actually executes; the `ToolCall` (and the transcript) keep what the
+    /// model proposed. Display only, so a client can show the effective call
+    /// in the call's row (mini-agent-sskdu.263).
+    #[cfg_attr(not(feature = "hooks"), allow(dead_code))]
+    ToolInputRewritten {
+        id: CompactString,
+        name: CompactString,
+        args: serde_json::Value,
+    },
     ToolResult {
         id: CompactString,
         name: CompactString,
