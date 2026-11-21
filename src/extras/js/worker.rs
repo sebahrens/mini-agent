@@ -3606,23 +3606,12 @@ fn record_console(
         return;
     }
     let maximum = available.min(MAX_CONSOLE_RECORD_BYTES);
-    let bounded = truncate_utf8(&text, maximum);
+    let bounded = crate::byte_text::clip_to_bytes(&text, maximum).0.to_owned();
     records.push(ConsoleRecord {
         level,
         truncated: already_truncated || bounded.len() < text.len(),
         text: bounded,
     });
-}
-
-fn truncate_utf8(value: &str, maximum: usize) -> String {
-    if value.len() <= maximum {
-        return value.to_owned();
-    }
-    let mut end = maximum;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
 }
 
 fn evaluate(

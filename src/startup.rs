@@ -569,6 +569,26 @@ pub(crate) fn verify_resume_provider_safety() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Error for a `--load-prompt NAME` that matches no prompt, listing the
+/// available names once (the message is the only output; callers must not
+/// print the list separately).
+fn unknown_prompt_check<'a>(
+    name: &str,
+    available: impl Iterator<Item = &'a String>,
+) -> anyhow::Result<()> {
+    let mut names: Vec<&String> = available.collect();
+    if names.iter().any(|candidate| candidate.as_str() == name) {
+        return Ok(());
+    }
+    names.sort();
+    let list = names
+        .iter()
+        .map(|candidate| format!("  {candidate}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    anyhow::bail!("unknown prompt '{name}'\navailable prompts:\n{list}")
+}
+
 /// Whether an explicit `--model`/`--provider`/`--quick-model` (or its
 /// environment form) pins the startup model. A pinned model is never replaced
 /// by the `[prompt_to_model]` mapping of the startup persona.
@@ -2500,6 +2520,12 @@ impl Startup {
             }
         }
 
+        // Reject an unknown `--load-prompt` before the SessionStart hook, the
+        // MCP prompts or any other effect of this phase.
+        if let Some(name) = &self.cli.load_prompt {
+            unknown_prompt_check(name, self.context.prompts.keys())?;
+        }
+
         // Recommended MCP prompts on first startup
         #[cfg(feature = "mcp")]
         if recommended_mcp_prompt_due(
@@ -2617,28 +2643,20 @@ impl Startup {
             }
         }
 
-        // --load-prompt overrides the default prompt
-        if let Some(ref name) = self.cli.load_prompt {
-            if self.context.activate_main_prompt(name).is_some() {
-                if !self.session_resumed && !cli_pins_startup_model(&self.cli) {
-                    apply_startup_prompt_model(
-                        name,
-                        &self.cfg,
-                        &mut self.provider,
-                        &mut self.model,
-                        &mut self.session,
-                    );
-                }
-            } else {
-                let mut sorted: Vec<&String> = self.context.prompts.keys().collect();
-                sorted.sort();
-                eprintln!("error: unknown prompt '{}'", name);
-                eprintln!("available prompts:");
-                for p in &sorted {
-                    eprintln!("  {}", p);
-                }
-                anyhow::bail!("unknown prompt '{}'", name);
-            }
+        // --load-prompt overrides the default prompt (validated earlier, before
+        // any hook or session effect, by `unknown_prompt_check`).
+        if let Some(ref name) = self.cli.load_prompt
+            && self.context.activate_main_prompt(name).is_some()
+            && !self.session_resumed
+            && !cli_pins_startup_model(&self.cli)
+        {
+            apply_startup_prompt_model(
+                name,
+                &self.cfg,
+                &mut self.provider,
+                &mut self.model,
+                &mut self.session,
+            );
         }
 
         // Rebuild client if the provider changed due to prompt-to-model mapping
@@ -2872,6 +2890,33 @@ impl Startup {
         failure.map_or(Ok(()), Err)
     }
 
+    /// Join the `SessionStart` hook task (a no-op without hooks or when none
+    /// was spawned) and hand its context to the session, or to the native
+    /// startup owner when one is in charge of the first model call.
+    async fn join_session_start_hook(&mut self) -> anyhow::Result<()> {
+        #[cfg(feature = "hooks")]
+        if let Some(task) = self.session_start_task.take() {
+            match task.await {
+                Ok(context) => {
+                    if self.native_startup.is_some() {
+                        self.pending_session_start_context = Some(context);
+                    } else {
+                        crate::extras::hooks::append_context_session(
+                            &mut self.session,
+                            &context.into_notices(),
+                        );
+                    }
+                }
+                Err(error) => {
+                    if let Some(owner) = &self.native_startup {
+                        owner.hook_retired(Err(error))?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     async fn dispatch_inner(mut self: Box<Self>) -> anyhow::Result<()> {
         session::storage::report_pending_save_notices(&mut self.session, |notice| {
             eprintln!("warning: {notice}")
@@ -2900,26 +2945,7 @@ impl Startup {
             None
         };
         if self.cli.print {
-            #[cfg(feature = "hooks")]
-            if let Some(task) = self.session_start_task.take() {
-                match task.await {
-                    Ok(context) => {
-                        if self.native_startup.is_some() {
-                            self.pending_session_start_context = Some(context);
-                        } else {
-                            crate::extras::hooks::append_context_session(
-                                &mut self.session,
-                                &context.into_notices(),
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        if let Some(owner) = &self.native_startup {
-                            owner.hook_retired(Err(error))?;
-                        }
-                    }
-                }
-            }
+            self.join_session_start_hook().await?;
             self.join_native_startup().await?;
             let result = if self.cli.input_format() == crate::cli::InputFormat::StreamJson {
                 heap_future(|| self.dispatch_print_stream_input()).await
@@ -2940,26 +2966,7 @@ impl Startup {
         } else {
             #[cfg(feature = "loop")]
             if self.cli.loop_mode {
-                #[cfg(feature = "hooks")]
-                if let Some(task) = self.session_start_task.take() {
-                    match task.await {
-                        Ok(context) => {
-                            if self.native_startup.is_some() {
-                                self.pending_session_start_context = Some(context);
-                            } else {
-                                crate::extras::hooks::append_context_session(
-                                    &mut self.session,
-                                    &context.into_notices(),
-                                );
-                            }
-                        }
-                        Err(error) => {
-                            if let Some(owner) = &self.native_startup {
-                                owner.hook_retired(Err(error))?;
-                            }
-                        }
-                    }
-                }
+                self.join_session_start_hook().await?;
                 self.join_native_startup().await?;
                 return heap_future(|| self.dispatch_loop()).await;
             }
@@ -3751,7 +3758,7 @@ impl Startup {
                         );
                     }
                     if interrupted {
-                        failure = Some(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED));
+                        failure = Some(crate::agent::runner::HeadlessInterrupted.into());
                     }
                     let saved = if let Some(owner) = &mut self.native_headless {
                         let result = owner.progress(session).await;
@@ -5159,7 +5166,7 @@ async fn run_headless_goal_rounds_inner(
                 &goal,
                 &round_interactions,
                 &driver::RoundCost {
-                    usage: turn.usage,
+                    usage: crate::extras::goal::driver::with_child_usage(&session.id, turn.usage),
                     active: round_elapsed,
                 },
                 turn.failure.as_ref(),
@@ -5209,7 +5216,6 @@ async fn run_headless_goal_rounds_inner(
             let transcript =
                 crate::extras::goal::judge::transcript_for_round(session, &turn.interactions);
             let client_for_judge = client.clone();
-            let cfg_for_judge = cfg.clone();
             // An interrupt during verification ends the goal rather than
             // feeding a cancelled command back to the agent as a failure it
             // should fix. The flag survives the closure so the loop can stop.
@@ -5232,133 +5238,38 @@ async fn run_headless_goal_rounds_inner(
             let outcome =
                 driver::settle_round(&session.goal_store, summary, move |request| async move {
                     // An operator who interrupts must not wait for a check;
-                    // a check can run as long as a test suite does. One
-                    // interrupt covers every tier, so a signal landing between
-                    // the checks and the judge is not lost.
-                    let interrupt = crate::print::headless_interrupt();
-                    tokio::pin!(interrupt);
-                    let (checks, interrupted) = crate::spend::run::scope(
-                        Some(spend.clone()),
-                        crate::extras::goal::checks::run_with_interrupt(
-                            &goal_for_checks,
-                            &request,
-                            &sandbox_for_checks,
-                            &cfg_for_checks,
-                            interrupt.as_mut(),
-                        ),
+                    // one interrupt covers every tier.
+                    let tiers = driver::run_tiers(
+                        driver::TierContext {
+                            goal: &goal_for_checks,
+                            request: &request,
+                            sandbox: &sandbox_for_checks,
+                            cfg: &cfg_for_checks,
+                            judge,
+                            transcript: &transcript,
+                            spend: Some(spend),
+                            prices: Some((session_prices, session_cache_prices)),
+                        },
+                        |_| Ok(client_for_judge.clone()),
+                        crate::print::headless_interrupt(),
                     )
                     .await;
-                    if interrupted {
+                    *judge_charge_out
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = tiers.judge_charge;
+                    if tiers.verification.interrupted {
                         interrupt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                        // Say what was stopped. The diagnostic used to reach
-                        // the operator only because the cancelled check was
-                        // fed back to the agent as a failure, which is exactly
-                        // what must not happen: nothing was proved either way,
-                        // so the round settles as interrupted and the reason
-                        // is reported here instead.
-                        if let Some(tail) = checks.as_ref().and_then(|o| o.failure_tail.as_deref())
-                        {
+                        // Say what was stopped. The cancelled check is not fed
+                        // back to the agent as a failure (nothing was proved
+                        // either way), so the reason is reported here instead.
+                        if let Some(tail) = tiers.interrupted_check_tail {
                             check_notices
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                                 .push(format!("{tail}\n"));
                         }
-                        return driver::Verification {
-                            interrupted: true,
-                            checks,
-                            ..driver::Verification::default()
-                        };
                     }
-                    // A failing check already decides the claim, and the
-                    // gate returns before it looks at the judge. Asking
-                    // anyway would spend a model call on an answer nobody
-                    // reads, and a transport failure there would count
-                    // against the judge's own failure ladder.
-                    let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
-                    let judged = match judge {
-                        Some(resolved) if request.run_judge && !checks_rejected => {
-                            // A judge call can wait on its provider for as long
-                            // as the retry policy allows. An interrupt drops it:
-                            // a verdict arriving after the operator stopped the
-                            // run must not decide the goal.
-                            let observed = crate::spend::run::UsageObserver::with_run(
-                                spend.for_judge(
-                                    &resolved,
-                                    &cfg_for_judge,
-                                    resolved
-                                        .same_provider_as_session
-                                        .then(|| {
-                                            client_for_judge.listing_key(&resolved.provider).ok()
-                                        })
-                                        .flatten()
-                                        .as_ref(),
-                                ),
-                            );
-                            let verdict = driver::unless_interrupted(
-                                crate::extras::goal::judge::ask_with_transcript_observed(
-                                    &goal_for_checks,
-                                    &request,
-                                    &resolved,
-                                    &client_for_judge,
-                                    &transcript,
-                                    &cfg_for_judge,
-                                    checks.as_ref(),
-                                    observed.clone(),
-                                ),
-                                interrupt.as_mut(),
-                            )
-                            .await;
-                            let Some(verdict) = verdict else {
-                                let cancelled_call =
-                                    crate::extras::goal::judge::JudgeCall::interrupted_with_usage(
-                                        &cfg_for_judge,
-                                        &resolved.provider,
-                                        &observed,
-                                    );
-                                *judge_charge_out
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    cancelled_call.charge(
-                                        &resolved,
-                                        &cfg_for_judge,
-                                        crate::extras::goal::judge::judge_prices_with_cache_prices(
-                                            &resolved,
-                                            &cfg_for_judge,
-                                            session_prices,
-                                            session_cache_prices,
-                                        ),
-                                        session_cache_prices,
-                                    );
-                                interrupt_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                                return driver::Verification {
-                                    interrupted: true,
-                                    ..driver::Verification::default()
-                                };
-                            };
-                            *judge_charge_out
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) = verdict
-                                .charge(
-                                    &resolved,
-                                    &cfg_for_judge,
-                                    crate::extras::goal::judge::judge_prices_with_cache_prices(
-                                        &resolved,
-                                        &cfg_for_judge,
-                                        session_prices,
-                                        session_cache_prices,
-                                    ),
-                                    session_cache_prices,
-                                );
-                            Some(verdict)
-                        }
-                        _ => None,
-                    };
-                    driver::Verification {
-                        checks,
-                        judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
-                        judge: judged.map(|call| call.outcome),
-                        ..driver::Verification::default()
-                    }
+                    tiers.verification
                 })
                 .await;
 
@@ -5779,8 +5690,8 @@ async fn relieve_headless_turn(
             relief_usage,
         };
         if crate::print::headless_force_stopped() {
-            let failure = failure
-                .or_else(|| Some(anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED)));
+            let failure =
+                failure.or_else(|| Some(crate::agent::runner::HeadlessInterrupted.into()));
             return surfaced(
                 failure,
                 prompt,
@@ -6056,6 +5967,19 @@ mod tests {
         assert_eq!(
             startup_prompt_provider(&missing, &cfg, false, &prompts),
             None
+        );
+    }
+
+    #[test]
+    fn unknown_load_prompt_error_lists_prompts_once() {
+        let known = ["plan".to_owned(), "build".to_owned()];
+        assert!(super::unknown_prompt_check("plan", known.iter()).is_ok());
+        let error = super::unknown_prompt_check("nope", known.iter())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "unknown prompt 'nope'\navailable prompts:\n  build\n  plan"
         );
     }
 

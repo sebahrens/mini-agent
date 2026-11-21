@@ -273,14 +273,7 @@ fn truncate_result(result: &mut Result<String, String>) {
 }
 
 fn truncate_utf8(value: &mut String, max_bytes: usize) {
-    if value.len() <= max_bytes {
-        return;
-    }
-    let mut boundary = max_bytes;
-    while !value.is_char_boundary(boundary) {
-        boundary -= 1;
-    }
-    value.truncate(boundary);
+    crate::byte_text::truncate_to_bytes(value, max_bytes);
 }
 
 /// Mutable state for fake host operations during one verification.

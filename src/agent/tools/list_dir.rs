@@ -7,21 +7,6 @@ use crate::agent::tools::{
     AskSender, ListDirArgs, PermCheck, ToolError, check_perm_bound_path, check_perm_path,
 };
 
-pub(crate) fn format_size(bytes: u64) -> String {
-    const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
-    let mut size = bytes as f64;
-    let mut unit_idx = 0;
-    while size >= 1024.0 && unit_idx < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit_idx += 1;
-    }
-    if unit_idx == 0 {
-        format!("{} {}", bytes, UNITS[unit_idx])
-    } else {
-        format!("{:.1} {}", size, UNITS[unit_idx])
-    }
-}
-
 const NOT_A_DIRECTORY_HINT: &str =
     "Use read to view the file, or pass its parent directory as path.";
 
@@ -78,7 +63,7 @@ fn collect_level(
             "file".to_string()
         };
         let size = if !entry.is_directory && !entry.is_link {
-            format_size(entry.size)
+            crate::byte_text::format_bytes(entry.size)
         } else {
             String::new()
         };

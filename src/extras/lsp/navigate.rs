@@ -690,14 +690,8 @@ fn position_of(range: Option<&Value>) -> (u32, u32) {
 }
 
 fn truncate(value: &str, max: usize) -> (String, bool) {
-    if value.len() <= max {
-        return (value.to_string(), false);
-    }
-    let mut end = max;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    (value[..end].to_string(), true)
+    let (kept, cut) = crate::byte_text::clip_to_bytes(value, max);
+    (kept.to_string(), cut)
 }
 
 fn clean_name(value: &str) -> String {

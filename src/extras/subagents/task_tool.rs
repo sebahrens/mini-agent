@@ -1672,52 +1672,13 @@ editing in a known location, grepping for a literal you will act on immediately.
         if args.run_in_background {
             limits = limits.for_background(&config)?;
         }
-        let mut prompts = prepare_task_prompts(&args, limits)?;
-
-        // `resume` continues one stored child conversation as the same
-        // agent type; the call is otherwise an ordinary, re-authorized task.
-        let resume_store = self.resume_store();
-        let resumed = match args.options.resume.as_deref() {
-            None => None,
-            Some(id) => {
-                if prompts.len() != 1 {
-                    return Err(ToolError::Msg(
-                        "task: resume continues one child; send exactly one prompt with the follow-up message".into(),
-                    ));
-                }
-                let stored = resume_store.get(id).ok_or_else(|| {
-                    ToolError::Msg(format!(
-                        "task: unknown or expired resume id '{id}'; child conversations are kept in memory for the most recent children of this session ([subagents] task_resume_max_children, default {}), only when under [subagents] task_resume_max_bytes (default 8 MiB), and a session's ids are restored by --continue/--resume subject to those limits but not by a fresh session; start a new task instead",
-                        super::resume::MAX_RESUMABLE_CHILDREN
-                    ))
-                })?;
-                if args.agent_type.is_some() && args.agent_type != stored.agent_type {
-                    return Err(ToolError::Msg(format!(
-                        "task: resume id '{id}' belongs to agent_type {}; omit agent_type or pass the same one",
-                        stored.agent_type.as_deref().unwrap_or("(default explorer)")
-                    )));
-                }
-                Some(stored)
-            }
-        };
-        let agent_type = match &resumed {
-            Some(stored) => stored.agent_type.clone(),
-            None => args.agent_type.clone(),
-        };
-        let permission_source = agent_type.as_deref().map(|agent_type| {
-            crate::context::agents::source_hint_for_workspace(agent_type, self.workspace.as_deref())
-        });
-        // Argument-only mistakes are reported before any permission prompt, so
-        // a corrected retry does not ask the user to approve the same
-        // delegation twice.
-        validate_call_options(&args.options, &config)?;
-        if args.run_in_background
-            && let Some(pool) =
-                crate::spend::run::Run::current().and_then(|run| run.background_pool())
-        {
-            pool.check_capacity()
-                .map_err(|error| ToolError::Msg(error.to_string()))?;
-        }
+        let CallPlan {
+            mut prompts,
+            resumed,
+            agent_type,
+            permission_source,
+            resume_store,
+        } = self.validate_call_args(&args, &config, limits)?;
         let delegation_input = permission_input(
             &prompts,
             agent_type.as_deref(),
@@ -2097,657 +2058,56 @@ editing in a known location, grepping for a literal you will act on immediately.
         let shared_mcp = SharedPersonaMcp::default();
         #[cfg(feature = "mcp")]
         let executor_mcp = shared_mcp.clone();
-        let executor: TaskExecutor = Arc::new(move |index, prompt_text| {
-            #[cfg(feature = "mcp")]
-            let shared_mcp = executor_mcp.clone();
-            let details_sink = executor_sink.clone();
-            let resume_history = resume_history.clone();
-            let resume_store = resume_store.clone();
-            let resume_agent_type = resume_agent_type.clone();
-            let report_policy = report_policy;
-            #[cfg(feature = "git-worktree")]
-            let shell_parent = shell_parent.clone();
-            let task_budget = executor_budget.clone();
-            let repair_budget = LiveTaskBudget::new(repair_max_cost_units);
-            let child_budget = LiveTaskBudget::new(u64::MAX);
-            let admission = |repair: bool| {
-                let check_task = task_budget.clone();
-                let check_repair = repair_budget.clone();
-                let charge_task = task_budget.clone();
-                let charge_repair = repair_budget.clone();
-                let charge_child = child_budget.clone();
-                SubagentAdmission::new(
-                    move || !check_task.exhausted() && (!repair || !check_repair.exhausted()),
-                    move |usage, fallback| {
-                        let units = cost_policy.units(if usage == Usage::default() {
-                            &fallback
-                        } else {
-                            &usage
-                        });
-                        charge_task.charge(units);
-                        charge_child.charge(units);
-                        if repair {
-                            charge_repair.charge(units);
-                        }
-                    },
-                )
-            };
-            let spend_profile = spend_profile
-                .as_ref()
-                .map(crate::spend::run::Run::for_invocation);
-            let admission_run = spend_profile.clone();
-            let client = runtime.client.clone();
-            let model_name = runtime.model_name.clone();
-            let max_turns = runtime.max_turns;
-            let mut persona = runtime.execution.clone();
-            persona.evidence = evidence_enabled;
-            persona.free_form = report_policy.free_form;
-            persona.inbox = job_inbox.as_ref().map(|inbox| inbox.child(index));
-            let inbox_guard = persona
-                .inbox
-                .as_ref()
-                .map(super::inbox::ChildInbox::running_guard);
-            persona.inline_images = inline_cap;
-            let inline_budget = inline_budget.clone();
-            let inline_sink = executor_inline_sink.clone();
-            let inline_permission = inline_permission.clone();
-            let event_tx = subagent_event_tx.clone();
-            #[cfg(feature = "archmd")]
-            let architecture = architecture.clone();
-            let config = config.clone();
-            let suffix = suffix.clone();
-            let authorization = authorization.clone();
-            let lane_workspace = lane_workspace.clone();
-            let isolation = isolation.clone();
-            #[cfg(feature = "mcp")]
-            let isolated_child = isolation.is_some();
-            #[cfg(feature = "skills")]
-            let skill_services = skill_services
-                .as_ref()
-                .map(|services| services.fork_for_read_only_child());
-            let specialization = specialization.clone();
-            let child_name = child_name.clone();
-            let evidence_pool = pool_weak.clone();
-            #[cfg(feature = "hooks")]
-            let hook_agent_type = hook_agent_type.clone();
-            #[cfg(feature = "hooks")]
-            let hook_agent_source = hook_agent_source.clone();
-            let initial_usage = SharedUsageLedger::default().with_admission(admission(false));
-            let retry_usage = SharedUsageLedger::default().with_admission(admission(false));
-            let relief_usage = SharedUsageLedger::default().with_admission(admission(false));
-            let repair_usage = SharedUsageLedger::default().with_admission(admission(true));
-            let writeup_usage = SharedUsageLedger::default().with_admission(admission(true));
-            let cancellation_units = child_budget.clone();
-            let cancellation_initial_usage = initial_usage.clone();
-            let cancellation_retry_usage = retry_usage.clone();
-            let cancellation_relief_usage = relief_usage.clone();
-            let cancellation_repair_usage = repair_usage.clone();
-            let cancellation_writeup_usage = writeup_usage.clone();
-            // Foreground children report their usage to the parent's event
-            // stream so goal token bounds and the `tokens:` line count them.
-            let report_tx = subagent_event_tx.clone();
-            let report_ledgers = [
-                initial_usage.clone(),
-                retry_usage.clone(),
-                relief_usage.clone(),
-                repair_usage.clone(),
-                writeup_usage.clone(),
-            ];
-            let cancellation_cost = Arc::new(move || {
-                // Streaming usage may be known before ModelTurnFinished. Keep
-                // it when cancellation retires an in-flight request, without
-                // charging completed turns twice or losing no-usage estimates.
-                let observed = usage_saturating_add(
-                    usage_saturating_add(
-                        usage_saturating_add(
-                            usage_saturating_add(
-                                cancellation_initial_usage.total(),
-                                cancellation_retry_usage.total(),
-                            ),
-                            cancellation_relief_usage.total(),
-                        ),
-                        cancellation_repair_usage.total(),
-                    ),
-                    cancellation_writeup_usage.total(),
-                );
-                cancellation_units
-                    .used
-                    .load(std::sync::atomic::Ordering::Acquire)
-                    .max(cost_policy.units(&observed))
-            });
-            let future = crate::startup::heap_future(|| async move {
-                // Held for the child's whole run: dropping it ends delivery.
-                let _inbox_guard = inbox_guard;
-                if let Some(spend) = &spend_profile
-                    && let Err(error) = spend.admit()
-                {
-                    return ChildExecution {
-                        output: Err(error.to_string()),
-                        cost_units: 0,
-                        host_suffix: None,
-                    };
-                }
-                #[cfg(feature = "hooks")]
-                let execution_prompt = match crate::extras::hooks::dispatch_subagent_start(
-                    &hook_agent_type,
-                    &hook_agent_source,
-                )
-                .await
-                {
-                    // Labelled, capped hook text goes after the brief so the
-                    // child cannot mistake it for the delegated objective.
-                    Some(extra) => format!("{prompt_text}\n\n{extra}"),
-                    None => prompt_text,
-                };
-                #[cfg(not(feature = "hooks"))]
-                let execution_prompt = prompt_text;
-
-                // Isolated child: its own worktree and an authorization bound
-                // to it alone. The guard removes the worktree if this future
-                // is dropped before `finish`.
-                let (isolated_worktree, authorization) = match &isolation {
-                    Some(plan) => match super::isolation::prepare(plan, &authorization).await {
-                        Ok((worktree, authorization)) => (Some(worktree), authorization),
-                        Err(error) => {
-                            return ChildExecution {
-                                output: Err(format!("worktree isolation unavailable: {error}")),
-                                cost_units: 0,
-                                host_suffix: None,
-                            };
-                        }
-                    },
-                    None => (None, authorization),
-                };
-                // Opt-in read-only shell: bind it to a private scratch
-                // directory (kept until this child ends) or drop it.
-                #[cfg(feature = "git-worktree")]
-                let (_scratch, authorization, execution_prompt) = match (
-                    authorization.read_only_shell_planned(),
-                    &shell_parent,
-                ) {
-                    (true, Some(parent)) => {
-                        let root = authorization
-                            .workspace()
-                            .map(|workspace| workspace.root().to_path_buf());
-                        match root
-                            .ok_or_else(|| "no captured workspace".to_string())
-                            .and_then(|root| {
-                                super::read_only_shell::prepare(parent, &root)
-                                    .map(|prepared| (prepared, root))
-                            }) {
-                            Ok(((scratch, shell), root)) => {
-                                let note =
-                                    super::read_only_shell::prompt_note(scratch.path(), &root);
-                                (
-                                    Some(scratch),
-                                    authorization.with_read_only_shell(Some(shell)),
-                                    format!("{note}\n\n{execution_prompt}"),
-                                )
-                            }
-                            Err(error) => (
-                                None,
-                                authorization.with_read_only_shell(None),
-                                format!(
-                                    "[host note: no shell tool: the read-only shell is unavailable ({error})]\n\n{execution_prompt}"
-                                ),
-                            ),
-                        }
-                    }
-                    (true, None) => (
-                        None,
-                        authorization.with_read_only_shell(None),
-                        execution_prompt,
-                    ),
-                    (false, _) => (None, authorization, execution_prompt),
-                };
-                let model = client.completion_model_with_cache_ttl(
-                    model_name,
-                    config.cache_ttl.unwrap_or_default(),
-                );
-                // Persona-scoped MCP: connect only the servers and exact tools
-                // the trusted persona names, with an independent permission
-                // checker; outer-agent MCP connections are never inherited.
-                #[cfg(feature = "mcp")]
-                let (mcp_manager, mcp_shared, mcp_tools, mcp_granted) = if isolated_child {
-                    // An isolated child's workspace differs: it owns its
-                    // connection.
-                    match builder::build_persona_mcp(&persona, &config, &authorization).await {
-                        Ok((manager, tools, granted)) => (manager, None, tools, granted),
-                        Err(error) => {
-                            return ChildExecution {
-                                output: Err(error),
-                                cost_units: 0,
-                                host_suffix: None,
-                            };
-                        }
-                    }
-                } else {
-                    // One connection per `task` call, shared by its children;
-                    // each child still derives its own tools and an
-                    // independent permission checker.
-                    match shared_mcp
-                        .tools_for(&persona, &config, &authorization)
-                        .await
-                    {
-                        Ok((shared, tools, granted)) => (None, shared, tools, granted),
-                        Err(error) => {
-                            return ChildExecution {
-                                output: Err(error),
-                                cost_units: 0,
-                                host_suffix: None,
-                            };
-                        }
-                    }
-                };
-                // Evidence is re-judged by the parent later: anchor relative
-                // paths at THIS child's directory (a worktree when isolated)
-                // and remember which MCP tools it could call.
-                let evidence_base_dir = authorization
-                    .workspace()
-                    .map(|workspace| workspace.root().to_path_buf());
-                #[cfg(feature = "hooks")]
-                let child_hook_bindings = crate::agent::runner::HookBindings {
-                    context: crate::agent::runner::current_hook_session_context(),
-                    permission: Some(authorization.hook_permission()),
-                    #[cfg(feature = "mcp")]
-                    peers: Some(
-                        mcp_manager
-                            .as_ref()
-                            .map(|manager| manager.hook_peers())
-                            .or_else(|| mcp_shared.as_ref().map(|manager| manager.hook_peers()))
-                            .unwrap_or_default(),
-                    ),
-                };
-                #[cfg(not(feature = "mcp"))]
-                let evidence_mcp: Vec<(String, String)> = Vec::new();
-                #[cfg(feature = "mcp")]
-                let evidence_mcp: Vec<(String, String)> = mcp_granted
-                    .iter()
-                    .flat_map(|(server, tools)| {
-                        tools.iter().map(move |tool| (server.clone(), tool.clone()))
-                    })
-                    .collect();
-                let agent = builder::build_explore_agent_with_suffix(
-                    model,
-                    max_turns,
-                    &config,
-                    authorization,
-                    #[cfg(feature = "archmd")]
-                    architecture,
-                    specialization,
-                    suffix.as_deref(),
-                    persona,
-                    #[cfg(feature = "mcp")]
-                    mcp_tools,
-                    #[cfg(feature = "skills")]
-                    skill_services,
-                )
-                .await
-                .with_spend(spend_profile);
-                #[cfg(feature = "hooks")]
-                let agent = agent.with_hook_routing(
-                    child_hook_bindings.permission.clone().flatten(),
-                    #[cfg(feature = "mcp")]
-                    child_hook_bindings.peers.clone().unwrap_or_default(),
-                );
-                #[cfg(feature = "agent-skills")]
-                let agent = if let Some(services) = agent.instruction_services() {
-                    agent.clone().with_instruction_turn(Some(
-                        crate::extras::skills::session::InstructionTurn::new(
-                            Arc::clone(services),
-                            None,
-                        ),
-                    ))
-                } else {
-                    agent
-                };
-                // Live task/repair admission bounds every provider call, so
-                // no separate per-run token reservation is passed.
-                let result = match resume_history {
-                    // A resumed child continues its stored conversation with
-                    // the follow-up prompt as its next user turn.
-                    Some(history) => {
-                        agent
-                            .run_subagent_with_history(
-                                &execution_prompt,
-                                history.as_ref().clone(),
-                                max_turns,
-                                event_tx.as_ref(),
-                                &config.retry,
-                                initial_usage.clone(),
-                                None,
-                            )
-                            .await
-                    }
-                    None => {
-                        agent
-                            .run_subagent(
-                                &execution_prompt,
-                                max_turns,
-                                event_tx.as_ref(),
-                                &config.retry,
-                                initial_usage.clone(),
-                                None,
-                            )
-                            .await
-                    }
-                };
-                // A child whose next request would exceed its window compacts
-                // its own conversation and continues (mini-agent-d0rfu).
-                let relief_agent = agent.clone();
-                let relief_retry = config.retry.clone();
-                let relief_events = event_tx.clone();
-                let relief_ledger = relief_usage.clone();
-                #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
-                let mut run = relieve_child_context(
-                    result,
-                    config.resolve_compact_enabled(),
-                    config.subagent_context_window.unwrap_or(u64::MAX),
-                    &execution_prompt,
-                    max_turns,
-                    || task_budget.exhausted(),
-                    |stage, prompt, history, turns| {
-                        let agent = match stage {
-                            ChildRelief::Summarize => relief_agent
-                                .clone()
-                                .for_subagent_report_repair(repair_max_tokens),
-                            ChildRelief::Continue => relief_agent.clone(),
-                        };
-                        let retry = relief_retry.clone();
-                        let events = relief_events.clone();
-                        let ledger = relief_ledger.clone();
-                        async move {
-                            agent
-                                .run_subagent_with_history(
-                                    &prompt,
-                                    history,
-                                    turns,
-                                    events.as_ref(),
-                                    &retry,
-                                    ledger,
-                                    None,
-                                )
-                                .await
-                        }
-                    },
-                )
-                .await;
-                // Host-minted evidence comes from the child's actual tool
-                // results, in call order; the report contract can only cite it.
-                let mut evidence = super::evidence::ChildEvidence::with_limits(evidence_limits)
-                    .with_child_context(evidence_base_dir, evidence_mcp);
-                #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
-                let mut omitted_images = super::image_cost::omitted_images(&run.history);
-                // Conversations replaced by context compaction come first, so
-                // numbering continues across the compaction.
-                let compacted = std::mem::take(&mut run.compacted_histories);
-                for earlier in &compacted {
-                    omitted_images += super::image_cost::omitted_images(earlier);
-                    if evidence_enabled {
-                        evidence.record_history(earlier);
-                    }
-                }
-                if evidence_enabled {
-                    evidence.record_history(&run.history);
-                }
-                #[cfg(feature = "hooks")]
-                if !task_budget.exhausted()
-                    && let Ok(response) = run.response.as_ref()
-                    && let crate::extras::hooks::SubagentStopGate::Continue { reason } =
-                        child_hook_bindings
-                            .clone()
-                            .run(crate::extras::hooks::dispatch_subagent_stop(
-                                &hook_agent_type,
-                                &hook_agent_source,
-                                false,
-                            ))
-                            .await
-                    && remaining_child_turns(max_turns, run.turns) > 0
-                {
-                    tracing::info!("hooks: SubagentStop forced continuation: {reason}");
-                    let continuation = format!("{response}\n\n{reason}");
-                    let retried = agent
-                        .run_subagent_with_history(
-                            &continuation,
-                            run.history.clone(),
-                            remaining_child_turns(max_turns, run.turns),
-                            event_tx.as_ref(),
-                            &config.retry,
-                            retry_usage.clone(),
-                            None,
-                        )
-                        .await;
-                    let new_history =
-                        &retried.history[run.history.len().min(retried.history.len())..];
-                    if evidence_enabled {
-                        evidence.record_history(new_history);
-                    }
-                    omitted_images += super::image_cost::omitted_images(new_history);
-                    run = merge_forced_continuation_run(run, retried);
-                }
-
-                // The conversation a later `resume` continues (an isolated
-                // child's worktree does not outlive it, so it is not kept).
-                let conversation = if !isolated && run.response.is_ok() {
-                    run.history.clone()
-                } else {
-                    Vec::new()
-                };
-                // Budget write-up and report repair are tool-free continuations
-                // of this child's own conversation (tool results included).
-                let continuation_agent = agent.clone();
-                let continuation_retry = config.retry.clone();
-                let continuation_events = event_tx.clone();
-                let evidence_ids = evidence_enabled.then(|| evidence.len());
-                let finished = finish_child_run_with(
-                    run,
-                    || task_budget.exhausted(),
-                    max_report_bytes,
-                    evidence_ids,
-                    report_policy,
-                    |stage, prompt, history| {
-                        let ledger = match stage {
-                            Continuation::WriteUp => writeup_usage.clone(),
-                            Continuation::Repair => repair_usage.clone(),
-                        };
-                        let repair_agent = continuation_agent
-                            .clone()
-                            .for_subagent_report_repair(repair_max_tokens);
-                        let retry = continuation_retry.clone();
-                        let events = continuation_events.clone();
-                        async move {
-                            repair_agent
-                                .run_subagent_with_history(
-                                    &prompt,
-                                    history,
-                                    REPORT_REPAIR_MAX_TURNS,
-                                    events.as_ref(),
-                                    &retry,
-                                    ledger,
-                                    None,
-                                )
-                                .await
-                        }
-                    },
-                )
-                .await;
-                let mut child_details = finished.details;
-                child_details.index = index;
-                let stored_evidence =
-                    match evidence_pool.as_ref().and_then(std::sync::Weak::upgrade) {
-                        Some(pool) if evidence_enabled => {
-                            let task_id = uuid::Uuid::new_v4().to_string();
-                            let stored = pool
-                                .evidence()
-                                .store(pool.session_id(), task_id, evidence)
-                                .await;
-                            child_details.evidence = Some(super::background::EvidenceSummary {
-                                task_id: stored.task_id.clone(),
-                                records: stored.metas.len(),
-                            });
-                            Some((stored, pool.session_id().to_string()))
-                        }
-                        _ => None,
-                    };
-                details_sink.record(child_details);
-                let violations = finished.response.as_ref().ok().map(|response| {
-                    finished
-                        .known_violations
-                        .unwrap_or_else(|| report_contract_violations_with(response, evidence_ids))
-                });
-                // The report the parent sees was replaced by the host: its raw
-                // text stays withheld, but the host-recorded index is offered.
-                // A formatting-only violation is normalized into the real
-                // report, which is not withheld.
-                let withheld = match (&finished.response, &violations) {
-                    (Ok(response), Some(v)) => report_withheld_by_host(response, v),
-                    _ => false,
-                };
-                let output = finished.response.map(|response| {
-                    enforce_validated_report_contract(
-                        response,
-                        violations.unwrap_or_default(),
-                        max_report_bytes,
-                    )
-                });
-                // Host metadata only (no tool content), rendered by the
-                // scheduler after the child's closing quote fence.
-                // Attachments of an accepted report only: a withheld report's
-                // child prose decides nothing. Each admitted image is charged
-                // to the task's cost units by its patch-formula estimate.
-                let selection = match (&stored_evidence, &output) {
-                    (Some((stored, session_id)), Ok(text)) if inline_cap > 0 && !withheld => {
-                        let lane = super::inline_images::Lane {
-                            cap: inline_cap,
-                            parent: parent_image_support,
-                            call: &inline_budget,
-                            session_id,
-                            permission: &inline_permission,
-                        };
-                        super::inline_images::select(lane, stored, text, |tokens| {
-                            let units = cost_policy.units(&Usage {
-                                input_tokens: tokens,
-                                total_tokens: tokens,
-                                ..Usage::new()
-                            });
-                            let used = task_budget.used.load(std::sync::atomic::Ordering::Acquire);
-                            if used.saturating_add(units) > task_budget.limit {
-                                return false;
-                            }
-                            task_budget.charge(units);
-                            child_budget.charge(units);
-                            true
-                        })
-                        .await
-                    }
-                    _ => super::inline_images::Selection::default(),
-                };
-                let host_suffix = match (&stored_evidence, &output) {
-                    (Some((stored, _)), Ok(text)) => render_evidence_section(
-                        stored,
-                        text,
-                        withheld,
-                        &selection.listed,
-                        &selection.notes,
-                        report_policy.free_form,
-                    ),
-                    _ => None,
-                };
-                let resume_limits = super::resume::ResumeLimits::from_config(&config);
-                let (resume_id, resume_note) = if output.is_ok() {
-                    let outcome =
-                        resume_store.insert_with(resume_limits, resume_agent_type, conversation);
-                    let note = super::resume::insert_note(&outcome, resume_limits);
-                    match outcome {
-                        super::resume::Insert::Stored { id, .. } => (Some(id), note),
-                        _ => (None, note),
-                    }
-                } else {
-                    (None, None)
-                };
-                // Host-authored: images the child's history ceiling dropped.
-                let host_suffix = match (omitted_images, host_suffix) {
-                    (0, suffix) => suffix,
-                    (count, Some(suffix)) => Some(format!(
-                        "{}{suffix}",
-                        super::image_cost::omission_note(count)
-                    )),
-                    (count, None) if output.is_ok() => {
-                        Some(super::image_cost::omission_note(count))
-                    }
-                    (_, None) => None,
-                };
-                let host_suffix = match (resume_id, host_suffix) {
-                    (Some(id), Some(evidence)) => {
-                        Some(format!("{}{evidence}", super::resume::resume_line(&id)))
-                    }
-                    (Some(id), None) => Some(super::resume::resume_line(&id)),
-                    (None, suffix) => suffix,
-                };
-                // Say so when a child cannot be resumed or an older one was
-                // dropped, instead of leaving the parent to find an
-                // "unknown or expired" error later.
-                let host_suffix = match (resume_note, host_suffix) {
-                    (Some(note), Some(suffix)) => Some(format!("{note}{suffix}")),
-                    (Some(note), None) => Some(note),
-                    (None, suffix) => suffix,
-                };
-                inline_sink.record(index, selection.images);
-                let output = match isolated_worktree {
-                    Some(worktree) => {
-                        let section = worktree.finish().await.render();
-                        match output {
-                            Ok(text) => Ok(format!("{text}{section}")),
-                            Err(text) => Err(format!("{text}{section}")),
-                        }
-                    }
-                    None => output,
-                };
-                let cost_units = child_budget.used.load(std::sync::atomic::Ordering::Acquire);
-                // The persona's MCP servers are shut down off the result path
-                // (a slow server stop used to add seconds to every child's
-                // wall-clock and to the call deadline); the owning scope
-                // still joins the shutdown before it retires.
-                #[cfg(feature = "mcp")]
-                if let Some(manager) = mcp_manager {
-                    drop(crate::agent::runner::spawn_async_scoped(async move {
-                        manager.shutdown().await;
-                    }));
-                }
-                if let Some(event_tx) = &report_tx {
-                    let total = report_ledgers.iter().fold(Usage::new(), |sum, ledger| {
-                        usage_saturating_add(sum, ledger.total())
-                    });
-                    if total.has_values() {
-                        let _ = event_tx
-                            .send(crate::event::AgentEvent::SubagentUsage {
-                                usage: total.into(),
-                            })
-                            .await;
-                    }
-                }
-                ChildExecution {
-                    output,
-                    cost_units,
-                    host_suffix,
-                }
-            });
-            let future: ChildFuture = Box::pin(crate::permission::ask::scope_subagent(
-                child_name, write_mode, future,
-            ));
-            let future = child_lane(
-                future,
-                pool_weak.clone(),
+        let executor: TaskExecutor = {
+            let plan = ChildPlan {
+                runtime,
+                evidence_enabled,
+                evidence_limits,
+                report_policy,
+                max_report_bytes,
+                repair_max_tokens,
+                repair_max_cost_units,
+                cost_policy,
+                task_budget: executor_budget,
+                details_sink: executor_sink,
+                job_inbox,
+                inline_cap,
+                inline_budget,
+                inline_sink: executor_inline_sink,
+                inline_permission,
+                parent_image_support,
+                subagent_event_tx,
+                config,
+                suffix,
+                authorization,
+                lane_workspace,
+                isolation,
+                isolated,
+                write_mode,
                 lane,
                 lane_write_mode,
-                lane_workspace,
-                admission_run,
-            );
-            ScheduledChild {
-                future,
-                cancellation_cost,
-            }
-        });
+                specialization,
+                child_name,
+                pool_weak: pool_weak.clone(),
+                spend_profile,
+                resume_history,
+                resume_store,
+                resume_agent_type,
+                #[cfg(feature = "archmd")]
+                architecture,
+                #[cfg(feature = "skills")]
+                skill_services,
+                #[cfg(feature = "hooks")]
+                hook_agent_type,
+                #[cfg(feature = "hooks")]
+                hook_agent_source,
+                #[cfg(feature = "mcp")]
+                shared_mcp: executor_mcp,
+                #[cfg(feature = "git-worktree")]
+                shell_parent,
+            };
+            Arc::new(move |index, prompt_text| plan.schedule(index, prompt_text))
+        };
 
         if let Some(admission) = admission {
             admission.describe(&task_label, agent_type.as_deref(), prompts.len());
@@ -2767,10 +2127,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                         #[cfg(feature = "mcp")]
                         shared_mcp.shutdown_off_path();
                         let failed = report.failed();
-                        let mut rendered = report.render();
-                        if let Some(section) = abandoned.render().await {
-                            rendered.push_str(&section);
-                        }
+                        let rendered = render_report(&report, &abandoned).await;
                         let text = super::inline_images::guard_text_output(rendered);
                         let details = Some(details_sink.take());
                         (if failed { Err(text) } else { Ok(text) }, details)
@@ -2800,11 +2157,815 @@ editing in a known location, grepping for a literal you will act on immediately.
         #[cfg(feature = "mcp")]
         shared_mcp.shutdown_off_path();
         let images = inline_sink.take(&report);
-        let mut rendered = report.render();
-        if let Some(section) = abandoned.render().await {
-            rendered.push_str(&section);
-        }
+        let rendered = render_report(&report, &abandoned).await;
         Ok(super::inline_images::envelope(rendered, &images))
+    }
+}
+
+/// The report text both the foreground and background arms return: the
+/// rendered outcomes followed by any abandoned-worktree notes.
+async fn render_report(
+    report: &TaskReport,
+    abandoned: &super::isolation::AbandonedNotes,
+) -> String {
+    let mut rendered = report.render();
+    if let Some(section) = abandoned.render().await {
+        rendered.push_str(&section);
+    }
+    rendered
+}
+
+/// Arguments checked before the delegation permission prompt.
+struct CallPlan {
+    prompts: Vec<String>,
+    resumed: Option<super::resume::StoredChild>,
+    agent_type: Option<String>,
+    permission_source: Option<String>,
+    resume_store: Arc<super::resume::ResumeStore>,
+}
+
+impl TaskTool {
+    /// Everything that depends on the arguments alone: prompt preparation,
+    /// the resume lookup, option validation and background capacity. It runs
+    /// before any permission prompt so a corrected retry does not ask the
+    /// user to approve the same delegation twice.
+    fn validate_call_args(
+        &self,
+        args: &TaskArgs,
+        config: &crate::config::Config,
+        limits: TaskLimits,
+    ) -> Result<CallPlan, ToolError> {
+        let prompts = prepare_task_prompts(args, limits)?;
+
+        // `resume` continues one stored child conversation as the same
+        // agent type; the call is otherwise an ordinary, re-authorized task.
+        let resume_store = self.resume_store();
+        let resumed = match args.options.resume.as_deref() {
+            None => None,
+            Some(id) => {
+                if prompts.len() != 1 {
+                    return Err(ToolError::Msg(
+                        "task: resume continues one child; send exactly one prompt with the follow-up message".into(),
+                    ));
+                }
+                let stored = resume_store.get(id).ok_or_else(|| {
+                    ToolError::Msg(format!(
+                        "task: unknown or expired resume id '{id}'; child conversations are kept in memory for the most recent children of this session ([subagents] task_resume_max_children, default {}), only when under [subagents] task_resume_max_bytes (default 8 MiB), and a session's ids are restored by --continue/--resume subject to those limits but not by a fresh session; start a new task instead",
+                        super::resume::MAX_RESUMABLE_CHILDREN
+                    ))
+                })?;
+                if args.agent_type.is_some() && args.agent_type != stored.agent_type {
+                    return Err(ToolError::Msg(format!(
+                        "task: resume id '{id}' belongs to agent_type {}; omit agent_type or pass the same one",
+                        stored.agent_type.as_deref().unwrap_or("(default explorer)")
+                    )));
+                }
+                Some(stored)
+            }
+        };
+        let agent_type = match &resumed {
+            Some(stored) => stored.agent_type.clone(),
+            None => args.agent_type.clone(),
+        };
+        let permission_source = agent_type.as_deref().map(|agent_type| {
+            crate::context::agents::source_hint_for_workspace(agent_type, self.workspace.as_deref())
+        });
+        // Argument-only mistakes are reported before any permission prompt, so
+        // a corrected retry does not ask the user to approve the same
+        // delegation twice.
+        validate_call_options(&args.options, config)?;
+        if args.run_in_background
+            && let Some(pool) =
+                crate::spend::run::Run::current().and_then(|run| run.background_pool())
+        {
+            pool.check_capacity()
+                .map_err(|error| ToolError::Msg(error.to_string()))?;
+        }
+        Ok(CallPlan {
+            prompts,
+            resumed,
+            agent_type,
+            permission_source,
+            resume_store,
+        })
+    }
+}
+
+/// Everything one `task` call shares with each of its children, captured once
+/// before scheduling. `schedule` builds one child's future from a clone.
+#[derive(Clone)]
+struct ChildPlan {
+    runtime: ResolvedPersonaRuntime,
+    evidence_enabled: bool,
+    evidence_limits: super::evidence::EvidenceLimits,
+    report_policy: ReportPolicy,
+    max_report_bytes: usize,
+    repair_max_tokens: u64,
+    repair_max_cost_units: u64,
+    cost_policy: super::cost::CostPolicy,
+    task_budget: LiveTaskBudget,
+    details_sink: DetailsSink,
+    job_inbox: Option<Arc<super::inbox::JobInbox>>,
+    inline_cap: usize,
+    inline_budget: super::inline_images::CallBudget,
+    inline_sink: InlineSink,
+    inline_permission: Option<PermCheck>,
+    parent_image_support: super::inline_images::ParentSupport,
+    subagent_event_tx: Option<tokio::sync::mpsc::Sender<crate::event::AgentEvent>>,
+    config: Arc<crate::config::Config>,
+    suffix: Option<Arc<str>>,
+    authorization: SubagentAuthorization,
+    lane_workspace: Option<Arc<crate::paths::WorkspaceBinding>>,
+    isolation: Option<super::isolation::IsolationPlan>,
+    isolated: bool,
+    write_mode: bool,
+    lane: ChildLane,
+    lane_write_mode: bool,
+    specialization: Option<String>,
+    child_name: String,
+    pool_weak: Option<std::sync::Weak<super::background::Pool>>,
+    spend_profile: Option<crate::spend::run::Run>,
+    resume_history: Option<Arc<Vec<Message>>>,
+    resume_store: Arc<super::resume::ResumeStore>,
+    resume_agent_type: Option<String>,
+    #[cfg(feature = "archmd")]
+    architecture: Option<String>,
+    #[cfg(feature = "skills")]
+    skill_services: Option<Arc<crate::extras::js::skills::session::SkillSessionServices>>,
+    #[cfg(feature = "hooks")]
+    hook_agent_type: String,
+    #[cfg(feature = "hooks")]
+    hook_agent_source: String,
+    #[cfg(feature = "mcp")]
+    shared_mcp: SharedPersonaMcp,
+    #[cfg(feature = "git-worktree")]
+    shell_parent: Option<builder::WriteChildTools>,
+}
+
+impl ChildPlan {
+    /// The scheduled future for child `index`: its own budgets and usage
+    /// ledgers, hooks, worktree, read-only shell, MCP, agent run, context
+    /// relief, report repair, evidence, inline images and resume store.
+    fn schedule(&self, index: usize, prompt_text: String) -> ScheduledChild {
+        let Self {
+            runtime,
+            evidence_enabled,
+            evidence_limits,
+            report_policy,
+            max_report_bytes,
+            repair_max_tokens,
+            repair_max_cost_units,
+            cost_policy,
+            task_budget,
+            details_sink,
+            job_inbox,
+            inline_cap,
+            inline_budget,
+            inline_sink,
+            inline_permission,
+            parent_image_support,
+            subagent_event_tx,
+            config,
+            suffix,
+            authorization,
+            lane_workspace,
+            isolation,
+            isolated,
+            write_mode,
+            lane,
+            lane_write_mode,
+            specialization,
+            child_name,
+            pool_weak,
+            spend_profile,
+            resume_history,
+            resume_store,
+            resume_agent_type,
+            #[cfg(feature = "archmd")]
+            architecture,
+            #[cfg(feature = "skills")]
+            skill_services,
+            #[cfg(feature = "hooks")]
+            hook_agent_type,
+            #[cfg(feature = "hooks")]
+            hook_agent_source,
+            #[cfg(feature = "mcp")]
+            shared_mcp,
+            #[cfg(feature = "git-worktree")]
+            shell_parent,
+        } = self.clone();
+        let repair_budget = LiveTaskBudget::new(repair_max_cost_units);
+        let child_budget = LiveTaskBudget::new(u64::MAX);
+        let admission = |repair: bool| {
+            let check_task = task_budget.clone();
+            let check_repair = repair_budget.clone();
+            let charge_task = task_budget.clone();
+            let charge_repair = repair_budget.clone();
+            let charge_child = child_budget.clone();
+            SubagentAdmission::new(
+                move || !check_task.exhausted() && (!repair || !check_repair.exhausted()),
+                move |usage, fallback| {
+                    let units = cost_policy.units(if usage == Usage::default() {
+                        &fallback
+                    } else {
+                        &usage
+                    });
+                    charge_task.charge(units);
+                    charge_child.charge(units);
+                    if repair {
+                        charge_repair.charge(units);
+                    }
+                },
+            )
+        };
+        let spend_profile = spend_profile
+            .as_ref()
+            .map(crate::spend::run::Run::for_invocation);
+        let admission_run = spend_profile.clone();
+        let client = runtime.client.clone();
+        let model_name = runtime.model_name.clone();
+        let max_turns = runtime.max_turns;
+        let mut persona = runtime.execution.clone();
+        persona.evidence = evidence_enabled;
+        persona.free_form = report_policy.free_form;
+        persona.inbox = job_inbox.as_ref().map(|inbox| inbox.child(index));
+        let inbox_guard = persona
+            .inbox
+            .as_ref()
+            .map(super::inbox::ChildInbox::running_guard);
+        persona.inline_images = inline_cap;
+        let event_tx = subagent_event_tx.clone();
+        #[cfg(feature = "mcp")]
+        let isolated_child = isolation.is_some();
+        #[cfg(feature = "skills")]
+        let skill_services = skill_services
+            .as_ref()
+            .map(|services| services.fork_for_read_only_child());
+        let evidence_pool = pool_weak.clone();
+        let initial_usage = SharedUsageLedger::default().with_admission(admission(false));
+        let retry_usage = SharedUsageLedger::default().with_admission(admission(false));
+        let relief_usage = SharedUsageLedger::default().with_admission(admission(false));
+        let repair_usage = SharedUsageLedger::default().with_admission(admission(true));
+        let writeup_usage = SharedUsageLedger::default().with_admission(admission(true));
+        let cancellation_units = child_budget.clone();
+        let cancellation_initial_usage = initial_usage.clone();
+        let cancellation_retry_usage = retry_usage.clone();
+        let cancellation_relief_usage = relief_usage.clone();
+        let cancellation_repair_usage = repair_usage.clone();
+        let cancellation_writeup_usage = writeup_usage.clone();
+        let report_pool = pool_weak.clone();
+        let report_ledgers = [
+            initial_usage.clone(),
+            retry_usage.clone(),
+            relief_usage.clone(),
+            repair_usage.clone(),
+            writeup_usage.clone(),
+        ];
+        let cancellation_cost = Arc::new(move || {
+            // Streaming usage may be known before ModelTurnFinished. Keep
+            // it when cancellation retires an in-flight request, without
+            // charging completed turns twice or losing no-usage estimates.
+            let observed = usage_saturating_add(
+                usage_saturating_add(
+                    usage_saturating_add(
+                        usage_saturating_add(
+                            cancellation_initial_usage.total(),
+                            cancellation_retry_usage.total(),
+                        ),
+                        cancellation_relief_usage.total(),
+                    ),
+                    cancellation_repair_usage.total(),
+                ),
+                cancellation_writeup_usage.total(),
+            );
+            cancellation_units
+                .used
+                .load(std::sync::atomic::Ordering::Acquire)
+                .max(cost_policy.units(&observed))
+        });
+        let future = crate::startup::heap_future(|| async move {
+            // Held for the child's whole run: dropping it ends delivery.
+            let _inbox_guard = inbox_guard;
+            if let Some(spend) = &spend_profile
+                && let Err(error) = spend.admit()
+            {
+                return ChildExecution {
+                    output: Err(error.to_string()),
+                    cost_units: 0,
+                    host_suffix: None,
+                };
+            }
+            #[cfg(feature = "hooks")]
+            let execution_prompt = match crate::extras::hooks::dispatch_subagent_start(
+                &hook_agent_type,
+                &hook_agent_source,
+            )
+            .await
+            {
+                // Labelled, capped hook text goes after the brief so the
+                // child cannot mistake it for the delegated objective.
+                Some(extra) => format!("{prompt_text}\n\n{extra}"),
+                None => prompt_text,
+            };
+            #[cfg(not(feature = "hooks"))]
+            let execution_prompt = prompt_text;
+
+            // Isolated child: its own worktree and an authorization bound
+            // to it alone. The guard removes the worktree if this future
+            // is dropped before `finish`.
+            let (isolated_worktree, authorization) = match &isolation {
+                Some(plan) => match super::isolation::prepare(plan, &authorization).await {
+                    Ok((worktree, authorization)) => (Some(worktree), authorization),
+                    Err(error) => {
+                        return ChildExecution {
+                            output: Err(format!("worktree isolation unavailable: {error}")),
+                            cost_units: 0,
+                            host_suffix: None,
+                        };
+                    }
+                },
+                None => (None, authorization),
+            };
+            // Opt-in read-only shell: bind it to a private scratch
+            // directory (kept until this child ends) or drop it.
+            #[cfg(feature = "git-worktree")]
+            let (_scratch, authorization, execution_prompt) = match (
+                authorization.read_only_shell_planned(),
+                &shell_parent,
+            ) {
+                (true, Some(parent)) => {
+                    let root = authorization
+                        .workspace()
+                        .map(|workspace| workspace.root().to_path_buf());
+                    match root
+                        .ok_or_else(|| "no captured workspace".to_string())
+                        .and_then(|root| {
+                            super::read_only_shell::prepare(parent, &root)
+                                .map(|prepared| (prepared, root))
+                        }) {
+                        Ok(((scratch, shell), root)) => {
+                            let note = super::read_only_shell::prompt_note(scratch.path(), &root);
+                            (
+                                Some(scratch),
+                                authorization.with_read_only_shell(Some(shell)),
+                                format!("{note}\n\n{execution_prompt}"),
+                            )
+                        }
+                        Err(error) => (
+                            None,
+                            authorization.with_read_only_shell(None),
+                            format!(
+                                "[host note: no shell tool: the read-only shell is unavailable ({error})]\n\n{execution_prompt}"
+                            ),
+                        ),
+                    }
+                }
+                (true, None) => (
+                    None,
+                    authorization.with_read_only_shell(None),
+                    execution_prompt,
+                ),
+                (false, _) => (None, authorization, execution_prompt),
+            };
+            let model = client
+                .completion_model_with_cache_ttl(model_name, config.cache_ttl.unwrap_or_default());
+            // Persona-scoped MCP: connect only the servers and exact tools
+            // the trusted persona names, with an independent permission
+            // checker; outer-agent MCP connections are never inherited.
+            #[cfg(feature = "mcp")]
+            let (mcp_manager, mcp_shared, mcp_tools, mcp_granted) = if isolated_child {
+                // An isolated child's workspace differs: it owns its
+                // connection.
+                match builder::build_persona_mcp(&persona, &config, &authorization).await {
+                    Ok((manager, tools, granted)) => (manager, None, tools, granted),
+                    Err(error) => {
+                        return ChildExecution {
+                            output: Err(error),
+                            cost_units: 0,
+                            host_suffix: None,
+                        };
+                    }
+                }
+            } else {
+                // One connection per `task` call, shared by its children;
+                // each child still derives its own tools and an
+                // independent permission checker.
+                match shared_mcp
+                    .tools_for(&persona, &config, &authorization)
+                    .await
+                {
+                    Ok((shared, tools, granted)) => (None, shared, tools, granted),
+                    Err(error) => {
+                        return ChildExecution {
+                            output: Err(error),
+                            cost_units: 0,
+                            host_suffix: None,
+                        };
+                    }
+                }
+            };
+            // Evidence is re-judged by the parent later: anchor relative
+            // paths at THIS child's directory (a worktree when isolated)
+            // and remember which MCP tools it could call.
+            let evidence_base_dir = authorization
+                .workspace()
+                .map(|workspace| workspace.root().to_path_buf());
+            #[cfg(feature = "hooks")]
+            let child_hook_bindings = crate::agent::runner::HookBindings {
+                context: crate::agent::runner::current_hook_session_context(),
+                permission: Some(authorization.hook_permission()),
+                #[cfg(feature = "mcp")]
+                peers: Some(
+                    mcp_manager
+                        .as_ref()
+                        .map(|manager| manager.hook_peers())
+                        .or_else(|| mcp_shared.as_ref().map(|manager| manager.hook_peers()))
+                        .unwrap_or_default(),
+                ),
+            };
+            #[cfg(not(feature = "mcp"))]
+            let evidence_mcp: Vec<(String, String)> = Vec::new();
+            #[cfg(feature = "mcp")]
+            let evidence_mcp: Vec<(String, String)> = mcp_granted
+                .iter()
+                .flat_map(|(server, tools)| {
+                    tools.iter().map(move |tool| (server.clone(), tool.clone()))
+                })
+                .collect();
+            let agent = builder::build_explore_agent_with_suffix(
+                model,
+                max_turns,
+                &config,
+                authorization,
+                #[cfg(feature = "archmd")]
+                architecture,
+                specialization,
+                suffix.as_deref(),
+                persona,
+                #[cfg(feature = "mcp")]
+                mcp_tools,
+                #[cfg(feature = "skills")]
+                skill_services,
+            )
+            .await
+            .with_spend(spend_profile);
+            #[cfg(feature = "hooks")]
+            let agent = agent.with_hook_routing(
+                child_hook_bindings.permission.clone().flatten(),
+                #[cfg(feature = "mcp")]
+                child_hook_bindings.peers.clone().unwrap_or_default(),
+            );
+            #[cfg(feature = "agent-skills")]
+            let agent = if let Some(services) = agent.instruction_services() {
+                agent.clone().with_instruction_turn(Some(
+                    crate::extras::skills::session::InstructionTurn::new(
+                        Arc::clone(services),
+                        None,
+                    ),
+                ))
+            } else {
+                agent
+            };
+            // Live task/repair admission bounds every provider call, so
+            // no separate per-run token reservation is passed.
+            let result = match resume_history {
+                // A resumed child continues its stored conversation with
+                // the follow-up prompt as its next user turn.
+                Some(history) => {
+                    agent
+                        .run_subagent_with_history(
+                            &execution_prompt,
+                            history.as_ref().clone(),
+                            max_turns,
+                            event_tx.as_ref(),
+                            &config.retry,
+                            initial_usage.clone(),
+                            None,
+                        )
+                        .await
+                }
+                None => {
+                    agent
+                        .run_subagent(
+                            &execution_prompt,
+                            max_turns,
+                            event_tx.as_ref(),
+                            &config.retry,
+                            initial_usage.clone(),
+                            None,
+                        )
+                        .await
+                }
+            };
+            // A child whose next request would exceed its window compacts
+            // its own conversation and continues (mini-agent-d0rfu).
+            let relief_agent = agent.clone();
+            let relief_retry = config.retry.clone();
+            let relief_events = event_tx.clone();
+            let relief_ledger = relief_usage.clone();
+            #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+            let mut run = relieve_child_context(
+                result,
+                config.resolve_compact_enabled(),
+                config.subagent_context_window.unwrap_or(u64::MAX),
+                &execution_prompt,
+                max_turns,
+                || task_budget.exhausted(),
+                |stage, prompt, history, turns| {
+                    let agent = match stage {
+                        ChildRelief::Summarize => relief_agent
+                            .clone()
+                            .for_subagent_report_repair(repair_max_tokens),
+                        ChildRelief::Continue => relief_agent.clone(),
+                    };
+                    let retry = relief_retry.clone();
+                    let events = relief_events.clone();
+                    let ledger = relief_ledger.clone();
+                    async move {
+                        agent
+                            .run_subagent_with_history(
+                                &prompt,
+                                history,
+                                turns,
+                                events.as_ref(),
+                                &retry,
+                                ledger,
+                                None,
+                            )
+                            .await
+                    }
+                },
+            )
+            .await;
+            // Host-minted evidence comes from the child's actual tool
+            // results, in call order; the report contract can only cite it.
+            let mut evidence = super::evidence::ChildEvidence::with_limits(evidence_limits)
+                .with_child_context(evidence_base_dir, evidence_mcp);
+            #[cfg_attr(not(feature = "hooks"), allow(unused_mut))]
+            let mut omitted_images = super::image_cost::omitted_images(&run.history);
+            // Conversations replaced by context compaction come first, so
+            // numbering continues across the compaction.
+            let compacted = std::mem::take(&mut run.compacted_histories);
+            for earlier in &compacted {
+                omitted_images += super::image_cost::omitted_images(earlier);
+                if evidence_enabled {
+                    evidence.record_history(earlier);
+                }
+            }
+            if evidence_enabled {
+                evidence.record_history(&run.history);
+            }
+            #[cfg(feature = "hooks")]
+            if !task_budget.exhausted()
+                && let Ok(response) = run.response.as_ref()
+                && let crate::extras::hooks::SubagentStopGate::Continue { reason } =
+                    child_hook_bindings
+                        .clone()
+                        .run(crate::extras::hooks::dispatch_subagent_stop(
+                            &hook_agent_type,
+                            &hook_agent_source,
+                            false,
+                        ))
+                        .await
+                && remaining_child_turns(max_turns, run.turns) > 0
+            {
+                tracing::info!("hooks: SubagentStop forced continuation: {reason}");
+                let continuation = format!("{response}\n\n{reason}");
+                let retried = agent
+                    .run_subagent_with_history(
+                        &continuation,
+                        run.history.clone(),
+                        remaining_child_turns(max_turns, run.turns),
+                        event_tx.as_ref(),
+                        &config.retry,
+                        retry_usage.clone(),
+                        None,
+                    )
+                    .await;
+                let new_history = &retried.history[run.history.len().min(retried.history.len())..];
+                if evidence_enabled {
+                    evidence.record_history(new_history);
+                }
+                omitted_images += super::image_cost::omitted_images(new_history);
+                run = merge_forced_continuation_run(run, retried);
+            }
+
+            // The conversation a later `resume` continues (an isolated
+            // child's worktree does not outlive it, so it is not kept).
+            let conversation = if !isolated && run.response.is_ok() {
+                run.history.clone()
+            } else {
+                Vec::new()
+            };
+            // Budget write-up and report repair are tool-free continuations
+            // of this child's own conversation (tool results included).
+            let continuation_agent = agent.clone();
+            let continuation_retry = config.retry.clone();
+            let continuation_events = event_tx.clone();
+            let evidence_ids = evidence_enabled.then(|| evidence.len());
+            let finished = finish_child_run_with(
+                run,
+                || task_budget.exhausted(),
+                max_report_bytes,
+                evidence_ids,
+                report_policy,
+                |stage, prompt, history| {
+                    let ledger = match stage {
+                        Continuation::WriteUp => writeup_usage.clone(),
+                        Continuation::Repair => repair_usage.clone(),
+                    };
+                    let repair_agent = continuation_agent
+                        .clone()
+                        .for_subagent_report_repair(repair_max_tokens);
+                    let retry = continuation_retry.clone();
+                    let events = continuation_events.clone();
+                    async move {
+                        repair_agent
+                            .run_subagent_with_history(
+                                &prompt,
+                                history,
+                                REPORT_REPAIR_MAX_TURNS,
+                                events.as_ref(),
+                                &retry,
+                                ledger,
+                                None,
+                            )
+                            .await
+                    }
+                },
+            )
+            .await;
+            let mut child_details = finished.details;
+            child_details.index = index;
+            let stored_evidence = match evidence_pool.as_ref().and_then(std::sync::Weak::upgrade) {
+                Some(pool) if evidence_enabled => {
+                    let task_id = uuid::Uuid::new_v4().to_string();
+                    let stored = pool
+                        .evidence()
+                        .store(pool.session_id(), task_id, evidence)
+                        .await;
+                    child_details.evidence = Some(super::background::EvidenceSummary {
+                        task_id: stored.task_id.clone(),
+                        records: stored.metas.len(),
+                    });
+                    Some((stored, pool.session_id().to_string()))
+                }
+                _ => None,
+            };
+            details_sink.record(child_details);
+            let violations = finished.response.as_ref().ok().map(|response| {
+                finished
+                    .known_violations
+                    .unwrap_or_else(|| report_contract_violations_with(response, evidence_ids))
+            });
+            // The report the parent sees was replaced by the host: its raw
+            // text stays withheld, but the host-recorded index is offered.
+            // A formatting-only violation is normalized into the real
+            // report, which is not withheld.
+            let withheld = match (&finished.response, &violations) {
+                (Ok(response), Some(v)) => report_withheld_by_host(response, v),
+                _ => false,
+            };
+            let output = finished.response.map(|response| {
+                enforce_validated_report_contract(
+                    response,
+                    violations.unwrap_or_default(),
+                    max_report_bytes,
+                )
+            });
+            // Host metadata only (no tool content), rendered by the
+            // scheduler after the child's closing quote fence.
+            // Attachments of an accepted report only: a withheld report's
+            // child prose decides nothing. Each admitted image is charged
+            // to the task's cost units by its patch-formula estimate.
+            let selection = match (&stored_evidence, &output) {
+                (Some((stored, session_id)), Ok(text)) if inline_cap > 0 && !withheld => {
+                    let lane = super::inline_images::Lane {
+                        cap: inline_cap,
+                        parent: parent_image_support,
+                        call: &inline_budget,
+                        session_id,
+                        permission: &inline_permission,
+                    };
+                    super::inline_images::select(lane, stored, text, |tokens| {
+                        let units = cost_policy.units(&Usage {
+                            input_tokens: tokens,
+                            total_tokens: tokens,
+                            ..Usage::new()
+                        });
+                        let used = task_budget.used.load(std::sync::atomic::Ordering::Acquire);
+                        if used.saturating_add(units) > task_budget.limit {
+                            return false;
+                        }
+                        task_budget.charge(units);
+                        child_budget.charge(units);
+                        true
+                    })
+                    .await
+                }
+                _ => super::inline_images::Selection::default(),
+            };
+            let host_suffix = match (&stored_evidence, &output) {
+                (Some((stored, _)), Ok(text)) => render_evidence_section(
+                    stored,
+                    text,
+                    withheld,
+                    &selection.listed,
+                    &selection.notes,
+                    report_policy.free_form,
+                ),
+                _ => None,
+            };
+            let resume_limits = super::resume::ResumeLimits::from_config(&config);
+            let (resume_id, resume_note) = if output.is_ok() {
+                let outcome =
+                    resume_store.insert_with(resume_limits, resume_agent_type, conversation);
+                let note = super::resume::insert_note(&outcome, resume_limits);
+                match outcome {
+                    super::resume::Insert::Stored { id, .. } => (Some(id), note),
+                    _ => (None, note),
+                }
+            } else {
+                (None, None)
+            };
+            // Host-authored: images the child's history ceiling dropped.
+            let host_suffix = match (omitted_images, host_suffix) {
+                (0, suffix) => suffix,
+                (count, Some(suffix)) => Some(format!(
+                    "{}{suffix}",
+                    super::image_cost::omission_note(count)
+                )),
+                (count, None) if output.is_ok() => Some(super::image_cost::omission_note(count)),
+                (_, None) => None,
+            };
+            let host_suffix = match (resume_id, host_suffix) {
+                (Some(id), Some(evidence)) => {
+                    Some(format!("{}{evidence}", super::resume::resume_line(&id)))
+                }
+                (Some(id), None) => Some(super::resume::resume_line(&id)),
+                (None, suffix) => suffix,
+            };
+            // Say so when a child cannot be resumed or an older one was
+            // dropped, instead of leaving the parent to find an
+            // "unknown or expired" error later.
+            let host_suffix = match (resume_note, host_suffix) {
+                (Some(note), Some(suffix)) => Some(format!("{note}{suffix}")),
+                (Some(note), None) => Some(note),
+                (None, suffix) => suffix,
+            };
+            inline_sink.record(index, selection.images);
+            let output = match isolated_worktree {
+                Some(worktree) => {
+                    let section = worktree.finish().await.render();
+                    match output {
+                        Ok(text) => Ok(format!("{text}{section}")),
+                        Err(text) => Err(format!("{text}{section}")),
+                    }
+                }
+                None => output,
+            };
+            let cost_units = child_budget.used.load(std::sync::atomic::Ordering::Acquire);
+            // The persona's MCP servers are shut down off the result path
+            // (a slow server stop used to add seconds to every child's
+            // wall-clock and to the call deadline); the owning scope
+            // still joins the shutdown before it retires.
+            #[cfg(feature = "mcp")]
+            if let Some(manager) = mcp_manager {
+                drop(crate::agent::runner::spawn_async_scoped(async move {
+                    manager.shutdown().await;
+                }));
+            }
+            // Report the child's real usage so goal token bounds count it,
+            // whether it ran in the foreground or as a background job.
+            if let Some(pool) = report_pool.as_ref().and_then(std::sync::Weak::upgrade) {
+                let total = report_ledgers.iter().fold(Usage::new(), |sum, ledger| {
+                    usage_saturating_add(sum, ledger.total())
+                });
+                if total.has_values() {
+                    super::record_child_usage(pool.session_id(), total.into());
+                }
+            }
+            ChildExecution {
+                output,
+                cost_units,
+                host_suffix,
+            }
+        });
+        let future: ChildFuture = Box::pin(crate::permission::ask::scope_subagent(
+            child_name, write_mode, future,
+        ));
+        let future = child_lane(
+            future,
+            pool_weak.clone(),
+            lane,
+            lane_write_mode,
+            lane_workspace,
+            admission_run,
+        );
+        ScheduledChild {
+            future,
+            cancellation_cost,
+        }
     }
 }
 

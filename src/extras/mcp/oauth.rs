@@ -569,72 +569,8 @@ fn secure_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn current_uid() -> u32 {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
     // SAFETY: `getuid` takes no arguments and has no failure mode.
-    unsafe { getuid() }
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    unsafe extern "C" {
-        fn flock(
-            file_descriptor: std::os::raw::c_int,
-            operation: std::os::raw::c_int,
-        ) -> std::os::raw::c_int;
-    }
-    loop {
-        // SAFETY: the descriptor remains owned by `file` for the duration of the call.
-        if unsafe { flock(file.as_raw_fd(), 2) } == 0 {
-            return Ok(());
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    unsafe extern "C" {
-        fn flock(
-            file_descriptor: std::os::raw::c_int,
-            operation: std::os::raw::c_int,
-        ) -> std::os::raw::c_int;
-    }
-    loop {
-        // SAFETY: the descriptor remains owned by `file` for the duration of the call.
-        // 6 = LOCK_EX | LOCK_NB
-        if unsafe { flock(file.as_raw_fd(), 6) } == 0 {
-            return Ok(true);
-        }
-        let error = std::io::Error::last_os_error();
-        match error.kind() {
-            std::io::ErrorKind::Interrupted => {}
-            std::io::ErrorKind::WouldBlock => return Ok(false),
-            _ => return Err(error),
-        }
-    }
-}
-
-#[cfg(unix)]
-#[allow(unsafe_code)]
-fn unlock_file(file: &std::fs::File) {
-    use std::os::fd::AsRawFd;
-    unsafe extern "C" {
-        fn flock(
-            file_descriptor: std::os::raw::c_int,
-            operation: std::os::raw::c_int,
-        ) -> std::os::raw::c_int;
-    }
-    // SAFETY: the descriptor remains valid while the lock is released.
-    let _ = unsafe { flock(file.as_raw_fd(), 8) };
+    unsafe { libc::getuid() }
 }
 
 #[cfg(windows)]
@@ -655,21 +591,6 @@ fn open_private_lock(path: &Path) -> std::io::Result<std::fs::File> {
 #[cfg(windows)]
 fn secure_atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     crate::fs::private_atomic_write_sync(path, bytes)
-}
-
-#[cfg(windows)]
-fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
-    windows_private::lock(file)
-}
-
-#[cfg(windows)]
-fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
-    windows_private::try_lock(file)
-}
-
-#[cfg(windows)]
-fn unlock_file(file: &std::fs::File) {
-    windows_private::unlock(file);
 }
 
 #[cfg(all(test, windows))]
@@ -709,24 +630,24 @@ fn secure_atomic_write(_path: &Path, _bytes: &[u8]) -> std::io::Result<()> {
     ))
 }
 
-#[cfg(not(any(unix, windows)))]
-fn lock_exclusive(_file: &std::fs::File) -> std::io::Result<()> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "MCP OAuth credential storage is unsupported on this platform",
-    ))
+/// Blocks until the exclusive advisory lock is held; `File::lock` retries
+/// `EINTR` and maps to `LockFileEx` on Windows.
+fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    file.lock()
 }
 
-#[cfg(not(any(unix, windows)))]
-fn try_lock_exclusive(_file: &std::fs::File) -> std::io::Result<bool> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "MCP OAuth credential storage is unsupported on this platform",
-    ))
+/// `Ok(false)` when another holder has the lock.
+fn try_lock_exclusive(file: &std::fs::File) -> std::io::Result<bool> {
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(false),
+        Err(std::fs::TryLockError::Error(error)) => Err(error),
+    }
 }
 
-#[cfg(not(any(unix, windows)))]
-fn unlock_file(_file: &std::fs::File) {}
+fn unlock_file(file: &std::fs::File) {
+    let _ = file.unlock();
+}
 
 #[cfg(windows)]
 #[allow(unsafe_code)]
@@ -734,7 +655,7 @@ mod windows_private {
     use std::ffi::{OsStr, c_void};
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use std::os::windows::io::FromRawHandle;
     use std::path::Path;
     use std::ptr::{null, null_mut};
 
@@ -764,9 +685,6 @@ mod windows_private {
     const OWNER_SECURITY_INFORMATION: Dword = 0x0000_0001;
     const DACL_SECURITY_INFORMATION: Dword = 0x0000_0004;
     const PROTECTED_DACL_SECURITY_INFORMATION: Dword = 0x8000_0000;
-    const LOCKFILE_EXCLUSIVE_LOCK: Dword = 0x0000_0002;
-    const LOCKFILE_FAIL_IMMEDIATELY: Dword = 0x0000_0001;
-    const ERROR_LOCK_VIOLATION: i32 = 33;
     const TOKEN_QUERY: Dword = 0x0000_0008;
     const TOKEN_USER_CLASS: Dword = 1;
     const ERROR_ALREADY_EXISTS: Dword = 183;
@@ -776,16 +694,6 @@ mod windows_private {
         _length: Dword,
         _security_descriptor: *mut c_void,
         _inherit_handle: Bool,
-    }
-
-    #[repr(C)]
-    #[derive(Default)]
-    struct Overlapped {
-        _internal: usize,
-        _internal_high: usize,
-        _offset: Dword,
-        _offset_high: Dword,
-        _event: Handle,
     }
 
     #[repr(C)]
@@ -891,21 +799,6 @@ mod windows_private {
         fn GetCurrentProcess() -> Handle;
         fn GetLastError() -> Dword;
         fn LocalFree(memory: LocalHandle) -> LocalHandle;
-        fn LockFileEx(
-            file: Handle,
-            flags: Dword,
-            reserved: Dword,
-            bytes_low: Dword,
-            bytes_high: Dword,
-            overlapped: *mut Overlapped,
-        ) -> Bool;
-        fn UnlockFileEx(
-            file: Handle,
-            reserved: Dword,
-            bytes_low: Dword,
-            bytes_high: Dword,
-            overlapped: *mut Overlapped,
-        ) -> Bool;
     }
 
     struct SecurityDescriptor(*mut c_void);
@@ -1278,54 +1171,6 @@ mod windows_private {
             Err(error) => return Err(error),
         }
         create_private_file(path, OPEN_ALWAYS)
-    }
-
-    pub(super) fn lock(file: &std::fs::File) -> std::io::Result<()> {
-        let mut overlapped = Overlapped::default();
-        if unsafe {
-            LockFileEx(
-                file.as_raw_handle(),
-                LOCKFILE_EXCLUSIVE_LOCK,
-                0,
-                u32::MAX,
-                u32::MAX,
-                &mut overlapped,
-            )
-        } == 0
-        {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
-    }
-
-    pub(super) fn try_lock(file: &std::fs::File) -> std::io::Result<bool> {
-        let mut overlapped = Overlapped::default();
-        if unsafe {
-            LockFileEx(
-                file.as_raw_handle(),
-                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-                0,
-                u32::MAX,
-                u32::MAX,
-                &mut overlapped,
-            )
-        } != 0
-        {
-            return Ok(true);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(ERROR_LOCK_VIOLATION) {
-            Ok(false)
-        } else {
-            Err(error)
-        }
-    }
-
-    pub(super) fn unlock(file: &std::fs::File) {
-        let mut overlapped = Overlapped::default();
-        let _ =
-            unsafe { UnlockFileEx(file.as_raw_handle(), 0, u32::MAX, u32::MAX, &mut overlapped) };
     }
 
     #[cfg(test)]

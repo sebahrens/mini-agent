@@ -177,13 +177,6 @@ pub enum AgentEvent {
         /// when the emitting task could tell (display attribution only).
         outer: Option<CompactString>,
     },
-    /// Total provider usage of one finished foreground `task` child. Added to
-    /// goal token bounds; not applied to the session counters (the child's own
-    /// spend is charged through the spend account).
-    #[cfg(feature = "subagents")]
-    SubagentUsage {
-        usage: UsageDelta,
-    },
     #[cfg(feature = "subagents")]
     SubagentStarted {
         agent_type: CompactString,

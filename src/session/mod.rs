@@ -1340,10 +1340,6 @@ impl Session {
         false
     }
 
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn native_js_context(&self) -> crate::provider::NativeJsContext {
         self.native_history
             .as_ref()
@@ -1358,10 +1354,6 @@ impl Session {
         self.native_history.as_ref()
     }
 
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn native_restore_history(
         &self,
         target: native_replay::HistoryProtocol,
@@ -1381,10 +1373,6 @@ impl Session {
     /// The caller owns exact retired-turn settlement. Validate a candidate
     /// snapshot before mutation; importing this data cannot recreate runtime
     /// authority or establish a ready native request on its own.
-    #[allow(
-        dead_code,
-        reason = "shared API is intentionally dormant before its frontend consumer lands"
-    )]
     pub(crate) fn store_native_history(
         &mut self,
         mut history: native_replay::NativeHistory,
@@ -3363,7 +3351,7 @@ impl Session {
 
     /// Number of leading messages to drain after a compaction whose summarizer
     /// reported `messages_included` summarized messages for a cut of
-    /// `cut_idx`. The summarizer contract (`provider::compress_messages`)
+    /// `cut_idx`. The summarizer contract (`provider::AnyClient::compress_messages_observed_with_timeout`)
     /// counts an oldest prefix of the cut slice, so with full coverage this is
     /// `cut_idx`; a partial count drains only the summarized prefix and leaves
     /// the unsummarized remainder for a later pass. Zero is an error because

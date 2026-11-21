@@ -91,11 +91,6 @@ impl RoundCollector {
                 self.input_tokens += usage.input_tokens;
                 self.output_tokens += usage.output_tokens;
             }
-            #[cfg(feature = "subagents")]
-            AgentEvent::SubagentUsage { usage, .. } => {
-                self.input_tokens += usage.input_tokens;
-                self.output_tokens += usage.output_tokens;
-            }
             AgentEvent::Error { message, .. } => {
                 self.failure = Some(message.to_string());
             }
@@ -862,30 +857,34 @@ mod tests {
         assert_eq!(summary.tokens_used, 5_600);
     }
 
-    /// A finished foreground subagent's usage counts toward the round's
-    /// tokens (mini-agent-sskdu.266).
+    /// Child usage recorded for a session is taken once, by the round that
+    /// settles next (mini-agent-sskdu.266).
     #[cfg(feature = "subagents")]
     #[test]
-    fn subagent_usage_counts_toward_the_round_tokens() {
+    fn child_usage_is_taken_once_per_session() {
+        let usage = crate::event::UsageDelta {
+            input_tokens: 3_000,
+            output_tokens: 400,
+            ..crate::event::UsageDelta::default()
+        };
+        crate::extras::subagents::record_child_usage("goal-child-usage-a", usage);
+        crate::extras::subagents::record_child_usage("goal-child-usage-a", usage);
+        assert_eq!(
+            crate::extras::subagents::take_child_usage("goal-child-usage-b").input_tokens,
+            0
+        );
         let mut collector = RoundCollector::new();
-        collector.observe(&AgentEvent::UsageDelta {
-            usage: crate::event::UsageDelta {
-                input_tokens: 100,
-                output_tokens: 20,
-                ..crate::event::UsageDelta::default()
-            },
-            context_complete: true,
-            awaits_compaction_decision: false,
-        });
-        collector.observe(&AgentEvent::SubagentUsage {
-            usage: crate::event::UsageDelta {
-                input_tokens: 3_000,
-                output_tokens: 400,
-                ..crate::event::UsageDelta::default()
-            },
-        });
-        let summary = collector.finish(&goal(), RoundEnd::Done, 0);
-        assert_eq!(summary.tokens_used, 3_520);
+        collector.add_usage(crate::extras::subagents::take_child_usage(
+            "goal-child-usage-a",
+        ));
+        assert_eq!(
+            collector.finish(&goal(), RoundEnd::Done, 0).tokens_used,
+            6_800
+        );
+        assert_eq!(
+            crate::extras::subagents::take_child_usage("goal-child-usage-a").input_tokens,
+            0
+        );
     }
 
     #[test]
@@ -1324,8 +1323,13 @@ mod tests {
             ..RoundCost::default()
         };
 
-        let interrupted = anyhow::anyhow!(crate::agent::runner::HEADLESS_INTERRUPTED);
+        let interrupted = anyhow::Error::from(crate::agent::runner::HeadlessInterrupted);
         let summary = summary_from_headless_turn(&goal, &[], &cost, Some(&interrupted), 0, false);
+        assert_eq!(summary.end, RoundEnd::Cancelled);
+
+        // Typed, so a wrapped interrupt is still one; a reworded message is not.
+        let wrapped = interrupted.context("turn failed");
+        let summary = summary_from_headless_turn(&goal, &[], &cost, Some(&wrapped), 0, false);
         assert_eq!(summary.end, RoundEnd::Cancelled);
 
         // An ordinary failure is still a failure and is still retried.
@@ -1453,6 +1457,170 @@ pub async fn unless_interrupted<T>(
             }
         },
         value = &mut work => Some(value),
+    }
+}
+
+/// What a surface supplies to run a round's verification tiers.
+pub struct TierContext<'a> {
+    pub goal: &'a Goal,
+    pub request: &'a super::gate::VerifyRequest,
+    pub sandbox: &'a crate::sandbox::Sandbox,
+    pub cfg: &'a crate::config::Config,
+    pub judge: Option<super::ResolvedJudge>,
+    pub transcript: &'a str,
+    /// The run the checks execute under and the judge call is accounted to.
+    pub spend: Option<crate::spend::run::Run>,
+    /// The session's base and cache prices, for pricing the judge call. `None`
+    /// when the surface does not charge judge calls to a session (ACP: the
+    /// call is accounted to the run only).
+    pub prices: Option<((f64, f64), crate::pricing::CachePrices)>,
+}
+
+/// What [`run_tiers`] found.
+#[derive(Default)]
+pub struct TierOutcome {
+    pub verification: Verification,
+    /// The judge call's usage priced for the session; also set for a call an
+    /// interrupt cut short, whose tokens were spent regardless.
+    pub judge_charge: Option<super::judge::JudgeCharge>,
+    /// The failing check's output when an interrupt cut a check short. The
+    /// round settles as interrupted, so only a surface that reports the
+    /// diagnostic to the operator (headless) reads it.
+    pub interrupted_check_tail: Option<String>,
+}
+
+/// Run a round's verification tiers: the checks, then the judge unless a
+/// check already rejected the claim.
+///
+/// This is the one orchestration the terminal, headless and ACP surfaces
+/// share, so a fix to the order, the interrupt handling or the judge pricing
+/// lands once. A surface supplies only the interrupt future and `judge_client`
+/// (the client for the resolved judge's provider, or why there is none: the
+/// judge then fails open as unavailable). One interrupt covers both tiers, so
+/// a signal landing between the checks and the judge is not lost.
+pub async fn run_tiers<F>(
+    ctx: TierContext<'_>,
+    judge_client: impl FnOnce(&super::ResolvedJudge) -> Result<crate::provider::AnyClient, String>,
+    interrupt: F,
+) -> TierOutcome
+where
+    F: std::future::Future<Output = std::io::Result<()>>,
+{
+    use futures::FutureExt as _;
+
+    let TierContext {
+        goal,
+        request,
+        sandbox,
+        cfg,
+        judge,
+        transcript,
+        spend,
+        prices,
+    } = ctx;
+    let mut interrupt = std::pin::pin!(interrupt.fuse());
+    let (checks, interrupted) = crate::spend::run::scope(
+        spend.clone(),
+        super::checks::run_with_interrupt(goal, request, sandbox, cfg, interrupt.as_mut()),
+    )
+    .await;
+    if interrupted {
+        // Nothing was proved either way: the round settles as interrupted and
+        // the cancellation is not fed back to the agent as a failure.
+        let tail = checks.as_ref().and_then(|o| o.failure_tail.clone());
+        return TierOutcome {
+            verification: Verification {
+                interrupted: true,
+                checks,
+                ..Verification::default()
+            },
+            interrupted_check_tail: tail,
+            ..TierOutcome::default()
+        };
+    }
+    // A failing check already decides the claim, and the gate returns before
+    // it looks at the judge: asking anyway spends a model call on an answer
+    // nobody reads, and a transport failure there would count against the
+    // judge's own failure ladder.
+    let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
+    let mut judge_charge = None;
+    let mut interrupted = false;
+    let judged = match judge {
+        Some(resolved) if request.run_judge && !checks_rejected => {
+            match judge_client(&resolved) {
+                Ok(client) => {
+                    let observed = spend.as_ref().map_or_else(Default::default, |run| {
+                        crate::spend::run::UsageObserver::with_run(
+                            run.for_judge(
+                                &resolved,
+                                cfg,
+                                resolved
+                                    .same_provider_as_session
+                                    .then(|| client.listing_key(&resolved.provider).ok())
+                                    .flatten()
+                                    .as_ref(),
+                            ),
+                        )
+                    });
+                    // An interrupt abandons a judge still waiting on its
+                    // provider: a verdict arriving after the operator stopped
+                    // the run must not decide the goal.
+                    let verdict = unless_interrupted(
+                        super::judge::ask_with_transcript_observed(
+                            goal,
+                            request,
+                            &resolved,
+                            &client,
+                            transcript,
+                            cfg,
+                            checks.as_ref(),
+                            observed.clone(),
+                        ),
+                        interrupt.as_mut(),
+                    )
+                    .await;
+                    interrupted = verdict.is_none();
+                    let call = verdict.unwrap_or_else(|| {
+                        super::judge::JudgeCall::interrupted_with_usage(
+                            cfg,
+                            &resolved.provider,
+                            &observed,
+                        )
+                    });
+                    judge_charge = prices.and_then(|(session_prices, cache_prices)| {
+                        call.charge(
+                            &resolved,
+                            cfg,
+                            super::judge::judge_prices_with_cache_prices(
+                                &resolved,
+                                cfg,
+                                session_prices,
+                                cache_prices,
+                            ),
+                            cache_prices,
+                        )
+                    });
+                    Some(call)
+                }
+                // Fail open, like every other judge failure: a surface
+                // without a reachable judge still gets its checks.
+                Err(reason) => Some(super::judge::JudgeCall::unmetered(
+                    super::gate::JudgeOutcome::Unavailable { reason },
+                )),
+            }
+        }
+        _ => None,
+    };
+    TierOutcome {
+        verification: Verification {
+            checks,
+            judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
+            judge: judged.map(|call| call.outcome),
+            interrupted,
+            ..Verification::default()
+        },
+        judge_charge,
+        interrupted_check_tail: None,
     }
 }
 
@@ -2125,6 +2293,37 @@ pub struct RoundCost {
     pub active: Duration,
 }
 
+/// Usage of finished `task` children of `session_id` since the last round.
+#[cfg_attr(not(feature = "subagents"), allow(unused_variables))]
+pub fn child_usage_delta(session_id: &str) -> crate::event::UsageDelta {
+    #[cfg(feature = "subagents")]
+    {
+        crate::extras::subagents::take_child_usage(session_id)
+    }
+    #[cfg(not(feature = "subagents"))]
+    {
+        crate::event::UsageDelta::default()
+    }
+}
+
+/// `usage` plus the usage finished `task` children of `session_id` recorded
+/// since the last round, so headless and editor rounds count subagent work
+/// toward `max_tokens` (mini-agent-sskdu.266).
+#[cfg_attr(not(feature = "subagents"), allow(unused_variables))]
+pub fn with_child_usage(
+    session_id: &str,
+    mut usage: rig::completion::Usage,
+) -> rig::completion::Usage {
+    #[cfg(feature = "subagents")]
+    {
+        let child = crate::extras::subagents::take_child_usage(session_id);
+        usage.input_tokens = usage.input_tokens.saturating_add(child.input_tokens);
+        usage.output_tokens = usage.output_tokens.saturating_add(child.output_tokens);
+        usage.total_tokens = usage.total_tokens.saturating_add(child.total_tokens);
+    }
+    usage
+}
+
 pub fn summary_from_headless_turn(
     goal: &Goal,
     interactions: &[rig::completion::Message],
@@ -2181,11 +2380,7 @@ pub fn summary_from_headless_turn(
             // An interrupt is the operator stopping the work, not the round
             // failing. Reported as a failure it would be retried, which is the
             // opposite of what was asked for.
-            Some(error)
-                if error
-                    .to_string()
-                    .contains(crate::agent::runner::HEADLESS_INTERRUPTED) =>
-            {
+            Some(error) if crate::agent::runner::is_headless_interrupt(error) => {
                 RoundEnd::Cancelled
             }
             Some(error) => RoundEnd::from_error(error.to_string()),
@@ -2309,5 +2504,151 @@ mod question_park_tests {
             goal.last_verdict.as_ref().unwrap().source,
             super::super::VerdictSource::Runtime
         );
+    }
+}
+
+#[cfg(test)]
+mod tier_tests {
+    use super::*;
+    use crate::extras::goal::gate::{VerifyCause, VerifyRequest};
+    use crate::extras::goal::{Goal, GoalCheck, ResolvedJudge};
+
+    fn sandbox() -> crate::sandbox::Sandbox {
+        use clap::Parser;
+        let cli = crate::cli::Cli::parse_from([
+            "mini-agent",
+            "--no-session",
+            "--no-sandbox",
+            "--shell",
+            "/bin/sh",
+        ]);
+        let cfg = crate::config::Config::default();
+        let workspace = std::sync::Arc::new(
+            crate::paths::WorkspaceBinding::capture(std::env::temp_dir().as_path()).unwrap(),
+        );
+        let authority = crate::permission::resolve_configured_execution_authority(&cli, &cfg)
+            .unwrap()
+            .0;
+        crate::permission::bind_configured_shell(
+            &cli,
+            &cfg,
+            authority,
+            &workspace,
+            None,
+            crate::sandbox::Sandbox::new(false, "__missing_goal_check_backend__"),
+        )
+        .with_workspace_binding(workspace)
+    }
+
+    fn judge() -> ResolvedJudge {
+        ResolvedJudge {
+            label: "session".into(),
+            provider: "openai".into(),
+            model: "m".into(),
+            same_provider_as_session: true,
+            same_as_session: true,
+        }
+    }
+
+    fn tiers_for(
+        goal: &Goal,
+        run_judge: bool,
+        judge: Option<ResolvedJudge>,
+    ) -> TierContext<'static> {
+        // The context borrows for its own lifetime; leaking keeps the test
+        // helpers small.
+        let goal: &'static Goal = Box::leak(Box::new(goal.clone()));
+        let request: &'static VerifyRequest = Box::leak(Box::new(VerifyRequest {
+            run_verify_command: false,
+            run_checks: true,
+            run_judge,
+            cause: VerifyCause::MetClaim,
+        }));
+        let sandbox: &'static crate::sandbox::Sandbox = Box::leak(Box::new(sandbox()));
+        let cfg: &'static crate::config::Config =
+            Box::leak(Box::new(crate::config::Config::default()));
+        TierContext {
+            goal,
+            request,
+            sandbox,
+            cfg,
+            judge,
+            transcript: "",
+            spend: None,
+            prices: None,
+        }
+    }
+
+    fn goal_with(checks: &[&str]) -> Goal {
+        let mut goal = Goal::new("ship it", Vec::new()).unwrap();
+        goal.checks = checks.iter().map(|c| GoalCheck::new(*c)).collect();
+        goal
+    }
+
+    /// A failing check decides the claim: the judge is never asked, so no
+    /// client is resolved and no model call is spent.
+    #[tokio::test]
+    async fn a_rejecting_check_skips_the_judge() {
+        let goal = goal_with(&["false"]);
+        let outcome = run_tiers(
+            tiers_for(&goal, true, Some(judge())),
+            |_| panic!("the judge must not be asked after a failing check"),
+            std::future::pending(),
+        )
+        .await;
+        assert!(!outcome.verification.checks.expect("checks ran").all_passed);
+        assert!(outcome.verification.judge.is_none());
+        assert_eq!(outcome.verification.judge_tokens, 0);
+        assert!(outcome.judge_charge.is_none());
+        assert!(!outcome.verification.interrupted);
+    }
+
+    /// With every check passing, a judge whose client cannot be built fails
+    /// open as unavailable (ACP's behaviour, now shared by every surface).
+    #[tokio::test]
+    async fn an_unreachable_judge_client_fails_open() {
+        let goal = goal_with(&["true"]);
+        let outcome = run_tiers(
+            tiers_for(&goal, true, Some(judge())),
+            |_| Err("no client".to_owned()),
+            std::future::pending(),
+        )
+        .await;
+        assert!(outcome.verification.checks.expect("checks ran").all_passed);
+        assert!(matches!(
+            outcome.verification.judge,
+            Some(crate::extras::goal::gate::JudgeOutcome::Unavailable { ref reason })
+                if reason == "no client"
+        ));
+    }
+
+    /// An interrupt that lands during the checks settles the round as
+    /// interrupted and never reaches the judge.
+    #[tokio::test]
+    async fn an_interrupt_during_the_checks_stops_before_the_judge() {
+        let goal = goal_with(&["sleep 30"]);
+        let outcome = run_tiers(
+            tiers_for(&goal, true, Some(judge())),
+            |_| panic!("the judge must not be asked after an interrupt"),
+            async { Ok(()) },
+        )
+        .await;
+        assert!(outcome.verification.interrupted);
+        assert!(outcome.verification.judge.is_none());
+        assert!(outcome.judge_charge.is_none());
+    }
+
+    /// No judge resolved: only the checks run.
+    #[tokio::test]
+    async fn without_a_judge_only_the_checks_run() {
+        let goal = goal_with(&["true"]);
+        let outcome = run_tiers(
+            tiers_for(&goal, true, None),
+            |_| panic!("no judge was resolved"),
+            std::future::pending(),
+        )
+        .await;
+        assert!(outcome.verification.checks.expect("checks ran").all_passed);
+        assert!(outcome.verification.judge.is_none());
     }
 }

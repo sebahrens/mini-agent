@@ -958,6 +958,29 @@ fn goal_hook_info() -> Option<crate::extras::hooks::GoalHookInfo> {
 /// comparison against a message someone later rewords.
 pub const HEADLESS_INTERRUPTED: &str = "headless agent interrupted";
 
+/// The typed form of [`HEADLESS_INTERRUPTED`]: build the failure with
+/// `anyhow::Error::from(HeadlessInterrupted)` and recognise it with
+/// [`is_headless_interrupt`], which survives `.context(..)` wrapping.
+#[derive(Debug, Clone, Copy)]
+pub struct HeadlessInterrupted;
+
+impl std::fmt::Display for HeadlessInterrupted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(HEADLESS_INTERRUPTED)
+    }
+}
+
+impl std::error::Error for HeadlessInterrupted {}
+
+/// Whether `error` is an operator interrupt. Typed errors are found anywhere in
+/// the chain; the message is still accepted for a failure that crossed a text
+/// boundary (a rendered or re-wrapped error) before reaching the caller.
+#[cfg(feature = "goal")]
+pub fn is_headless_interrupt(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<HeadlessInterrupted>())
+        || error.to_string().contains(HEADLESS_INTERRUPTED)
+}
+
 /// Continuation prompt after headless context relief (a compaction inside a
 /// turn). Like the TUI's mid-turn prompt it frames the summary as work already
 /// done rather than as new instructions.
@@ -2160,7 +2183,7 @@ pub(crate) async fn await_headless_work<F: std::future::Future>(
 ) -> anyhow::Result<F::Output> {
     tokio::select! {
         biased;
-        _ = current_work_scope_cancelled() => Err(anyhow::anyhow!(HEADLESS_INTERRUPTED)),
+        _ = current_work_scope_cancelled() => Err(HeadlessInterrupted.into()),
         result = work => Ok(result),
     }
 }
@@ -3140,10 +3163,7 @@ fn usage_nonnegative_difference(
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "shared API is intentionally dormant before its frontend consumer lands"
-)]
+#[cfg(test)]
 fn completed_stream_delta(
     messages: Option<Vec<Message>>,
     current_prompt: &str,
@@ -3927,10 +3947,6 @@ fn replay_call_identity(
 /// Canonical ACP projection retains actual empty assistant boundaries and
 /// optional non-Responses IDs; legacy/Responses identity safety stays intact.
 #[cfg(feature = "acp")]
-#[allow(
-    dead_code,
-    reason = "shared canonical adapter precedes its ACP session consumer"
-)]
 pub(crate) fn convert_canonical_history_with_tool_result_retention(
     session: &Session,
     keep_recent_tool_results: usize,
@@ -4629,11 +4645,8 @@ where
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-#[allow(
-    dead_code,
-    reason = "shared API is intentionally dormant before its frontend consumer lands"
-)]
 pub(crate) fn spawn_agent_paused_in_scope<M>(
     agent: Agent<M>,
     prompt: String,
@@ -4665,11 +4678,8 @@ where
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-#[allow(
-    dead_code,
-    reason = "shared API is intentionally dormant before its frontend consumer lands"
-)]
 pub(crate) fn spawn_agent_paused_in_scope_with_native_capture<M>(
     agent: Agent<M>,
     prompt: String,
@@ -8432,6 +8442,56 @@ mod tests {
             }
         }
         assert_eq!(model.requests().len(), 2);
+    }
+
+    /// A stream that dies after only a completed thinking block (a large
+    /// tool_use was still streaming) must not replay that thinking-only
+    /// assistant message in the retry request (mini-agent-sskdu.261).
+    #[tokio::test]
+    async fn mid_stream_retry_does_not_replay_a_thinking_only_assistant_message() {
+        let model = MockCompletionModel::from_stream_turns(vec![
+            vec![
+                MockStreamEvent::reasoning("a long plan"),
+                MockStreamEvent::error("connection reset by peer"),
+            ],
+            vec![
+                MockStreamEvent::text("recovered"),
+                MockStreamEvent::final_response_with_default_usage(),
+            ],
+        ]);
+        let agent = AgentBuilder::new(model.clone())
+            .default_max_turns(3)
+            .build();
+        let mut runner = super::spawn_agent(
+            agent,
+            "start".to_string(),
+            Vec::new(),
+            immediate_retry_config(3),
+            None,
+            #[cfg(feature = "skills")]
+            None,
+            #[cfg(feature = "hooks")]
+            None,
+        );
+        loop {
+            match runner.event_rx.recv().await.expect("runner terminal event") {
+                crate::event::AgentEvent::Done { response, .. } => {
+                    assert_eq!(response, "recovered");
+                    break;
+                }
+                crate::event::AgentEvent::Error { message, .. } => {
+                    panic!("transient error was not recovered: {message}")
+                }
+                _ => {}
+            }
+        }
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        let replayed: Vec<Message> = requests[1].chat_history.iter().cloned().collect();
+        assert!(
+            !replayed.iter().any(super::is_thinking_only_assistant),
+            "retry replayed a thinking-only assistant message: {replayed:?}"
+        );
     }
 
     #[tokio::test]
