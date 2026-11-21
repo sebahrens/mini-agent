@@ -15418,7 +15418,7 @@ brainstorm = "no-such-quick-model"
             stream.write_all(wire.as_bytes()).unwrap();
         });
         let cfg = format!(
-            "provider = \"plan80\"\nmodel = \"owned-model\"\n[api_keys]\nplan80 = \"unused-key\"\n[custom_providers.plan80]\nprovider_type = \"openai\"\nbase_url = \"http://{address}/v1\"\napi_style = \"completions\"\n"
+            "keep_recent_tokens = 1\nprovider = \"plan80\"\nmodel = \"owned-model\"\n[api_keys]\nplan80 = \"unused-key\"\n[custom_providers.plan80]\nprovider_type = \"openai\"\nbase_url = \"http://{address}/v1\"\napi_style = \"completions\"\n"
         );
         let mut state = persona_state(&cfg, counting_fixture(Arc::new(AtomicUsize::new(0))));
         let owned = Arc::get_mut(&mut state).unwrap();
