@@ -837,6 +837,11 @@ pub struct Cli {
     )]
     pub resume_all: bool,
 
+    /// The provider `--api-key` is scoped to when a resumed session (not the
+    /// startup flags) decides which provider the run uses.
+    #[arg(skip)]
+    pub(crate) api_key_provider: Option<CompactString>,
+
     #[arg(skip)]
     pub(crate) resume_selection: Option<Box<crate::session::catalogue::ResumeSelection>>,
 
@@ -1740,8 +1745,13 @@ impl Cli {
         (self.resolve_provider(cfg), self.resolve_model(cfg))
     }
 
-    /// `--api-key`, scoped to the startup provider it was given for.
+    /// `--api-key`, scoped to the provider it was given for: the resumed
+    /// session's own provider once a session is resumed, otherwise the
+    /// startup provider.
     pub(crate) fn scoped_api_key(&self, cfg: &config::Config) -> crate::provider::CliKey<'_> {
+        if let Some(provider) = &self.api_key_provider {
+            return crate::provider::CliKey::new(self.api_key.as_deref(), provider.as_str());
+        }
         let (startup, _) = self.resolve_provider_and_model(cfg);
         crate::provider::CliKey::new(self.api_key.as_deref(), startup.as_str())
     }
@@ -2648,6 +2658,23 @@ output_token_cost = 0.0
         let ok = Cli::try_parse_from(["mini-agent", "--quick-model", "sonnet"]).unwrap();
         ok.validate_quick_model(&cfg).unwrap();
         Cli::default().validate_quick_model(&cfg).unwrap();
+    }
+
+    #[test]
+    fn api_key_follows_the_resumed_session_provider_only() {
+        let cfg = config::Config::default();
+        let mut cli = Cli::try_parse_from(["mini-agent", "--api-key", "k"]).unwrap();
+        let startup = cli.resolve_provider(&cfg);
+        assert_eq!(cli.api_key_for(&cfg, &startup), Some("k"));
+        assert_eq!(cli.api_key_for(&cfg, "resumed-p"), None);
+
+        // A resumed session on provider P takes the key; the startup provider
+        // and any quick-model/persona/advisor provider Q do not.
+        cli.api_key_provider = Some(compact_str::CompactString::new("resumed-p"));
+        assert_eq!(cli.api_key_for(&cfg, "resumed-p"), Some("k"));
+        assert_eq!(cli.api_key_for(&cfg, "quick-q"), None);
+        assert_eq!(cli.api_key_for(&cfg, &startup), None);
+        assert_eq!(cli.scoped_api_key(&cfg).for_provider("quick-q"), None);
     }
 
     fn resolved(config: &str, args: &[&str], env: Option<&str>) -> (String, String) {

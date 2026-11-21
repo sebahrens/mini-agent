@@ -1941,6 +1941,8 @@ impl Startup {
             let target = decision.target();
             provider = target.provider.clone();
             model = target.model.clone();
+            // `--api-key` belongs to the provider the resumed session runs on.
+            cli.api_key_provider = Some(provider.clone());
             if let Some((saved, target)) = decision.override_identities() {
                 if cli.no_session {
                     anyhow::bail!(
