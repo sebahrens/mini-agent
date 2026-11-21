@@ -6759,6 +6759,7 @@ where
                         .send(AgentEvent::SubagentToolCall {
                             name: CompactString::from(tool_call.function.name),
                             args: tool_call.function.arguments,
+                            outer: crate::agent::tools::bash::current_tool_call_id(),
                         })
                         .await;
                 }
@@ -8377,6 +8378,7 @@ mod tests {
                 .send(crate::event::AgentEvent::SubagentToolCall {
                     name: self.marker.into(),
                     args: serde_json::json!({}),
+                    outer: None,
                 })
                 .await
                 .expect("runner event receiver must remain open");
@@ -10998,6 +11000,7 @@ mod tests {
                 tx.try_send(crate::event::AgentEvent::SubagentToolCall {
                     name: index.to_string().into(),
                     args: serde_json::json!({}),
+                    outer: None,
                 })
                 .expect("child events must not wait at the default capacity");
             }

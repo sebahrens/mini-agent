@@ -1433,7 +1433,16 @@ mod tests {
             &serde_json::to_string(&encoded_session).unwrap(),
         )
         .unwrap_err();
-        assert_eq!(error.to_string(), "invalid persisted session JSON");
+        // The message names the line, column and offending field, never content.
+        let message = error.to_string();
+        assert!(
+            message.starts_with("invalid persisted session JSON (line 1, column "),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(", unknown field `opaque-secret-unknown-key`)"),
+            "{message}"
+        );
 
         let mut credential_domain = original.clone();
         credential_domain.frames[0]

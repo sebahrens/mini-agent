@@ -1063,13 +1063,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/provider_http.rs",
-        "response.status().is_success(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/provider_http.rs",
-        "response.status().as_u16()",
+        "let listing_status = response.status();",
         1,
         "NON-PROCESS",
     ),
@@ -1233,6 +1227,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     ("src/extras/acp/mod.rs", ".status(status)", 1, "NON-PROCESS"),
     ("src/extras/acp/mod.rs", "cx.spawn({", 1, "NON-PROCESS"),
+    (
+        "src/extras/acp/mod.rs",
+        "cx.spawn(tasks::watch(",
+        1,
+        "NON-PROCESS",
+    ),
     // The ACP /cron driver is a connection task on the ACP executor, not a process.
     (
         "src/extras/acp/cron.rs",
@@ -4277,13 +4277,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         ],
     ),
     // Bounded listing response status is metadata, not a subprocess terminal.
-    (
-        "src/provider_http.rs",
-        &[(
-            "05231f50fbe276ef652346dfef91ee00e56417da4cb5041c4c29d7eb5ca0f664",
-            1,
-        )],
-    ),
     // Complete tokens of the exact context63 captured data macros above.
     (
         "src/context/instruction_wire_tests.rs",
@@ -5995,13 +5988,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "src/provider_http.rs",
-        "response.status().is_success(),",
-        1,
-        "NON-PROCESS",
-    ),
-    (
-        "src/provider_http.rs",
-        "response.status().as_u16()",
+        "let listing_status = response.status();",
         1,
         "NON-PROCESS",
     ),

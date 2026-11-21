@@ -305,7 +305,7 @@ pub async fn handle_agent_event(
             renderer.write_line_anchored(&id, &sanitize_output(&line), C_TOOL)?;
         }
         #[cfg(feature = "subagents")]
-        AgentEvent::SubagentToolCall { name, args } => {
+        AgentEvent::SubagentToolCall { name, args, .. } => {
             // The raw `args` go to the session, never the rendered summary
             // below: they are persisted as the structured payload
             // `convert_history` replays as a real tool call, and flattening
@@ -319,7 +319,7 @@ pub async fn handle_agent_event(
             renderer.write_line(&sanitize_output(&line), C_TOOL)?;
         }
         #[cfg(feature = "subagents")]
-        AgentEvent::SubagentStarted { agent_type, source } => {
+        AgentEvent::SubagentStarted { agent_type, source, .. } => {
             renderer.write_line(
                 &sanitize_output(&format!("⌥ specialist {agent_type} ({source})")),
                 C_TOOL,

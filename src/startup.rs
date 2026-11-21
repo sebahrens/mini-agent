@@ -3142,7 +3142,7 @@ impl Startup {
         }
         anyhow::ensure!(!is_bang, "images cannot be attached to a `!` shell command");
         #[cfg(feature = "multimodal")]
-        crate::headless_media::ensure_vision(&self.session.provider, &self.session.model)
+        crate::extras::multimodal::ensure_vision(&self.session.provider, &self.session.model)
             .map_err(anyhow::Error::msg)?;
         Ok(media)
     }

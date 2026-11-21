@@ -278,11 +278,10 @@ impl ProviderHttpClient {
             .send_with_credentials(request.map(Bytes::from))
             .await
             .map_err(|error| anyhow::anyhow!(listing_transport_message(&error.to_string())))?;
-        anyhow::ensure!(
-            response.status().is_success(),
-            "{}",
-            listing_status_message(response.status().as_u16())
-        );
+        let listing_status = response.status();
+        if !listing_status.is_success() {
+            anyhow::bail!("{}", listing_status_message(listing_status.as_u16()));
+        }
         anyhow::ensure!(
             response.content_length().is_none_or(|n| n <= limit as u64),
             "model listing byte limit exceeded"
@@ -470,9 +469,10 @@ fn private_error_text(label: &str, status: http::StatusCode, code: Option<&str>)
     if let Some(code) = code {
         return format!("{label} request was rejected: {code}");
     }
-    match status.as_u16() {
+    let code = status.as_u16();
+    match code {
         429 => format!("{label} rate limit reached; the service asked to slow down"),
-        500..=599 => format!("{label} service error (HTTP {})", status.as_u16()),
+        500..=599 => format!("{label} service error (HTTP {code})"),
         _ => format!("{label} request was rejected; check your account access and plan limits"),
     }
 }

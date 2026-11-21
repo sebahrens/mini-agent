@@ -2107,6 +2107,23 @@ impl Session {
         (content, artifact)
     }
 
+    /// Flag stored tool results whose output `failed` recognises, so a replay
+    /// can show them as failed. Already-flagged rows are left alone.
+    #[cfg(feature = "acp")]
+    pub(crate) fn mark_failed_tool_results(&mut self, mut failed: impl FnMut(&str) -> bool) {
+        for message in &mut self.messages {
+            if let Some(PersistedToolMessage::Result {
+                output,
+                is_error: is_error @ false,
+                ..
+            }) = &mut message.tool
+                && failed(output)
+            {
+                *is_error = true;
+            }
+        }
+    }
+
     /// Evidence that an imported/legacy transcript may contain prior model
     /// calls. This marks count history incomplete; it never invents a count.
     pub(crate) fn has_model_call_history(&self) -> bool {

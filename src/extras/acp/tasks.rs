@@ -64,6 +64,58 @@ fn format_row(row: &SavedTask, with_result: bool) -> String {
     text
 }
 
+/// Messages for tasks that were running at an earlier call and are not now.
+/// `seen_active` carries the ids still known to be running between calls, so a
+/// task restored as finished (never seen running) is not announced.
+pub(super) fn finished_messages(
+    seen_active: &mut std::collections::HashSet<String>,
+    rows: &[SavedTask],
+) -> Vec<String> {
+    let mut messages = Vec::new();
+    for row in rows {
+        if row.status.is_active() {
+            seen_active.insert(row.id.clone());
+        } else if seen_active.remove(&row.id) {
+            messages.push(format!(
+                "Background task {} {}. Send /tasks result {} to read its report.",
+                row.id,
+                row.status.as_str(),
+                row.id
+            ));
+        }
+    }
+    messages
+}
+
+/// Tells the editor when a background task finishes while nobody is looking.
+/// Holds only a weak pool handle and polls it every few seconds besides waking
+/// on changes, so it ends shortly after the session (and its pool) is gone.
+pub(super) async fn watch(
+    cx: ConnectionTo<Client>,
+    session_id: SessionId,
+    pool: std::sync::Weak<crate::extras::subagents::background::Pool>,
+) -> Result<(), agent_client_protocol::Error> {
+    let mut seen_active = std::collections::HashSet::new();
+    loop {
+        let Some(pool) = pool.upgrade() else {
+            return Ok(());
+        };
+        for text in finished_messages(&mut seen_active, &pool.list()) {
+            let chunk = ContentChunk::new(ContentBlock::Text(TextContent::new(text)));
+            if cx
+                .send_notification(SessionNotification::new(
+                    session_id.clone(),
+                    SessionUpdate::AgentMessageChunk(chunk),
+                ))
+                .is_err()
+            {
+                return Ok(());
+            }
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), pool.wait_changed()).await;
+    }
+}
+
 pub(super) async fn handle_command(
     arguments: &str,
     session_id: &SessionId,
@@ -131,6 +183,18 @@ mod tests {
         assert!(parse("cancel not-an-id").unwrap_err().contains("invalid"));
         assert_eq!(parse("cancel").unwrap_err(), USAGE);
         assert_eq!(parse("clear").unwrap_err(), USAGE);
+    }
+
+    #[test]
+    fn finished_messages_announce_only_tasks_seen_running_once() {
+        let mut seen = std::collections::HashSet::new();
+        // Restored as finished: never announced.
+        assert!(finished_messages(&mut seen, &[row("old", Status::Completed)]).is_empty());
+        assert!(finished_messages(&mut seen, &[row("a", Status::Running)]).is_empty());
+        let done = finished_messages(&mut seen, &[row("a", Status::Failed)]);
+        assert_eq!(done.len(), 1);
+        assert!(done[0].contains("a failed") && done[0].contains("/tasks result a"));
+        assert!(finished_messages(&mut seen, &[row("a", Status::Failed)]).is_empty());
     }
 
     #[test]

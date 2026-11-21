@@ -165,6 +165,7 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
                 AgentEvent::SubagentToolCall {
                     name: "grep".into(),
                     args: serde_json::json!({"pattern":"needle", "path":"src", "nested":{"keep":"raw"}}),
+                    outer: None,
                 },
                 AgentEvent::Token("done".into()),
                 terminal,

@@ -1811,6 +1811,7 @@ editing in a known location, grepping for a literal you will act on immediately.
                 .send(crate::event::AgentEvent::SubagentStarted {
                     agent_type: agent_type.as_deref().unwrap_or("explore").into(),
                     source: source.into(),
+                    outer: crate::agent::tools::bash::current_tool_call_id(),
                 })
                 .await;
         }
