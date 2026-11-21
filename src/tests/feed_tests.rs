@@ -1272,9 +1272,11 @@ fn syntax_unclosed_adversarial_and_oversized_streams_keep_literal_content() {
         before,
         "overlong line skips lexical work"
     );
-    assert!(indexed_rows(&rows).any(
-        |r| r.text.strip_prefix("< ").unwrap_or(&r.text) == source.split('\n').nth(1).unwrap()
-    ));
+    // The long code line is hard-wrapped; its rows rejoin to the source line.
+    let rejoined: String = indexed_rows(&rows)
+        .map(|r| r.text.strip_prefix("< ").unwrap_or(&r.text).to_string())
+        .collect();
+    assert!(rejoined.contains(source.split('\n').nth(1).unwrap()));
     assert!(indexed_rows(&rows).all(|r| r.syntax_spans.is_none()));
     let mut bounded = Feed::new();
     bounded.push_streaming_block(BlockStyle::Agent);
@@ -1284,8 +1286,11 @@ fn syntax_unclosed_adversarial_and_oversized_streams_keep_literal_content() {
     bounded.append_to(index, "/* x\n".repeat(10_000));
     let before = parsed_lines_for_test();
     let rows = bounded.lines(80);
-    assert_eq!(parsed_lines_for_test(), before);
-    assert!(indexed_rows(&rows).all(|r| r.syntax_spans.is_none()));
+    // The fence's own budget (512 lines) bounds lexical work; rows past it
+    // are plain.
+    assert!(parsed_lines_for_test() - before <= 512);
+    let rows: Vec<_> = indexed_rows(&rows).collect();
+    assert!(rows.last().unwrap().syntax_spans.is_none());
     bounded.replace_last(BlockStyle::Agent, "```rust\nlet n=2;\n```");
     assert!(indexed_rows(&bounded.lines(80)).any(|r| r.syntax_spans.is_some()));
 }
@@ -1730,4 +1735,38 @@ fn a_short_or_pruned_feed_tail_layout_is_complete() {
     let lines = pruned.lines(80);
     assert_eq!(lines[0].text, "[3 earlier feed blocks omitted]");
     assert_same_rows(&lines, &pruned.full_layout_for_test(80));
+}
+
+#[test]
+fn agent_prefix_never_pushes_the_first_row_past_the_width() {
+    let text =
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi";
+    for width in 20..=80 {
+        let mut feed = Feed::new();
+        feed.push_block(BlockStyle::Agent, text);
+        let lines = feed.lines(width);
+        assert!(lines[0].text.starts_with("< "));
+        for row in 0..lines.len() {
+            assert!(
+                crate::ui::utils::display_width(&lines[row].text) <= width,
+                "w={width} row {row}: {:?}",
+                lines[row].text
+            );
+        }
+    }
+}
+
+#[test]
+fn a_long_prose_line_does_not_turn_off_highlighting_for_a_small_fence() {
+    let mut feed = Feed::new();
+    let prose = "word ".repeat(700);
+    feed.push_block(
+        BlockStyle::Agent,
+        format!("{prose}\n\n```rust\nlet x = 1;\n```\n"),
+    );
+    let lines = feed.lines(80);
+    let row = (0..lines.len())
+        .find(|i| lines[*i].text.contains("let x"))
+        .unwrap();
+    assert!(lines[row].syntax_spans.is_some());
 }

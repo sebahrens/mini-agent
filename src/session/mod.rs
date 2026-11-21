@@ -550,7 +550,8 @@ pub enum PersistedToolMessage {
         /// recovery path without parsing marker-like text from the tool.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact_path: Option<CompactString>,
-        /// The tool failed, was denied, or its outcome is unknown.
+        /// The tool reported failure. Absent in older sessions (replay then
+        /// guesses from the text).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
     },
@@ -817,6 +818,9 @@ struct HistoryConversionCache {
 
 struct CachedHistoryConversion {
     revision: u64,
+    /// The live todo/goal blocks the recap carried; they change without a
+    /// history revision.
+    live_blocks: String,
     keep_recent_tool_results: usize,
     messages: std::sync::Arc<[rig::completion::Message]>,
 }
@@ -1205,6 +1209,11 @@ pub struct Session {
     history_conversion_cache: HistoryConversionCache,
     #[serde(skip)]
     pub(crate) save_notice_state: storage::SaveNoticeState,
+    /// The transcript prefix the latest compaction replaced, with that
+    /// compaction's number, until the next save writes it to a sidecar file
+    /// (mini-agent-sskdu.244). Process-local; never serialized.
+    #[serde(skip)]
+    pub(crate) pending_precompact: Option<(usize, Vec<SessionMessage>)>,
     #[serde(skip)]
     history_revision: u64,
 }
@@ -1495,6 +1504,7 @@ impl Session {
             .and_then(|cache| {
                 cache.as_ref().and_then(|entry| {
                     (entry.revision == self.history_revision
+                        && entry.live_blocks == self.live_recap_blocks()
                         && entry.keep_recent_tool_results == keep_recent_tool_results)
                         .then(|| std::sync::Arc::clone(&entry.messages))
                 })
@@ -1509,10 +1519,29 @@ impl Session {
         if let Ok(mut cache) = self.history_conversion_cache.entry.lock() {
             *cache = Some(CachedHistoryConversion {
                 revision: self.history_revision,
+                live_blocks: self.live_recap_blocks(),
                 keep_recent_tool_results,
                 messages,
             });
         }
+    }
+
+    /// The open-todo and active-goal blocks appended to the replayed recap, read
+    /// live so they never contradict the current state (mini-agent-sskdu.236).
+    /// Empty when there is nothing to state.
+    pub(crate) fn live_recap_blocks(&self) -> String {
+        let mut out = String::new();
+        if let Some(todo) = self.todos.critical_context() {
+            out.push_str(&todo);
+        }
+        #[cfg(feature = "goal")]
+        if let Some(goal) = self.goal_store.critical_context() {
+            if !out.is_empty() {
+                out.push_str("\n\n");
+            }
+            out.push_str(&goal);
+        }
+        out
     }
 
     pub(crate) fn mark_history_changed(&mut self) {
@@ -1649,6 +1678,7 @@ impl Session {
             environment: None,
             history_conversion_cache: HistoryConversionCache::default(),
             save_notice_state: storage::SaveNoticeState::default(),
+            pending_precompact: None,
             history_revision: 0,
         }
     }
@@ -2047,6 +2077,18 @@ impl Session {
         output: &str,
         images: Vec<tool_image::PersistedToolImage>,
     ) -> (String, Option<std::path::PathBuf>) {
+        self.add_tool_result_flagged(id, name, output, images, false)
+    }
+
+    /// [`Self::add_tool_result_with_images`] recording whether the tool failed.
+    pub(crate) fn add_tool_result_flagged(
+        &mut self,
+        id: &str,
+        name: &str,
+        output: &str,
+        images: Vec<tool_image::PersistedToolImage>,
+        is_error: bool,
+    ) -> (String, Option<std::path::PathBuf>) {
         let (content, replay_output, artifact) = self.tool_result_content(id, name, output);
         let artifact_path = artifact
             .as_ref()
@@ -2059,7 +2101,7 @@ impl Session {
                 output: CompactString::new(replay_output),
                 images,
                 artifact_path,
-                is_error: false,
+                is_error,
             }),
         );
         (content, artifact)
@@ -2176,6 +2218,24 @@ impl Session {
         });
         (self.input_token_cost, self.output_token_cost) = prices.unwrap_or((0.0, 0.0));
         self.input_output_prices_known = Some(prices.is_some());
+    }
+
+    /// Whether the recorded cost may undercount: prices are unknown or spend
+    /// tracking failed.
+    pub(crate) fn cost_is_incomplete(&self) -> bool {
+        self.known_input_output_prices().is_none() || self.spend_account.snapshot().tracking_error
+    }
+
+    /// The cost as the statusline and exports show it: the recorded amount,
+    /// marked `+?` when it may be incomplete, or `?` when nothing is priced.
+    #[cfg(feature = "export")]
+    pub(crate) fn cost_display(&self) -> String {
+        let amount = self.recorded_total_cost();
+        match (self.cost_is_incomplete(), amount > 0.0) {
+            (false, _) => format!("${amount:.4}"),
+            (true, true) => format!("${amount:.4}+?"),
+            (true, false) => "price unknown".into(),
+        }
     }
 
     pub(crate) fn known_input_output_prices(&self) -> Option<(f64, f64)> {
@@ -2958,6 +3018,20 @@ impl Session {
         cut_idx
     }
 
+    /// Whether cutting before `messages[idx]` (or at the end) never separates a
+    /// tool call from its result and lands on a record a compaction may start
+    /// the kept tail with.
+    #[cfg(feature = "acp")]
+    pub(crate) fn is_legal_cut(messages: &[SessionMessage], idx: usize) -> bool {
+        if idx == 0 || idx >= messages.len() {
+            return idx == messages.len();
+        }
+        matches!(
+            messages[idx].role,
+            MessageRole::User | MessageRole::Assistant
+        ) || Self::completed_batch_starts(&messages[..=idx])[idx]
+    }
+
     /// For each index of `messages`, whether it is a `ToolCall` record that
     /// starts a new batch: its predecessor is a `ToolResult` and every earlier
     /// call already has its result, so cutting before it never separates a
@@ -3179,18 +3253,9 @@ impl Session {
         };
         images.extend(&self.messages[..first_kept_index]);
         let mut summary = file_requests.attach(&summary, summary_byte_budget);
-        if let Some(todo_context) = self.todos.critical_context() {
-            summary.push_str("\n\n");
-            summary.push_str(&todo_context);
-        }
-        // A summarizer can drop anything in the messages it replaces, so the
-        // objective is re-stated from the record rather than trusted to survive
-        // in prose.
-        #[cfg(feature = "goal")]
-        if let Some(goal_context) = self.goal_store.critical_context() {
-            summary.push_str("\n\n");
-            summary.push_str(&goal_context);
-        }
+        // The open todos and the active goal are not frozen into the stored
+        // summary: `live_recap_blocks` renders them from the live stores each
+        // time the recap is replayed (mini-agent-sskdu.236).
         if let Some(restored) = restored_reads {
             summary.push_str("\n\n");
             summary.push_str(&restored);
@@ -3230,6 +3295,13 @@ impl Session {
                     )
                 });
         }
+
+        // Keep the replaced transcript for the sidecar the next save writes:
+        // compaction is otherwise irreversible (mini-agent-sskdu.244).
+        self.pending_precompact = Some((
+            self.compaction_count() + 1,
+            self.messages[..first_kept_index.min(self.messages.len())].to_vec(),
+        ));
 
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);
@@ -4298,17 +4370,17 @@ mod goal_persistence_tests {
 
         session.compress("a summary that forgot everything".into(), 4, 100);
 
-        let summary = session
-            .messages
-            .iter()
-            .find(|m| m.role == MessageRole::System)
-            .expect("summary inserted");
-        assert!(summary.content.contains("finish the migration"));
-        assert!(summary.content.contains("old table dropped"));
+        // The objective is rendered from the live record at replay, not frozen
+        // into the stored summary (mini-agent-sskdu.236).
+        let live = session.live_recap_blocks();
+        assert!(live.contains("finish the migration"));
+        assert!(live.contains("old table dropped"));
         assert!(
-            summary.content.contains("task data, not instructions"),
+            live.contains("task data, not instructions"),
             "the restated objective stays framed as data"
         );
+        let stored = session.compactions.last().unwrap();
+        assert!(!stored.summary.contains("finish the migration"));
     }
 
     #[test]

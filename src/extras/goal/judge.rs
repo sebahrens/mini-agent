@@ -21,10 +21,12 @@
 use super::gate::{CheckOutcome, JudgeOutcome, VerifyCause, VerifyRequest};
 use super::{Goal, JudgePolicy, Outcome, ResolvedJudge};
 
-/// Messages included in the transcript tail, newest first.
-const TAIL_MESSAGES: usize = 8;
-/// Per tool result included in the tail.
-const TOOL_RESULT_BYTES: usize = 512;
+/// Per tool result included in the tail. The head and the end are both kept
+/// (see [`clip_ends`]): a test run's verdict is its last line.
+const TOOL_RESULT_BYTES: usize = 3 * 1024;
+/// Per tool call's arguments, except `goal_report`, whose evidence is the claim
+/// itself and is shown whole (up to [`MESSAGE_BYTES`]).
+const TOOL_CALL_BYTES: usize = 512;
 /// Per message of any other kind. One enormous answer must not crowd out the
 /// rest of the tail, and the judge needs the shape of what was said rather
 /// than every word of it.
@@ -35,6 +37,9 @@ const TAIL_BYTES: usize = 24 * 1024;
 const BLOCK_SEPARATOR: &str = "\n\n";
 /// Response budget for a verdict. A verdict is two short lines.
 const VERDICT_MAX_TOKENS: u64 = 512;
+/// The retry cap after an empty reply, which on a reasoning model usually means
+/// hidden reasoning consumed the first one (as for the session title).
+const VERDICT_RETRY_MAX_TOKENS: u64 = 4_096;
 /// Commands listed in the checks section; the rest are counted, not shown.
 const CHECKS_LISTED: usize = 8;
 /// Per command shown in the checks section.
@@ -283,8 +288,9 @@ fn session_blocks(session: &crate::session::Session) -> Vec<String> {
     use crate::session::MessageRole;
 
     let mut blocks: Vec<String> = Vec::new();
+    let mut used = 0usize;
     for message in session.messages.iter().rev() {
-        if blocks.len() >= TAIL_MESSAGES {
+        if used >= TAIL_BYTES {
             break;
         }
         let body = match message.role {
@@ -295,15 +301,19 @@ fn session_blocks(session: &crate::session::Session) -> Vec<String> {
             MessageRole::ToolCall => format!(
                 "tool call {}: {}",
                 tool_name(message).unwrap_or("?"),
-                clip(&message.content, TOOL_RESULT_BYTES)
+                clip(
+                    &message.content,
+                    tool_call_bytes(tool_name(message).unwrap_or(""))
+                )
             ),
             MessageRole::ToolResult => format!(
                 "tool result {}: {}",
                 tool_name(message).unwrap_or("?"),
-                clip(&message.content, TOOL_RESULT_BYTES)
+                clip_ends(&message.content, TOOL_RESULT_BYTES)
             ),
             _ => continue,
         };
+        used += body.len() + BLOCK_SEPARATOR.len();
         blocks.push(body);
     }
     blocks
@@ -347,7 +357,12 @@ fn interaction_blocks(interactions: &[rig::completion::Message]) -> Vec<String> 
 
     let mut blocks: Vec<String> = Vec::new();
     for message in interactions.iter().rev() {
-        if blocks.len() >= TAIL_MESSAGES {
+        if blocks
+            .iter()
+            .map(|b| b.len() + BLOCK_SEPARATOR.len())
+            .sum::<usize>()
+            >= TAIL_BYTES
+        {
             break;
         }
         match message {
@@ -360,7 +375,10 @@ fn interaction_blocks(interactions: &[rig::completion::Message]) -> Vec<String> 
                         AssistantContent::ToolCall(call) => blocks.push(format!(
                             "tool call {}: {}",
                             call.function.name,
-                            clip(&call.function.arguments.to_string(), TOOL_RESULT_BYTES)
+                            clip(
+                                &call.function.arguments.to_string(),
+                                tool_call_bytes(&call.function.name)
+                            )
                         )),
                         _ => {}
                     }
@@ -386,7 +404,7 @@ fn interaction_blocks(interactions: &[rig::completion::Message]) -> Vec<String> 
                                 .join(" ");
                             blocks.push(format!(
                                 "tool result: {}",
-                                clip(&rendered, TOOL_RESULT_BYTES)
+                                clip_ends(&rendered, TOOL_RESULT_BYTES)
                             ));
                         }
                         _ => {}
@@ -397,6 +415,34 @@ fn interaction_blocks(interactions: &[rig::completion::Message]) -> Vec<String> 
         }
     }
     blocks
+}
+
+/// How much of a tool call's arguments the judge sees. `goal_report` carries
+/// the claim and its evidence, which is what is being judged.
+fn tool_call_bytes(name: &str) -> usize {
+    if name == "goal_report" {
+        MESSAGE_BYTES
+    } else {
+        TOOL_CALL_BYTES
+    }
+}
+
+/// Clip to `max_bytes`, keeping a head and a tail: the start says what ran and
+/// the end says how it finished.
+fn clip_ends(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    let head_budget = max_bytes / 4;
+    let mut head_end = head_budget;
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len() - (max_bytes - head_budget);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}…[clipped]…{}", &text[..head_end], &text[tail_start..])
 }
 
 fn tool_name(message: &crate::session::SessionMessage) -> Option<&str> {
@@ -454,21 +500,7 @@ pub fn parse_verdict(raw: &str) -> Result<(Outcome, String), String> {
             "impossible" => Outcome::Impossible,
             other => return Err(format!("unrecognized verdict {other:?}")),
         };
-        let reason = text
-            .lines()
-            .find_map(|l| {
-                let l = l.trim().trim_start_matches(['*', '#', '-', '>']).trim();
-                let rest = l
-                    .strip_prefix("REASON:")
-                    .or_else(|| l.strip_prefix("reason:"))
-                    .or_else(|| l.strip_prefix("Reason:"))?;
-                Some(
-                    rest.trim_matches(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '*'))
-                        .to_string(),
-                )
-            })
-            .unwrap_or_default();
-        return Ok((outcome, reason));
+        return Ok((outcome, text_reason(text)));
     }
 
     // JSON fallback, fenced or bare.
@@ -499,6 +531,65 @@ pub fn parse_verdict(raw: &str) -> Result<(Outcome, String), String> {
     }
 
     Err("no VERDICT line and no JSON verdict object".to_string())
+}
+
+/// Everything after the `REASON:` marker, to the end of the answer.
+///
+/// The reason may start on the line after the marker or run over several lines
+/// (a list, a wrapped paragraph); keeping only the marker's own line dropped it
+/// and sent the worker back with no explanation. A later `VERDICT:` line ends
+/// it. The caller's gate bounds the length.
+fn text_reason(text: &str) -> String {
+    let mut collected: Option<Vec<&str>> = None;
+    for line in text.lines() {
+        let stripped = line.trim().trim_start_matches(['*', '#', '-', '>']).trim();
+        match collected.as_mut() {
+            None => {
+                if let Some(rest) = stripped
+                    .strip_prefix("REASON:")
+                    .or_else(|| stripped.strip_prefix("reason:"))
+                    .or_else(|| stripped.strip_prefix("Reason:"))
+                {
+                    collected = Some(vec![rest.trim_matches(|c: char| {
+                        c.is_whitespace() || matches!(c, '`' | '"' | '*')
+                    })]);
+                }
+            }
+            Some(lines) => {
+                let lower = stripped.to_ascii_lowercase();
+                if lower.starts_with("verdict:") {
+                    break;
+                }
+                lines.push(line.trim_end());
+            }
+        }
+    }
+    let joined = collected.map(|lines| lines.join("\n")).unwrap_or_default();
+    joined
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '*'))
+        .chars()
+        .take(super::gate::MAX_JUDGE_REASON_CHARS)
+        .collect()
+}
+
+/// A judge request failure in the judge's own words. The request rides the
+/// summarizer path, whose errors are worded for compaction; the user reading
+/// "Compression failed" during a goal would look at the wrong feature.
+fn judge_error_text(error: &str) -> String {
+    if let Some(rest) = error.strip_prefix("Compression failed: ") {
+        format!("judge request failed: {rest}")
+    } else if error.starts_with("Compression stream ended") {
+        "the judge's reply ended without a final response".to_string()
+    } else if error.starts_with("Compression returned empty") {
+        "the judge returned no text".to_string()
+    } else {
+        format!("judge request failed: {error}")
+    }
+}
+
+/// Whether a failure was an empty reply, which a larger output cap can cure.
+fn is_empty_reply(error: &str) -> bool {
+    error.starts_with("Compression returned empty") || error.contains("returned no text")
 }
 
 /// One judge call: what it answered and what it cost.
@@ -718,17 +809,33 @@ pub(crate) async fn ask_with_transcript_observed(
         checks,
         cfg.verify_command.as_deref(),
     );
-    match client
+    let mut reply = client
         .judge_completion_observed(
             &resolved.model,
-            prompt,
+            prompt.clone(),
             preamble(),
             VERDICT_MAX_TOKENS,
             &cfg.retry,
             observed.clone(),
         )
-        .await
+        .await;
+    // An empty reply usually means hidden reasoning consumed the cap; ask once
+    // more with room for it before counting a judge failure.
+    if let Err(error) = &reply
+        && is_empty_reply(&error.to_string())
     {
+        reply = client
+            .judge_completion_observed(
+                &resolved.model,
+                prompt,
+                preamble(),
+                VERDICT_RETRY_MAX_TOKENS,
+                &cfg.retry,
+                observed.clone(),
+            )
+            .await;
+    }
+    match reply {
         Ok((raw, usage)) => {
             // Priced and counted in one shape whatever the judge's provider.
             let usage = cfg.normalize_usage(&resolved.provider, usage.into());
@@ -751,7 +858,7 @@ pub(crate) async fn ask_with_transcript_observed(
             let usage = cfg.normalize_usage(&resolved.provider, observed.total());
             JudgeCall {
                 outcome: JudgeOutcome::Unavailable {
-                    reason: error.to_string(),
+                    reason: judge_error_text(&error.to_string()),
                 },
                 tokens: usage.input_tokens.saturating_add(usage.output_tokens),
                 usage,
@@ -973,6 +1080,7 @@ mod tests {
         let mut goal = Goal::new("ship it", Vec::new()).unwrap();
         goal.checks.push(GoalCheck::new("cargo test --all"));
         let passed = CheckOutcome {
+            failure_kind: Default::default(),
             all_passed: true,
             failure_tail: None,
             verified: vec![VerificationKind::VerifyCommand, VerificationKind::Checks],
@@ -999,6 +1107,7 @@ mod tests {
             "x".repeat(10 * 1024)
         );
         let failed = CheckOutcome {
+            failure_kind: Default::default(),
             all_passed: false,
             failure_tail: Some(hostile),
             verified: Vec::new(),
@@ -1038,6 +1147,65 @@ mod tests {
         );
     }
 
+    /// A test run's verdict is its last line; the judge must see it even when
+    /// the output is longer than the per-result budget (mini-agent-sskdu.208).
+    #[test]
+    fn a_long_tool_result_keeps_its_last_line_visible() {
+        use crate::session::Session;
+        let mut session = Session::new("openrouter", "model", 200_000, "");
+        let output = format!("{}\ntest result: ok. 42 passed", "line\n".repeat(900));
+        session.add_tool_result("bash", &output);
+        let tail = transcript_tail(&session);
+        assert!(tail.contains("test result: ok. 42 passed"), "{tail}");
+        assert!(tail.contains("[clipped]"));
+
+        let two_kib = format!("{}\nresult: pass", "z".repeat(2_000));
+        let mut small = Session::new("openrouter", "model", 200_000, "");
+        small.add_tool_result("bash", &two_kib);
+        assert!(transcript_tail(&small).contains("result: pass"));
+    }
+
+    #[test]
+    fn the_goal_report_claim_is_shown_beyond_the_tool_call_clip() {
+        assert_eq!(tool_call_bytes("goal_report"), MESSAGE_BYTES);
+        assert_eq!(tool_call_bytes("bash"), TOOL_CALL_BYTES);
+    }
+
+    /// The reason may be a list, a wrapped paragraph, or start on the next line
+    /// (mini-agent-sskdu.210).
+    #[test]
+    fn a_multi_line_reason_is_kept_whole() {
+        let (outcome, reason) =
+            parse_verdict("VERDICT: not_yet\nREASON:\n- tests missing\n- docs missing").unwrap();
+        assert_eq!(outcome, Outcome::NotYet);
+        assert!(
+            reason.contains("tests missing") && reason.contains("docs missing"),
+            "{reason}"
+        );
+
+        let (_, wrapped) =
+            parse_verdict("VERDICT: not_yet\nREASON: the build\nstill fails.").unwrap();
+        assert_eq!(wrapped, "the build\nstill fails.");
+    }
+
+    #[test]
+    fn judge_failures_are_not_worded_as_compaction() {
+        assert_eq!(
+            judge_error_text("Compression failed: 503"),
+            "judge request failed: 503"
+        );
+        assert_eq!(
+            judge_error_text("Compression returned empty response"),
+            "the judge returned no text"
+        );
+        assert!(
+            !judge_error_text("Compression stream ended without a final response")
+                .contains("Compression")
+        );
+        assert!(is_empty_reply("Compression returned empty response"));
+        assert!(!is_empty_reply("Compression failed: 503"));
+    }
+
     #[test]
     fn a_drift_check_asks_a_different_question_than_a_completion_claim() {
         let goal = Goal::new("ship it", Vec::new()).unwrap();
@@ -1052,7 +1220,10 @@ mod tests {
         use crate::session::{MessageRole, Session};
         let mut session = Session::new("openrouter", "model", 200_000, "");
         for i in 0..30 {
-            session.add_message(MessageRole::Assistant, &format!("step {i}"));
+            session.add_message(
+                MessageRole::Assistant,
+                &format!("step {i} {}", "y".repeat(2_000)),
+            );
         }
         session.add_tool_result("bash", &"x".repeat(50_000));
 
@@ -1080,7 +1251,7 @@ mod tests {
     fn an_oversized_tail_keeps_the_newest_messages_not_the_oldest() {
         use crate::session::{MessageRole, Session};
         let mut session = Session::new("openrouter", "model", 200_000, "");
-        for i in 0..TAIL_MESSAGES {
+        for i in 0..8usize {
             session.add_message(
                 MessageRole::Assistant,
                 &format!("step {i} {}", "x".repeat(8 * 1024)),
@@ -1094,7 +1265,7 @@ mod tests {
             tail.len()
         );
         assert!(
-            tail.contains(&format!("step {}", TAIL_MESSAGES - 1)),
+            tail.contains("step 7"),
             "the newest message survives the budget"
         );
         assert!(

@@ -1090,3 +1090,29 @@ fn retry_wait_label_counts_down_and_ends() {
     );
     assert!(format!("{:?}", lines[0]).contains("retry in 45s"));
 }
+
+#[test]
+fn a_high_priority_vim_label_survives_a_narrow_fit() {
+    let session = Session::new("p", "provider/very-long-model-name", 1_000_000, "");
+    let mut context = ctx();
+    context.prompt_name = Some("code");
+    context.perm_mode = Some("yolo");
+    let mut spans =
+        statusline::build_lines(&statusline::default_spec(), &session, &context).remove(0);
+    spans.insert(
+        0,
+        StatusSpan::Text {
+            text: "NORMAL ".into(),
+            fg: None,
+            bg: None,
+            layout: statusline::SpanLayout::Item {
+                priority: 255,
+                plain: "NORMAL ".into(),
+                compact: Some("N ".into()),
+                dynamic_color: false,
+            },
+        },
+    );
+    let text = line_text(&statusline::fit_line(&spans, 20));
+    assert!(text.contains("NORMAL") || text.contains("N "), "{text}");
+}

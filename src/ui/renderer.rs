@@ -45,18 +45,119 @@ fn may_contain_url(text: &str) -> bool {
     text.contains("http")
 }
 
+/// The URL part of a regex match: trailing sentence punctuation, backticks and
+/// a closing bracket without a matching opener are not part of the address.
+pub(crate) fn trim_url(url: &str) -> &str {
+    let mut end = url.len();
+    loop {
+        let current = &url[..end];
+        let Some(last) = current.chars().next_back() else {
+            break;
+        };
+        let trim = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' | '`' => true,
+            ')' | ']' | '}' => {
+                let open = match last {
+                    ')' => '(',
+                    ']' => '[',
+                    _ => '{',
+                };
+                current.matches(last).count() > current.matches(open).count()
+            }
+            _ => false,
+        };
+        if !trim {
+            break;
+        }
+        end -= last.len_utf8();
+    }
+    &url[..end]
+}
+
+thread_local! {
+    /// The full URL of the row being painted when that row holds a fragment of
+    /// a URL split over several rows, and whether the row continues it.
+    static FRAGMENT: std::cell::RefCell<Option<(String, bool)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn set_fragment(value: Option<(String, bool)>) {
+    FRAGMENT.with(|f| *f.borrow_mut() = value);
+}
+
+fn fragment_active() -> bool {
+    FRAGMENT.with(|f| f.borrow().is_some())
+}
+
+/// For a row that holds part of a URL wrapped over rows (`Cont::Split`
+/// chain): the whole URL, and whether the row continues it from above.
+fn fragment_url(lines: &FeedLines, idx: usize) -> Option<(String, bool)> {
+    let cont = lines.get(idx)?.cont == Cont::Split;
+    if !cont && !lines.get(idx + 1).is_some_and(|l| l.cont == Cont::Split) {
+        return None;
+    }
+    let mut first = idx;
+    while first > 0 && lines.get(first).is_some_and(|l| l.cont == Cont::Split) {
+        first -= 1;
+    }
+    let mut joined = String::new();
+    let (mut row_start, mut row_end) = (0, 0);
+    let mut i = first;
+    while let Some(entry) = lines.get(i) {
+        if i > first && entry.cont != Cont::Split {
+            break;
+        }
+        let lead = if i > first { entry.lead as usize } else { 0 };
+        if i == idx {
+            row_start = joined.len();
+        }
+        joined.push_str(entry.text.get(lead..).unwrap_or(""));
+        if i == idx {
+            row_end = joined.len();
+        }
+        i += 1;
+    }
+    URL_RE.find_iter(&joined).find_map(|m| {
+        let url = trim_url(m.as_str());
+        let (start, end) = (m.start(), m.start() + url.len());
+        (start < row_end && end > row_start && url.len() >= "http://".len())
+            .then(|| (url.to_string(), cont))
+    })
+}
+
 fn wrap_urls_osc8(text: &str) -> String {
     note_url_scan();
+    let fragment = FRAGMENT.with(|f| f.borrow().clone());
     let mut result = String::with_capacity(text.len() + 64);
     let mut last = 0;
-    for m in URL_RE.find_iter(text) {
-        result.push_str(&text[last..m.start()]);
+    if let Some((full, true)) = &fragment {
+        // The row continues a URL from above: its leading run is the tail.
+        let run = text.find(char::is_whitespace).unwrap_or(text.len());
+        if run > 0 && !text.starts_with("http") {
+            result.push_str("\x1b]8;;");
+            result.push_str(full);
+            result.push_str("\x1b\\");
+            result.push_str(&text[..run]);
+            result.push_str("\x1b]8;;\x1b\\");
+            last = run;
+        }
+    }
+    for m in URL_RE.find_iter(&text[last..]) {
+        let (mstart, mend) = (last + m.start(), last + m.end());
+        let url = trim_url(m.as_str());
+        if url.len() < "http://".len() {
+            continue;
+        }
+        let target = match &fragment {
+            Some((full, _)) if mend == text.len() => full.as_str(),
+            _ => url,
+        };
+        result.push_str(&text[last..mstart]);
         result.push_str("\x1b]8;;");
-        result.push_str(m.as_str());
+        result.push_str(target);
         result.push_str("\x1b\\");
-        result.push_str(m.as_str());
+        result.push_str(url);
         result.push_str("\x1b]8;;\x1b\\");
-        last = m.end();
+        last = mstart + url.len();
     }
     result.push_str(&text[last..]);
     result
@@ -88,7 +189,10 @@ pub(crate) fn paint_row_text(
 /// (nothing to sanitize, no URL) is written straight from the row, with no
 /// allocation and no regex scan.
 fn write_painted_text(out: &mut impl Write, text: &str) -> io::Result<()> {
-    if !may_contain_url(text) && !text.chars().any(super::events::needs_terminal_sanitizing) {
+    if !may_contain_url(text)
+        && !fragment_active()
+        && !text.chars().any(super::events::needs_terminal_sanitizing)
+    {
         return out.write_all(text.as_bytes());
     }
     out.write_all(paint_text(text).as_bytes())
@@ -102,7 +206,13 @@ pub(crate) fn paint_styled_row(
     selected: Option<(usize, usize)>,
     monochrome: bool,
 ) -> io::Result<()> {
-    let Some(spans) = entry.syntax_spans.as_ref().filter(|_| !monochrome) else {
+    // Monochrome drops span colours but keeps attributes (bold, italic, ...),
+    // which stay readable without colour.
+    let Some(spans) = entry
+        .syntax_spans
+        .as_ref()
+        .filter(|spans| !monochrome || spans.iter().any(|span| span.attrs != 0))
+    else {
         return paint_row_text(out, &entry.text, selected);
     };
     let mut previous = 0;
@@ -117,7 +227,7 @@ pub(crate) fn paint_styled_row(
         }
         previous = span.range.end;
     }
-    let mut paint = |range: std::ops::Range<usize>, color: Color| -> io::Result<()> {
+    let mut paint = |range: std::ops::Range<usize>, color: Color, attrs: u8| -> io::Result<()> {
         if range.is_empty() {
             return Ok(());
         }
@@ -126,8 +236,13 @@ pub(crate) fn paint_styled_row(
             let end = end.min(range.end);
             (start < end).then(|| (start - range.start, end - range.start))
         });
-        write!(out, "{}", SetForegroundColor(color))?;
-        paint_row_text(out, &entry.text[range], selection)
+        if !monochrome {
+            write!(out, "{}", SetForegroundColor(color))?;
+        }
+        write_attrs(out, attrs, true)?;
+        let result = paint_row_text(out, &entry.text[range], selection);
+        write_attrs(out, attrs, false)?;
+        result
     };
     // A syntax boundary must not cut a pre-existing OSC8 URL into unrelated fragments.
     // Treat complete inert URL text as one foreground run; selection still overlays it.
@@ -137,7 +252,10 @@ pub(crate) fn paint_styled_row(
     } else {
         ""
     };
-    let mut urls = URL_RE.find_iter(url_text).peekable();
+    let mut urls = URL_RE
+        .find_iter(url_text)
+        .map(|m| (m.start(), m.start() + trim_url(m.as_str()).len()))
+        .peekable();
     let mut offset = 0;
     let mut span_index = 0;
     while offset < entry.text.len() {
@@ -147,24 +265,53 @@ pub(crate) fn paint_styled_row(
         {
             span_index += 1;
         }
-        while urls.peek().is_some_and(|url| url.end() <= offset) {
+        while urls.peek().is_some_and(|url| url.1 <= offset) {
             urls.next();
         }
-        let (mut end, mut color) = match spans.get(span_index) {
-            Some(span) if span.range.start <= offset => (span.range.end, span.color),
-            Some(span) => (span.range.start, entry.color),
-            None => (entry.text.len(), entry.color),
+        let (mut end, mut color, mut attrs) = match spans.get(span_index) {
+            Some(span) if span.range.start <= offset => (
+                span.range.end,
+                if span.color == Color::Reset {
+                    entry.color
+                } else {
+                    span.color
+                },
+                span.attrs,
+            ),
+            Some(span) => (span.range.start, entry.color, 0),
+            None => (entry.text.len(), entry.color, 0),
         };
         if let Some(url) = urls.peek() {
-            if url.start() <= offset {
-                end = url.end();
+            if url.0 <= offset {
+                end = url.1;
                 color = entry.color;
+                attrs = 0;
             } else {
-                end = end.min(url.start());
+                end = end.min(url.0);
             }
         }
-        paint(offset..end, color)?;
+        paint(offset..end, color, attrs)?;
         offset = end;
+    }
+    Ok(())
+}
+
+/// Switch the `ATTR_*` text attributes in `attrs` on or off.
+fn write_attrs(out: &mut impl Write, attrs: u8, on: bool) -> io::Result<()> {
+    use super::highlight::{ATTR_BOLD, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE};
+    for (bit, set, unset) in [
+        (ATTR_BOLD, Attribute::Bold, Attribute::NormalIntensity),
+        (ATTR_ITALIC, Attribute::Italic, Attribute::NoItalic),
+        (ATTR_STRIKE, Attribute::CrossedOut, Attribute::NotCrossedOut),
+        (
+            ATTR_UNDERLINE,
+            Attribute::Underlined,
+            Attribute::NoUnderline,
+        ),
+    ] {
+        if attrs & bit != 0 {
+            write!(out, "{}", SetAttribute(if on { set } else { unset }))?;
+        }
     }
     Ok(())
 }
@@ -177,6 +324,18 @@ fn paint_text(text: &str) -> String {
     }
 }
 
+/// How a laid-out row relates to the row before it. Rows that continue one
+/// logical line carry the wrap kind so copy and URL resolution can rejoin them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cont {
+    /// Starts a logical line.
+    None,
+    /// Soft wrap at whitespace: the wrap consumed a space.
+    Space,
+    /// A long word was split: the rows join with nothing between them.
+    Split,
+}
+
 #[derive(Clone, Debug)]
 pub struct LineEntry {
     pub text: CompactString,
@@ -187,6 +346,11 @@ pub struct LineEntry {
     pub theme_accent: bool,
     /// Ephemeral foreground spans; text stays plain for widths and copying.
     pub(crate) syntax_spans: Option<std::sync::Arc<[super::highlight::TokenSpan]>>,
+    /// Whether this row continues the previous one (soft wrap).
+    pub cont: Cont,
+    /// Leading layout columns (list hanging indent) that are not content;
+    /// copy skips them on continuation rows.
+    pub lead: u8,
 }
 
 pub struct PermissionPrompt {
@@ -199,6 +363,18 @@ pub struct PermissionPrompt {
 
 pub struct ChainPrompt {
     pub question: CompactString,
+    /// When the prompt appeared; answer keys typed before it is armed were
+    /// meant for the draft (see `permission_handler::premature_prompt_key`).
+    pub opened: std::time::Instant,
+}
+
+impl ChainPrompt {
+    pub fn new(question: impl Into<CompactString>) -> Self {
+        Self {
+            question: question.into(),
+            opened: std::time::Instant::now(),
+        }
+    }
 }
 
 /// Everything that affects what the chat viewport paints. Compared between
@@ -605,6 +781,49 @@ fn prompt_header_shortened(header: &str, options: &str, width: usize, rows: &[St
     rows[..rows.len() - option_rows] != full[..]
 }
 
+/// Rows for the options block of a prompt, at most `room` of them. Each
+/// `\n`-separated line is its own row group (a question overlay lists one
+/// option per line, then its answer draft and key hint). When they do not
+/// fit, the last two lines (the draft and the key legend) are kept and the
+/// earlier ones shrink to one row each, so the tail is never what is cut.
+fn option_block_rows(options: &str, width: usize, room: usize) -> Vec<String> {
+    use crate::ui::utils::{display_prefix, wrap_to_width};
+    let options = crate::ui::events::sanitize_output(options);
+    let lines: Vec<&str> = options.split('\n').collect();
+    if lines.len() == 1 {
+        let mut rows = wrap_to_width(lines[0], width);
+        rows.truncate(room);
+        return rows;
+    }
+    let all: Vec<Vec<String>> = lines.iter().map(|l| wrap_to_width(l, width)).collect();
+    if all.iter().map(Vec::len).sum::<usize>() <= room {
+        return all.into_iter().flatten().collect();
+    }
+    let keep = lines.len().min(2);
+    let (head, tail) = all.split_at(all.len() - keep);
+    let mut tail_rows: Vec<String> = tail.iter().flatten().cloned().collect();
+    if tail_rows.len() > room {
+        // Keep the legend (last rows), drop the front of a long draft.
+        tail_rows.drain(..tail_rows.len() - room);
+    }
+    let head_room = room - tail_rows.len();
+    let mut rows: Vec<String> = head
+        .iter()
+        .take(head_room)
+        .map(|group| {
+            let first = group.first().map(String::as_str).unwrap_or("");
+            display_prefix(first, width).to_string()
+        })
+        .collect();
+    if head.len() > head_room && head_room > 0 {
+        let hidden = head.len() - head_room + 1;
+        let note = format!("  … {hidden} more option(s)");
+        *rows.last_mut().expect("head_room > 0") = display_prefix(&note, width).to_string();
+    }
+    rows.extend(tail_rows);
+    rows
+}
+
 /// Lay out a permission (or chain) prompt as terminal rows: the sanitized
 /// `header` hard-wrapped to `width`, then the `options`, in at most
 /// `max_rows` rows. Nothing is ever written raw: a multi-line header (a
@@ -623,9 +842,7 @@ pub(crate) fn prompt_block_rows(
     let width = width.max(1);
     let max_rows = max_rows.max(2);
     let header = crate::ui::events::sanitize_for_review(header);
-    let options = crate::ui::events::sanitize_output(options).replace('\n', " ");
-    let mut option_rows = wrap_to_width(&options, width);
-    option_rows.truncate(max_rows - 1);
+    let option_rows = option_block_rows(options, width, max_rows - 1);
     let budget = max_rows - option_rows.len();
     let lines: Vec<&str> = header.split('\n').collect();
 
@@ -849,6 +1066,7 @@ pub struct Renderer {
     spinner_frame: u8,
     feed: Feed,
     seen_feed_retention_generation: u64,
+    seen_feed_reset_generation: u64,
     scroll_offset: usize,
     input_vscroll_offset: usize,
     input_max_vscroll: usize,
@@ -928,6 +1146,8 @@ pub struct Renderer {
     /// Transient status-line message (e.g. a copy result) that must not
     /// become a permanent transcript entry.
     notice: Option<Notice>,
+    /// The last [`NOTICE_LOG_LEN`] notices, for `/notices`.
+    notice_log: std::collections::VecDeque<CompactString>,
     /// Report agent activity in the terminal title (config `terminal_title`).
     title_status: bool,
     /// Activity last written to the title, so unchanged frames write nothing.
@@ -1005,6 +1225,8 @@ impl Write for TestSink {
 }
 
 /// How long a transient notice stays on the status line.
+/// Notices kept for `/notices`.
+pub(crate) const NOTICE_LOG_LEN: usize = 20;
 pub(crate) const NOTICE_DURATION: std::time::Duration = std::time::Duration::from_secs(3);
 
 impl Renderer {
@@ -1030,6 +1252,7 @@ impl Renderer {
             spinner_frame: 0,
             feed: Feed::new(),
             seen_feed_retention_generation: 0,
+            seen_feed_reset_generation: 0,
             scroll_offset: 0,
             input_vscroll_offset: 0,
             input_max_vscroll: 0,
@@ -1078,6 +1301,7 @@ impl Renderer {
             statusline_builds: 0,
             bottom_cursor: None,
             notice: None,
+            notice_log: std::collections::VecDeque::new(),
             title_status: false,
             title_activity: None,
             activity_signals: crate::ui::terminal::ActivitySignals::default(),
@@ -1357,11 +1581,29 @@ impl Renderer {
     /// Show `text` on the status line for [`NOTICE_DURATION`] instead of
     /// adding it to the transcript.
     pub(crate) fn show_notice(&mut self, text: &str, color: Color) {
+        // An error carries a cause the user needs to read in full: keep a copy
+        // in the transcript (the statusline slot truncates and expires) and
+        // give a long message longer on screen.
+        let mut duration = NOTICE_DURATION;
+        if color == crate::ui::C_ERROR {
+            self.feed.push_block(style_from_color(color), text);
+            self.chat_dirty = true;
+            duration += std::time::Duration::from_millis(50 * text.chars().count().min(160) as u64);
+        }
+        if self.notice_log.len() == NOTICE_LOG_LEN {
+            self.notice_log.pop_front();
+        }
+        self.notice_log.push_back(CompactString::from(text));
         self.notice = Some(Notice {
             text: CompactString::from(text),
             color,
-            until: std::time::Instant::now() + NOTICE_DURATION,
+            until: std::time::Instant::now() + duration,
         });
+    }
+
+    /// The recent statusline notices, oldest first.
+    pub(crate) fn recent_notices(&self) -> Vec<String> {
+        self.notice_log.iter().map(|n| n.to_string()).collect()
     }
 
     /// When the current notice expires, so the UI loop can repaint then.
@@ -2001,15 +2243,44 @@ impl Renderer {
 
     pub fn link_url_at(&self, buf_idx: usize, col: u16) -> Option<String> {
         let lines = self.chat_lines(self.max_line_width());
-        let entry = lines.get(buf_idx)?;
-        let text: &str = &entry.text;
+        lines.get(buf_idx)?;
+        // A URL longer than the row is split across rows (`Cont::Split`):
+        // resolve it on the joined logical line so every fragment opens the
+        // whole address.
+        let mut first = buf_idx;
+        while first > 0 && lines.get(first).is_some_and(|l| l.cont == Cont::Split) {
+            first -= 1;
+        }
+        let mut last = buf_idx;
+        while lines.get(last + 1).is_some_and(|l| l.cont == Cont::Split) {
+            last += 1;
+        }
+        let mut joined = String::new();
+        let mut base = 0usize;
+        let mut click_base = 0usize;
         let click_col = col.saturating_sub(self.chat_margin) as usize;
-        for m in URL_RE.find_iter(text) {
-            let prefix = &text[..m.start()];
-            let url_start = display_width(prefix);
-            let url_end = url_start + display_width(m.as_str());
-            if click_col >= url_start && click_col < url_end {
-                return Some(m.as_str().to_string());
+        let mut click_in_row = click_col;
+        for idx in first..=last {
+            let entry = lines.get(idx)?;
+            let lead = if idx > first { entry.lead as usize } else { 0 };
+            let text = entry.text.get(lead..).unwrap_or("");
+            if idx == buf_idx {
+                if click_col < lead {
+                    return None;
+                }
+                click_base = base;
+                click_in_row = click_col - lead;
+            }
+            base += display_width(text);
+            joined.push_str(text);
+        }
+        let click = click_base + click_in_row;
+        for m in URL_RE.find_iter(&joined) {
+            let url = trim_url(m.as_str());
+            let url_start = display_width(&joined[..m.start()]);
+            let url_end = url_start + display_width(url);
+            if click >= url_start && click < url_end {
+                return Some(url.to_string());
             }
         }
         None
@@ -2028,14 +2299,30 @@ impl Renderer {
         };
         let lines = self.chat_lines(self.max_line_width());
         let (lo, hi) = (a.min(b).line, a.max(b).line);
-        let pieces: Vec<&str> = (lo..=hi)
-            .filter_map(|line| {
-                let text: &str = &lines.get(line)?.text;
-                let (start, end) = selection_byte_range(text, line, a, b)?;
-                Some(&text[start..end])
-            })
-            .collect();
-        let result = pieces.join("\n");
+        let mut result = String::new();
+        let mut any = false;
+        for line in lo..=hi {
+            let Some(entry) = lines.get(line) else {
+                continue;
+            };
+            let text: &str = &entry.text;
+            let Some((mut start, end)) = selection_byte_range(text, line, a, b) else {
+                continue;
+            };
+            if any {
+                // Soft-wrapped rows rejoin into the logical line they came from.
+                match entry.cont {
+                    Cont::None => result.push('\n'),
+                    Cont::Space => result.push(' '),
+                    Cont::Split => {}
+                }
+                if entry.cont != Cont::None {
+                    start = start.max((entry.lead as usize).min(end));
+                }
+            }
+            result.push_str(&text[start..end]);
+            any = true;
+        }
         (!result.is_empty()).then_some(result)
     }
 
@@ -2254,7 +2541,8 @@ impl Renderer {
                     entry.theme_accent.hash(&mut state);
                     if let Some(spans) = &entry.syntax_spans {
                         for span in spans.iter() {
-                            (span.range.start, span.range.end, span.color).hash(&mut state);
+                            (span.range.start, span.range.end, span.color, span.attrs)
+                                .hash(&mut state);
                         }
                     }
                     selected_range(line).hash(&mut state);
@@ -2325,7 +2613,11 @@ impl Renderer {
                     let entry = &buffer[line];
                     self.write_chat_margin(&mut stdout)?;
                     write!(stdout, "{}", SetForegroundColor(self.line_color(entry)))?;
-                    paint_styled_row(&mut stdout, entry, selected_range(line), self.monochrome)?;
+                    set_fragment(fragment_url(&buffer, line));
+                    let painted_row =
+                        paint_styled_row(&mut stdout, entry, selected_range(line), self.monochrome);
+                    set_fragment(None);
+                    painted_row?;
                 }
                 write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
                 write!(stdout, "{}", ResetColor)?;
@@ -2425,7 +2717,15 @@ impl Renderer {
         let retention_generation = self.feed.retention_generation();
         if retention_generation != self.seen_feed_retention_generation {
             self.seen_feed_retention_generation = retention_generation;
-            self.scroll_offset = 0;
+            let reset_generation = self.feed.reset_generation();
+            let reset = reset_generation != self.seen_feed_reset_generation;
+            self.seen_feed_reset_generation = reset_generation;
+            if reset {
+                self.scroll_offset = 0;
+            }
+            // Front pruning leaves the tail rows intact, so a scrolled-up view
+            // (measured from the bottom) keeps its place; only the selection,
+            // whose row indices count from the top, is dropped.
             self.selection_active = false;
             self.selection_start = None;
             self.selection_end = None;
@@ -2499,23 +2799,65 @@ impl Renderer {
             crate::ui::feed::Block::new(BlockStyle::ToolResult, view.initial())
         };
         self.feed.place_block_after_anchor(anchor, block);
+        self.feed.refresh_fold_hint();
         self.chat_dirty = true;
         self.paint_written_line()
+    }
+
+    /// Run a fold change while keeping the row at the top of a scrolled-up
+    /// viewport where it is: rows inserted or removed above the viewport
+    /// bottom must not move what the reader is looking at.
+    fn anchor_scroll<R>(&mut self, change: impl FnOnce(&mut Self) -> R) -> R {
+        if self.scroll_offset == 0 {
+            return change(self);
+        }
+        let width = self.max_line_width();
+        let visible = self.visible_lines();
+        let top = self
+            .buffer_len()
+            .saturating_sub(self.scroll_offset + visible);
+        let anchor = self.feed.block_containing_line(width, top);
+        let result = change(self);
+        if let Some((index, within)) = anchor
+            && let Some((start, len)) = self.feed.block_span(width, index)
+        {
+            let new_top = start + within.min(len.saturating_sub(1));
+            self.scroll_offset = self.buffer_len().saturating_sub(visible + new_top);
+        }
+        result
     }
 
     /// Unfold, fold or toggle (`None`) the `nth` most recent tool result
     /// (1 = latest). Returns its new state, or `None` when there is none.
     pub fn set_tool_output_fold(&mut self, nth: usize, expanded: Option<bool>) -> Option<bool> {
-        let state = self.feed.set_fold(nth, expanded);
+        let state = self.anchor_scroll(|r| r.feed.set_fold(nth, expanded));
         self.chat_dirty = true;
         state
     }
 
     /// Unfold or fold every tool result. Returns how many changed.
     pub fn set_all_tool_output_folds(&mut self, expanded: bool) -> usize {
-        let changed = self.feed.set_all_folds(expanded);
+        let changed = self.anchor_scroll(|r| r.feed.set_all_folds(expanded));
         self.chat_dirty = true;
         changed
+    }
+
+    /// Which tool result (1 = latest) Ctrl+T acts on: the newest one whose
+    /// summary row is in the viewport when scrolled up, else the latest.
+    pub fn ctrl_t_fold_target(&self) -> usize {
+        if self.scroll_offset == 0 {
+            return 1;
+        }
+        let width = self.max_line_width();
+        let visible = self.visible_lines();
+        let top = self
+            .buffer_len()
+            .saturating_sub(self.scroll_offset + visible);
+        let lines = self.feed.fold_summary_lines(width);
+        lines
+            .iter()
+            .rposition(|&line| line >= top && line < top + visible)
+            .map_or(1, |pos| lines.len() - pos)
     }
 
     /// Toggle the tool result whose summary row is laid-out chat line
@@ -2523,7 +2865,7 @@ impl Renderer {
     /// is not a tool-result summary.
     pub fn toggle_tool_output_at_line(&mut self, line: usize) -> Option<bool> {
         let width = self.max_line_width();
-        let state = self.feed.toggle_fold_at_line(width, line);
+        let state = self.anchor_scroll(|r| r.feed.toggle_fold_at_line(width, line));
         if state.is_some() {
             self.chat_dirty = true;
         }
@@ -3217,7 +3559,7 @@ impl Renderer {
         write!(
             stdout,
             "{}{}{}",
-            SetForegroundColor(self.color(Color::DarkYellow)),
+            SetForegroundColor(self.color(self.palette.tool)),
             SPINNER[drawn_frame as usize],
             ResetColor
         )?;
@@ -4480,6 +4822,40 @@ mod syntax_paint_tests {
     use super::*;
     use crate::ui::highlight::TokenSpan;
     #[test]
+    fn emphasis_paints_attributes_in_colour_and_monochrome() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        renderer
+            .feed_mut()
+            .push_block(BlockStyle::Agent, "plain **bold** *it* ~~gone~~ end");
+        renderer.render_viewport().unwrap();
+        let painted = renderer.captured_output();
+        assert!(painted.contains("\x1b[1m"), "{painted:?}");
+        assert!(painted.contains("\x1b[3m"));
+        assert!(painted.contains("\x1b[9m"));
+        renderer.capture_bytes().lock().unwrap().clear();
+        renderer.set_monochrome(true);
+        renderer.render_viewport().unwrap();
+        let mono = renderer.captured_output();
+        assert!(
+            mono.contains("\x1b[1m") && mono.contains("\x1b[9m"),
+            "{mono:?}"
+        );
+        assert!(mono.contains("bold") && !mono.contains("**"));
+    }
+
+    #[test]
+    fn every_fragment_of_a_wrapped_url_links_to_the_whole_url() {
+        let mut renderer = Renderer::for_app_test().unwrap();
+        let width = renderer.line_width();
+        let url = format!("https://example.com/{}", "a".repeat(width * 2));
+        renderer.feed_mut().push_line(BlockStyle::Plain, &url);
+        renderer.render_viewport().unwrap();
+        let painted = renderer.captured_output();
+        let target = format!("\x1b]8;;{url}\x1b\\");
+        assert!(painted.matches(&target).count() >= 3, "{painted:?}");
+    }
+
+    #[test]
     fn syntax_row_paint_preserves_unicode_selection_and_plain_copy_text() {
         let entry = LineEntry {
             text: "let 雪=1;".into(),
@@ -4489,19 +4865,24 @@ mod syntax_paint_tests {
                     TokenSpan {
                         range: 0..3,
                         color: Color::Cyan,
+                        attrs: 0,
                     },
                     TokenSpan {
                         range: 4..7,
                         color: Color::Green,
+                        attrs: 0,
                     },
                     TokenSpan {
                         range: 8..9,
                         color: Color::Yellow,
+                        attrs: 0,
                     },
                 ]
                 .into(),
             ),
             theme_accent: false,
+            cont: Cont::None,
+            lead: 0,
         };
         let mut painted = Vec::new();
         paint_styled_row(&mut painted, &entry, Some((4, 7)), false).unwrap();
@@ -4585,7 +4966,7 @@ mod syntax_paint_tests {
         let mut painted = Vec::new();
         paint_styled_row(&mut painted, entry, None, false).unwrap();
         let painted = String::from_utf8(painted).unwrap();
-        assert!(painted.contains("\x1b]8;;https://example.test/path;\x1b\\"));
+        assert!(painted.contains("\x1b]8;;https://example.test/path\x1b\\"));
         assert_eq!(sanitize_output(&painted), entry.text);
     }
     #[test]
@@ -4597,10 +4978,13 @@ mod syntax_paint_tests {
                 vec![TokenSpan {
                     range: 1..2,
                     color: Color::Red,
+                    attrs: 0,
                 }]
                 .into(),
             ),
             theme_accent: false,
+            cont: Cont::None,
+            lead: 0,
         };
         let mut painted = Vec::new();
         paint_styled_row(&mut painted, &entry, None, false).unwrap();
@@ -4827,6 +5211,30 @@ mod frame_buffer_tests {
         renderer.tick_spinner().unwrap();
         let tick = renderer.frame_stats().since(before);
         assert_eq!((tick.writes, tick.flushes), (2, 2));
+    }
+
+    #[test]
+    fn the_spinner_tick_uses_the_same_colour_as_the_full_bottom_draw() {
+        let mut renderer = filled_renderer();
+        let palette = ForegroundPalette {
+            tool: Color::Rgb {
+                r: 11,
+                g: 22,
+                b: 33,
+            },
+            ..Default::default()
+        };
+        renderer.set_foreground_palette(palette);
+        renderer.render_viewport().unwrap();
+        renderer.draw_bottom("", 0, &[], 0, true).unwrap();
+        let sgr = SetForegroundColor(palette.tool).to_string();
+        if !sgr.contains("38;2;11;22;33") {
+            return; // process-level NO_COLOR suppressed ANSI colour
+        }
+        assert!(renderer.captured_output().contains(&sgr));
+        renderer.capture_bytes().lock().unwrap().clear();
+        renderer.tick_spinner().unwrap();
+        assert!(renderer.captured_output().contains(&sgr));
     }
 
     #[test]

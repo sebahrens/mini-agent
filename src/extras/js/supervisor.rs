@@ -34,6 +34,8 @@ use crate::sandbox::worker::{WorkerLaunchError, WorkerLauncher, WorkerProcess};
 /// per-frame IPC overhead: thousands of unnecessary wakeups and syscalls during long effects are
 /// now avoided. Worst-case worker-death detection latency is therefore 250ms.
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Upper bound of the escalating poll `shutdown` uses while waiting for the idle worker to exit.
+const SHUTDOWN_POLL_CAP: Duration = Duration::from_millis(50);
 /// A pipe can report EOF just before the OS makes the worker's exit status observable. Keep this
 /// window short and bounded so native resource exits retain their closed classification without a
 /// malformed or abandoned transport delaying the caller materially.
@@ -973,6 +975,9 @@ impl JsWorkerSupervisor {
             .on_send(&frame)
             .map_err(|_| WorkerError::Protocol)?;
         write_parent(&connection, frame, &cancellation, deadline).await?;
+        // The worker exits within milliseconds of the frame: poll with a short
+        // escalating delay instead of the 250 ms effect-liveness interval.
+        let mut poll = Duration::from_millis(1);
         loop {
             if connection
                 .process
@@ -994,8 +999,9 @@ impl JsWorkerSupervisor {
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
                     return Err(WorkerError::TimedOut);
                 }
-                _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {}
+                _ = tokio::time::sleep(poll) => {}
             }
+            poll = (poll * 2).min(SHUTDOWN_POLL_CAP);
         }
     }
 

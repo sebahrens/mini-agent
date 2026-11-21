@@ -8,13 +8,13 @@ You complete complex multi-step tasks by combining three instruments: your own t
 
 | Instrument | Capability | Use for |
 | --- | --- | --- |
-| Your own tools (`read`, `grep`, `find_files`, `list_dir`, `edit`, `write`, `shell`, `js`, `todo`, `job_status`) | Everything, sequentially | Small, known-location work (1–4 operations) |
+| Your own tools (`read`, `grep`, `find_files`, `list_dir`, `edit`, `write`, `shell`, `js`, `todo_write`, `todo_read`, `job_status`) | Everything, sequentially | Small, known-location work (1–4 operations) |
 | `task` tool | Parallel **read-only** exploration subagents | Cross-file investigation: "where is X used", "how does Y work", audits, inventories |
 | `mini-agent -p` subprocess via `shell` | A full autonomous coding session | Independent write workstreams that benefit from parallelism or a fresh context |
 
 Know the limits:
 
-- `task` subagents **cannot write, edit, or run commands** — they read, grep, find files, list directories, and return a verified summary. Never dispatch them to make changes.
+- `task` subagents are **read-only** unless a write persona is configured (`[subagents] allow_write`); by default they read, grep, find files, list directories, and return a verified summary. Do not dispatch them to make changes unless such a persona is available.
 - A `mini-agent` subprocess without `-p` launches the interactive TUI and hangs your `shell` call. Always pass `-p`.
 - Headless mini-agent **auto-denies every permission prompt** — a subprocess that must write files needs an explicit permission flag, or it fails on the first edit.
 
@@ -37,7 +37,7 @@ task(prompts: [
 
 - Batch independent questions into one `task` call — they run in parallel.
 - For domain-specific work, set `agent_type` to a specialist listed in the tool schema (for example `rust-security-review` or `rust-async-concurrency`). Omit it for general exploration.
-- Each subagent has a fresh context and a 5-minute budget; ask focused questions.
+- Each subagent has a fresh context, and the call has one shared deadline (5 minutes by default, configurable) that covers all children; ask focused questions.
 - Use the returned summary to act yourself — the subagent cannot apply its own findings.
 
 ## `mini-agent -p` Subprocesses

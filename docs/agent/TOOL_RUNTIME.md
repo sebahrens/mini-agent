@@ -48,11 +48,12 @@ installed-binary path because libtest is not a production worker executable.
 
 Foreground shell commands default to a 120 s deadline. `shell_timeout_secs`
 sets it between 1 and 600 seconds; the tool definition publishes the effective
-deadline. A call's millisecond `timeout` can only lower that deadline and must
-be positive. Other sandbox command classes retain their existing limits;
+deadline. A call's millisecond `timeout_ms` (alias `timeout`) can only lower that deadline and
+must be at least 1000 (a smaller value is refused with a "did you mean N000" hint, because
+models often pass seconds). Other sandbox command classes retain their existing limits;
 brokered JS `spawn` is bounded by the remaining `js-step-timeout-secs` deadline. A shell call with
 `background = true` instead returns a session-scoped job id immediately and
-uses a 24-hour maximum (again lowerable with `timeout`).
+uses a 24-hour maximum (again lowerable with `timeout_ms`).
 
 With `auto_background = true` on the call (or `shell_auto_background = true` in
 config) a foreground command runs as a job from the start: if it finishes
@@ -170,7 +171,7 @@ hosts, on Seatbelt and Linux bwrap (Unix-socket proxy plus the in-namespace forw
 
 | Command class | Deadline |
 |---------------|----------|
-| `shell` foreground | `shell_timeout_secs` (default 120 s, 1..=600); call `timeout` can only lower it; optional promotion to a job |
+| `shell` foreground | `shell_timeout_secs` (default 120 s, 1..=600); call `timeout_ms` can only lower it; optional promotion to a job |
 | `shell` background job | 24 h, call `timeout` can lower it |
 | `!` commands (TUI and headless) | `command_timeout_secs` (default 120 s, 1..=600); a leading `!timeout=<s>` sets one command's deadline |
 | Loop and goal validation commands | Their own configured validation limits |
@@ -643,15 +644,18 @@ held-out skill tests) keep the strict 64 KiB contract and fail with
 ## Turn-scoped cron tool
 
 `schedule_wakeup` (`src/agent/tools/schedule_wakeup.rs`) is the one tool that
-is registered per turn rather than at agent build. When a self-paced `/cron`
-schedule fires, the TUI arms `AgentRunState::cron_wakeup`, and the
-`QuestionOrigin::Scheduled` start (`start_main_run_with_directive`) adds the
-tool to the agent's shared tool server (`AnyAgent::add_turn_tool`) after the
-agent is resolved and before the first request; a mid-turn context-relief
-respawn adds it again. `App::settle_dynamic_cron_turn` removes it
-(`AnyAgent::remove_turn_tool`) when that turn ends, is interrupted, or fails to
-start, before any queued input can start the next turn. Ordinary turns, interval
-fires, subagents and side questions (their own tool servers), headless `-p` and
+is registered at run time rather than at agent build. When a self-paced `/cron`
+schedule first fires, the TUI creates `AgentRunState::cron_wakeup_cell` and
+`start_main_run_with_directive` adds the tool to the agent's shared tool server
+(`AnyAgent::add_turn_tool`, idempotent) at the start of every turn while that
+cell exists, so a rebuilt agent keeps the same tool list. The tool list is part
+of the provider's cached prompt prefix, so it stays unchanged between cron and
+ordinary turns. The per-fire slot is armed in the cell for the fire's turn and
+disarmed by `App::settle_dynamic_cron_turn`; a call while no cron turn is armed
+returns "only valid in a turn started by a self-paced /cron schedule". The tool
+is removed (`AnyAgent::remove_turn_tool`) when the last self-paced entry ends at
+a turn settlement. Sessions with no self-paced entry,
+subagents and side questions (their own tool servers), headless `-p` and
 ACP never register it; the name is reserved against MCP shadowing and counts
 as non-mutating. Its parameters are `delay_secs` (integer, clamped to
 60..=3600), `reason` (string, kept as one line of at most 200 characters) and
@@ -1054,6 +1058,34 @@ are preserved.
 an owned Unix child held before exec. Explicit unlock ends the lock's ownership
 before receipt acknowledgement; inherited descriptors cannot extend it after
 the ledger operation completes. Corrupt-tail failures retain bytes and charges.
+
+### Unknown tool names and malformed arguments
+
+A call to a tool name that is not advertised for the turn (`bash` for `shell`,
+`multi_tool_use.parallel`, a deferred MCP tool that was never loaded) does not end the run. The
+`ToolLoopGuard` hook answers Rig's invalid-tool-call event with `Flow::skip`, so the model gets a
+paired tool result: `Tool \`bash\` is not available; it was not executed. Did you mean: shell?`
+followed by the available names, and the rest of the batch is suppressed by Rig. `retry::is_retryable`
+never classifies `UnknownToolCall`, `PromptCancelled` or `MaxTurnsError` as transient, whatever tool
+names their text contains.
+
+Chat Completions streams whose tool-call argument text is not valid JSON are no longer dropped
+silently when the provider finished with `tool_calls`: the call is kept with
+`{"__invalid_json": "<raw, 2 KiB max>", "__invalid_json_error": "<parse error>"}` and `ToolLoopGuard`
+answers it with a corrective result asking for a valid JSON object (`patched-deps/rig-core`, see
+`PATCH.md`).
+
+### Tool classification
+
+`agent::tools::tool_class` is the single table behind "may this call change the workspace"
+(`tool_may_mutate_workspace`, which gates `verify_command` and the goal round summary) and the
+read-loop guard (`is_evidence_read`, `invalidates_evidence`). Listed read-only and evidence tools
+(`read`, `grep`, `find_files`, `list_dir`, `todo_read`, `skills_search`, `lsp_navigate`,
+`memory_read`, `memory_search`, `web_fetch`, `web_search`, `job_status`, `task_evidence`, `advisor`,
+`lsp_diagnostics`, MCP resource tools, `ask_user_question`, `schedule_wakeup`) never count as
+mutations; anything else, including MCP tools, is treated as mutating. A completed mutating call also
+resets the identical-failure counters of `ToolLoopGuard`, so a call that failed before an edit can run
+again after it.
 
 ### Unknown tool arguments
 
@@ -2270,3 +2302,22 @@ plus their bounded metadata may accompany that tail. Image bytes cannot hide an
 over-budget tail, and compaction stops rather than repeatedly summarizing an
 unshrinkable image-only recap. Active retained pixels remain recoverable in the
 saved session under the retention limits above.
+
+## Tool result and argument conventions (2026-11-21 review)
+
+- A missing path or a directory given to `read`, `edit`, `grep`, `find_files` or `list_dir` returns
+  `<tool>: '<path>' does not exist. <next step>` (or `is a directory` for `read`) instead of a raw
+  errno string.
+- A shell command that exits 0 and prints nothing returns `[exit code 0; no output]`. When the line
+  cap drops lines and the full output was saved to a log, the omission marker names the log instead
+  of suggesting a re-run.
+- `grep`, `find_files` and `list_dir` validate arguments before any permission prompt, and all
+  three reject a per-call cap of 0 with an example, and serve one above the configured cap at the
+  cap with a one-line note. `grep` context
+  lines use the same shape as match lines: `path:N:text` and `path:N-text`.
+- Numeric and boolean arguments of the built-in tools also accept string spellings (`"200"`,
+  `"true"`) and integral floats; other type errors name the field.
+- Tool descriptions for `grep`, `find_files` and `list_dir` list the directories skipped according
+  to `[tool_limits] skip_dirs`.
+- `read` keeps the last parsed PDF (up to 32 MiB of source) so consecutive `pages` windows of one
+  unchanged file parse it once.

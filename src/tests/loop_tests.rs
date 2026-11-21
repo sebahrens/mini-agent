@@ -276,6 +276,7 @@ async fn goal_verification_stays_interruptible_and_ignores_a_superseded_result()
     let superseded = crate::event::GoalVerificationEvent {
         operation_id: crate::event::ValidationOperationId(stale_id.0 + 1),
         checks: Some(crate::extras::goal::gate::CheckOutcome {
+            failure_kind: Default::default(),
             all_passed: true,
             failure_tail: None,
             verified: vec![crate::extras::goal::VerificationKind::Checks],

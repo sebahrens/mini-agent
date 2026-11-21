@@ -277,6 +277,29 @@ fn regen_resource(
 /// Validate the complete configured policy before any provider, model, tool,
 /// transport, or UI construction. All execution modes share `Startup::init`,
 /// including ACP, headless print, loop, and interactive startup.
+/// Marker recording that the one-time recommended-MCP questions were asked.
+#[cfg(feature = "mcp")]
+fn onboarding_marker() -> Option<std::path::PathBuf> {
+    crate::paths::process_paths_ref()
+        .ok()
+        .map(|paths| paths.data_dir.join("onboarding_done"))
+}
+
+/// The one-time "Enable Context7 / Grep.app MCP?" questions are due in an
+/// interactive session while a choice is still unset and they were never
+/// asked. Decided from config content and a marker, not from whether the
+/// config file already existed: a first `--setup`, `--print-config` or `-p`
+/// run creates that file without ever reaching the questions.
+#[cfg(feature = "mcp")]
+fn recommended_mcp_prompt_due(
+    is_interactive: bool,
+    context7: Option<bool>,
+    grepapp: Option<bool>,
+    marker_exists: bool,
+) -> bool {
+    is_interactive && !marker_exists && (context7.is_none() || grepapp.is_none())
+}
+
 fn validate_startup_permission_policy(cli: &Cli, cfg: &Config) -> anyhow::Result<()> {
     let authority = crate::permission::resolve_execution_authority(
         cli,
@@ -1124,14 +1147,15 @@ async fn compact_headless_session(
     if let Some(compacted) = &compacted {
         // The auto-compacting line announced the work; say what it did so a
         // script log shows the run was compacted (mini-agent-sskdu.243).
+        let freed = session
+            .compactions
+            .last()
+            .map_or(0, |compaction| compaction.token_savings);
         eprintln!(
-            "compacted {} messages into a summary (freed ~{} tokens net)",
+            "compacted {} messages into a summary (freed ~{freed} tokens net)",
             compacted.first_kept_index,
-            session
-                .compactions
-                .last()
-                .map_or(0, |compaction| compaction.token_savings),
         );
+        crate::print::record_headless_compaction(compacted.first_kept_index, freed);
     }
     Ok((
         compacted
@@ -1498,7 +1522,10 @@ impl Startup {
         if cli.input_format() == crate::cli::InputFormat::StreamJson
             && cli.output_format() != OutputFormat::StreamJson
         {
-            anyhow::bail!("--input-format stream-json requires --output stream-json");
+            return Err(HeadlessUsageError(
+                "--input-format stream-json requires --output stream-json".to_owned(),
+            )
+            .into());
         }
         #[allow(unused_mut)]
         let mut expand_custom =
@@ -1568,6 +1595,14 @@ impl Startup {
             }
             // Headless: a usage error (exit 2) with a machine-readable
             // failure record, before any provider/session setup.
+            let message = error.to_string();
+            crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message).await?;
+            return Err(HeadlessUsageError(message).into());
+        }
+        if let Err(error) = cli.validate_tool_allowlist(&cfg) {
+            if !cli.print {
+                return Err(error);
+            }
             let message = error.to_string();
             crate::print::emit_headless_preflight_failure(&cli, workspace.root(), &message).await?;
             return Err(HeadlessUsageError(message).into());
@@ -1688,7 +1723,9 @@ impl Startup {
                             skip.reason
                         );
                     }
-                    anyhow::bail!("no session matching '{}'", session_id);
+                    return Err(
+                        HeadlessUsageError(format!("no session matching '{session_id}'")).into(),
+                    );
                 }
                 session::storage::SessionSelection::Ambiguous(sessions) => {
                     eprintln!("multiple sessions match '{}':", session_id);
@@ -1719,7 +1756,12 @@ impl Startup {
         }
 
         if let Some(original) = fork_source {
-            anyhow::ensure!(session_resumed, "--fork-session requires a saved session");
+            if !session_resumed {
+                return Err(HeadlessUsageError(
+                    "--fork-session requires a saved session".to_owned(),
+                )
+                .into());
+            }
             // A cross-workspace selection has already created its fresh fork.
             if session.id == original {
                 session = session::lock::fork_at_turn(&session, None)?;
@@ -1767,9 +1809,11 @@ impl Startup {
             Some(resolve_resume_provider_decision(&cli, &cfg, &session)?)
         } else {
             if cli.resume_provider.is_some() || cli.resume_model.is_some() {
-                anyhow::bail!(
+                return Err(HeadlessUsageError(
                     "--resume-provider/--resume-model require --continue or --session with an existing saved session"
-                );
+                        .to_owned(),
+                )
+                .into());
             }
             None
         };
@@ -2334,7 +2378,12 @@ impl Startup {
 
         // Recommended MCP prompts on first startup
         #[cfg(feature = "mcp")]
-        if self.is_first_startup && self.is_interactive {
+        if recommended_mcp_prompt_due(
+            self.is_interactive,
+            self.cfg.enable_context7_mcp,
+            self.cfg.enable_grepapp_mcp,
+            onboarding_marker().is_some_and(|marker| marker.exists()),
+        ) {
             let prompted =
                 self.cfg.enable_context7_mcp.is_none() || self.cfg.enable_grepapp_mcp.is_none();
             if prompted {
@@ -2366,6 +2415,10 @@ impl Startup {
                 config::inject_mcp_defaults(&mut self.cfg);
                 if let Err(e) = config::save_config_changes(&config_before_prompts, &self.cfg) {
                     tracing::warn!("Failed to save config with MCP choices: {e}");
+                }
+                if let Some(marker) = onboarding_marker() {
+                    let _ = std::fs::create_dir_all(marker.parent().unwrap_or(&marker));
+                    let _ = std::fs::write(&marker, b"recommended MCP servers offered\n");
                 }
             }
         }
@@ -2503,10 +2556,12 @@ impl Startup {
                     self.client = new_client;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to rebuild client for prompt-mapped provider '{}': {}",
-                        self.provider,
-                        e
+                    // Continuing would send the mapped provider's model id to
+                    // the original provider while the session records the
+                    // mapped one.
+                    anyhow::bail!(
+                        "`prompt_to_model` maps the active prompt to provider '{}', but its client cannot be built: {e:#}",
+                        self.provider
                     );
                 }
             }
@@ -2934,7 +2989,7 @@ impl Startup {
         let identity = (self.session.id.to_string(), self.session.name.to_string());
         let result = heap_future(|| self.dispatch_print_inner()).await;
         if let Err(error) = &result
-            && output_format == OutputFormat::StreamJson
+            && output_format != OutputFormat::Text
             && !crate::print::headless_result_emitted()
         {
             crate::print::emit_headless_failure(
@@ -2975,14 +3030,13 @@ impl Startup {
     }
 
     async fn dispatch_print_inner(&mut self) -> anyhow::Result<()> {
-        let mut msg = self.cli.message.join(" ").trim().to_string();
+        let msg = self.cli.message.join(" ").trim().to_string();
         #[cfg_attr(not(feature = "multimodal"), allow(unused_variables))]
         let media = self.take_headless_media(msg.starts_with('!'))?;
         let schema = self.cli.loaded_output_schema.clone();
-        if let Some(schema) = &schema {
-            msg.push_str("\n\n");
-            msg.push_str(&schema.instructions());
-        }
+        // The schema contract is host text for this request only: a directive
+        // keeps it out of the saved prompt, hooks, title and chat history.
+        let schema_directive = schema.as_ref().map(|schema| schema.instructions());
         let output = crate::print::HeadlessOutputPolicy::from_cli(&self.cli);
         let json_output = output.format != OutputFormat::Text;
         let identity = (self.session.id.to_string(), self.session.name.to_string());
@@ -3127,7 +3181,8 @@ impl Startup {
                     "message is too large to fit in the context window \
                      (estimated {pending_tokens} tokens; overhead {oh} tokens; \
                      window {cw} tokens; reserve {reserve} tokens): \
-                     reduce the message size or clear the session with /clear",
+                     reduce the message size, or start fresh by omitting \
+                     --continue/--session (or pass --no-session)",
                     oh = self.session.overhead_tokens,
                     cw = self.session.context_window,
                 );
@@ -3246,7 +3301,15 @@ impl Startup {
             // state it did when it was taken before MCP connect.
             let change_baseline = join_change_baseline(baseline_task).await;
             #[cfg(feature = "subagents")]
-            let agent = agent.with_headless_turn_directive(self.headless_agent_directive.take());
+            let agent_directive = self.headless_agent_directive.take();
+            #[cfg(not(feature = "subagents"))]
+            let agent_directive: Option<String> = None;
+            let agent = agent.with_headless_turn_directive(
+                match (agent_directive, schema_directive.clone()) {
+                    (Some(first), Some(second)) => Some(format!("{first}\n\n{second}")),
+                    (first, second) => first.or(second),
+                },
+            );
             #[cfg(all(feature = "hooks", feature = "mcp"))]
             if let Some(scope) = crate::agent::runner::current_hook_work_scope() {
                 scope.set_hook_mcp_peers(
@@ -3968,6 +4031,34 @@ fn apply_goal_flags(cli: &Cli, cfg: &config::Config, session: &Session) -> anyho
         .map(str::trim)
         .filter(|o| !o.is_empty())
     else {
+        if cli.goal_args.goal_resume {
+            if cli.resolve_no_tools(cfg) {
+                anyhow::bail!("a goal needs the goal_report tool; remove --no-tools");
+            }
+            let max_rounds = cli.goal_args.goal_max_rounds;
+            let resumed = session.goal_store.with_mut(|goal| {
+                if let Some(max_rounds) = max_rounds {
+                    goal.bounds.max_rounds = max_rounds.max(1);
+                }
+                goal.resume()
+            });
+            return match resumed {
+                Some(true) => Ok(()),
+                Some(false) => anyhow::bail!(
+                    "the session's goal is finished and cannot resume; start a new one with --goal"
+                ),
+                None => anyhow::bail!("--goal-resume needs a session with a goal (use --continue)"),
+            };
+        }
+        // The answer to a goal's question is what it was waiting for, as in
+        // the terminal: with a prompt given, the goal resumes.
+        if !cli.message.is_empty() {
+            session.goal_store.with_mut(|goal| {
+                if goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
+                    goal.resume();
+                }
+            });
+        }
         if has_live_goal && cli.resolve_no_tools(cfg) {
             anyhow::bail!(
                 "this session has an unfinished goal, which needs the goal_report tool; \
@@ -4998,6 +5089,7 @@ async fn run_headless_goal_rounds_inner(
                 &session.provider,
                 &session.model,
             );
+            session.goal_store.record_judge(judge.as_ref());
             // The round that just ran is persisted after the gate settles, so
             // the session does not contain it yet and the judge would be shown
             // every round except the one it was asked about. The turn's own
@@ -5768,7 +5860,7 @@ pub(crate) fn current_environment_record(
     }
 }
 
-/// Notices a session entered after startup (the `/resume` picker, `/fork`,
+/// Notices a session entered after startup (the `/sessions` picker, `/fork`,
 /// `/import`) owes the model, as a `--resume` launch already gives it: the
 /// environment-change notice and the "child ids are no longer resumable"
 /// notice. Subagent conversations live in memory only, so a saved
@@ -5803,6 +5895,24 @@ fn tool_set_label(no_tools: bool, allowlist: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn recommended_mcp_questions_survive_a_non_interactive_first_run() {
+        use super::recommended_mcp_prompt_due;
+        // A headless first run creates the config file but asks nothing; the
+        // next interactive start must still ask (choices unset, no marker).
+        assert!(!recommended_mcp_prompt_due(false, None, None, false));
+        assert!(recommended_mcp_prompt_due(true, None, None, false));
+        assert!(recommended_mcp_prompt_due(true, Some(true), None, false));
+        assert!(!recommended_mcp_prompt_due(
+            true,
+            Some(false),
+            Some(true),
+            false
+        ));
+        assert!(!recommended_mcp_prompt_due(true, None, None, true));
+    }
+
     #[test]
     fn explicit_model_flags_pin_startup_model_against_prompt_to_model() {
         use super::*;
@@ -5840,7 +5950,7 @@ mod tests {
     /// that `Session::sync_environment` compares on resume: an unchanged tool
     /// set must not look like a change, and a changed one must produce the
     /// resume notice (mini-agent-jn5e7).
-    // mini-agent-ji9iy: a session entered after startup (/resume picker, /fork,
+    // mini-agent-ji9iy: a session entered after startup (/sessions picker, /fork,
     // /import) gets the stale-child-id and environment-change notices exactly
     // once, as a `--resume` launch does.
     #[test]
@@ -9040,5 +9150,20 @@ mod headless_session_lifetime_tests {
             next_pool.ensure_open().is_err(),
             "EOF closes admission for the same retained pool"
         );
+    }
+}
+
+#[cfg(all(test, feature = "hooks"))]
+mod pre_compact_once_tests {
+    #[tokio::test]
+    async fn pre_compact_is_announced_once_per_compaction() {
+        // mini-agent-sskdu.239: the fork and the text path share one flag.
+        let sent = std::sync::atomic::AtomicBool::new(false);
+        super::dispatch_pre_compact_once(&sent, None).await;
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
+        // A second request of the same compaction must not dispatch again; the
+        // flag staying set is the observable contract.
+        super::dispatch_pre_compact_once(&sent, None).await;
+        assert!(sent.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

@@ -389,7 +389,7 @@ impl Tool for ShellTool {
             "Execute a {dialect} command in the current working directory. Foreground commands have a hard \
              {} second deadline and bounded output. Set background=true for builds, test suites, or servers; \
              this returns a session-scoped job id for the job_status tool and uses a 24 hour maximum. The \
-             optional timeout can lower the applicable deadline. Commands keep the same sandbox and permission \
+             optional timeout_ms (milliseconds) can lower the applicable deadline. Commands keep the same sandbox and permission \
              policy in either mode.",
             self.foreground_timeout.as_secs()
         );
@@ -421,11 +421,11 @@ impl Tool for ShellTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string", "description": format!("{dialect} command to execute") },
-                "timeout": {
+                "timeout_ms": {
                     "type": "integer",
-                    "minimum": 1,
+                    "minimum": 1000,
                     "maximum": 86_400_000,
-                    "description": format!("Lower command deadline in milliseconds (optional; maximum {} foreground or 86400000 background)", self.foreground_timeout.as_secs() * 1000)
+                    "description": format!("Lower command deadline in MILLISECONDS, not seconds: 120000 is two minutes (optional; at least 1000; maximum {} foreground or 86400000 background)", self.foreground_timeout.as_secs() * 1000)
                 },
                 "workdir": {
                     "type": "string",
@@ -652,7 +652,7 @@ impl ShellTool {
                 "foreground"
             };
             return Err(ToolError::Msg(format!(
-                "shell timeout must be between 1 and {} milliseconds for {mode} commands. For longer foreground work, use a background job. Example: {{\"command\":\"cargo test\",\"background\":true,\"timeout\":120000}}",
+                "shell timeout must be between 1 and {} milliseconds for {mode} commands. For longer foreground work, use a background job. Example: {{\"command\":\"cargo test\",\"background\":true,\"timeout_ms\":120000}}",
                 maximum.as_millis()
             )));
         }
@@ -832,10 +832,26 @@ impl ShellTool {
             }
             result.push_str(&termination);
         }
+        let failed = output.exit_status.is_some_and(|status| !status.success());
+        if let Some(note) =
+            sandbox_failure_note(&self.sandbox, self.allow_escalation, failed, &result)
+        {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&note);
+        }
 
         let transcript = self.spill_line_capped_output(transcript, &result);
-        let mut result = bound_output_lines(result, self.max_output_lines);
+        let mut result = bound_output_lines(result, self.max_output_lines, &transcript);
         push_log_footer(&mut result, &transcript);
+        if result.is_empty()
+            && output
+                .exit_status
+                .is_some_and(|status| status.code() == Some(0))
+        {
+            result = SUCCESS_NO_OUTPUT.to_string();
+        }
 
         let result = match coaching {
             Some(msg) => format!("{}\n\n{}", msg, result),
@@ -981,9 +997,21 @@ impl ShellTool {
             }
             result.push_str(&ended);
         }
+        let failed = snapshot.exit_code.is_some_and(|code| code != 0) || snapshot.signal.is_some();
+        if let Some(note) =
+            sandbox_failure_note(&self.sandbox, self.allow_escalation, failed, &result)
+        {
+            if !result.is_empty() && !result.ends_with('\n') {
+                result.push('\n');
+            }
+            result.push_str(&note);
+        }
         let transcript = self.spill_line_capped_output(transcript, &result);
-        let mut result = bound_output_lines(result, self.max_output_lines);
+        let mut result = bound_output_lines(result, self.max_output_lines, &transcript);
         push_log_footer(&mut result, &transcript);
+        if result.is_empty() && snapshot.exit_code == Some(0) {
+            result = SUCCESS_NO_OUTPUT.to_string();
+        }
         Ok(Some(result))
     }
 }
@@ -1390,14 +1418,14 @@ impl Tool for JobStatusTool {
                 "input": {
                     "type": "string",
                     "maxLength": 16384,
-                    "description": "Only with action=input: text written to the job's terminal as typed, at most 16384 bytes; include \\n to press Enter. The text is permission-checked like a shell command, together with any unterminated line already typed. C0 control characters other than newline and carriage return (Tab, Ctrl-U, Ctrl-C, backspace, ESC, DEL) are refused because a terminal would act on them (completion, line editing, signals); so are history expansions (`!` followed by text, a line starting with `^`). Use keys for Ctrl-C, Ctrl-D, Esc and arrows. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
+                    "description": "Only with action=input: text typed into the pty=true job's terminal (at most 16384 bytes; include \\n to press Enter), permission-checked like a shell command. Control characters other than newline and carriage return, and history expansions, are refused; use keys for Ctrl-C, Ctrl-D, Esc and arrows. Writing gives up after 5 seconds if the program is not reading; the result shows the output produced until it goes quiet (at most 3 seconds)."
                 },
                 "keys": {
                     "type": "array",
                     "minItems": 1,
                     "maxItems": MAX_JOB_KEYS,
                     "items": {"type": "string", "enum": JobKey::NAMES},
-                    "description": "Only with action=input, instead of input: named keys pressed in order (ctrl_c interrupts the foreground program, ctrl_d sends EOF, ctrl_z suspends it, ctrl_l redraws the screen, plus esc, arrows, page_up, page_down, home, end, delete, shift_tab, f1..f12, tab, enter, backspace for pagers, TUIs and REPLs). The tool renders the bytes. ctrl_c and ctrl_d are always allowed; enter judges the typed line like input; cursor, history, function and esc keys make the line unknowable so the next enter is judged as an opaque edited line (use ctrl_c to clear it); tab on a partly typed line is refused."
+                    "description": "Only with action=input, instead of input: named keys pressed in order, for pagers, TUIs and REPLs. ctrl_c and ctrl_d are always allowed; enter is judged like input; cursor, history, function and esc keys make the line unknowable so the next enter is judged as an opaque edited line (ctrl_c clears it); tab on a partly typed line is refused."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -2148,13 +2176,31 @@ fn render_background_job(output: BackgroundJobOutput, max_output_lines: Option<u
 /// short tail around an omitted-count marker so the model sees how the output
 /// starts and ends (exit codes and final errors live at the end). `None`
 /// returns the text unchanged.
-fn bound_output_lines(text: String, max_output_lines: Option<u64>) -> String {
-    bound_output_lines_with_hint(
-        text,
-        max_output_lines,
-        "re-run with a narrower invocation or pipe through `head`/`tail`/`grep` to see the rest",
-    )
+fn bound_output_lines(
+    text: String,
+    max_output_lines: Option<u64>,
+    transcript: &OutputTranscript,
+) -> String {
+    match &transcript.log {
+        Some(log) => bound_output_lines_with_hint(
+            text,
+            max_output_lines,
+            &format!(
+                "the omitted lines are saved in the output log {}; read or grep that log instead of re-running the command",
+                log.path.display()
+            ),
+        ),
+        None => bound_output_lines_with_hint(
+            text,
+            max_output_lines,
+            "re-run with a narrower invocation or pipe through `head`/`tail`/`grep` to see the rest",
+        ),
+    }
 }
+
+/// Positive confirmation for a command that exited 0 and printed nothing, so
+/// an empty tool result is never mistaken for a dropped one.
+const SUCCESS_NO_OUTPUT: &str = "[exit code 0; no output]";
 
 fn bound_output_lines_with_hint(text: String, max_output_lines: Option<u64>, hint: &str) -> String {
     let Some(cap) = max_output_lines else {
@@ -2174,12 +2220,69 @@ fn bound_output_lines_with_hint(text: String, max_output_lines: Option<u64>, hin
     .unwrap_or(text)
 }
 
+/// Output fragments that a sandbox denial produces and that an unrelated
+/// failure rarely does. Matched case-insensitively against the retained output.
+const SANDBOX_FAILURE_MARKERS: [&str; 6] = [
+    "operation not permitted",
+    "read-only file system",
+    "could not resolve host",
+    "network is unreachable",
+    "sandbox-exec",
+    "bwrap:",
+];
+
+/// One bracketed line telling the model (and user) that a failed command may
+/// have been stopped by the sandbox rather than by its own logic
+/// (mini-agent-sskdu.143). `None` unless containment was requested, the
+/// command failed and the output carries a known sandbox marker.
+fn sandbox_failure_note(
+    sandbox: &Sandbox,
+    allow_escalation: bool,
+    failed: bool,
+    output: &str,
+) -> Option<String> {
+    if !failed || !sandbox.containment_requested() {
+        return None;
+    }
+    let lowered = output.to_ascii_lowercase();
+    if !SANDBOX_FAILURE_MARKERS
+        .iter()
+        .any(|marker| lowered.contains(marker))
+    {
+        return None;
+    }
+    let mut note = format!(
+        "[sandbox: profile {}, network {}. This failure may be the sandbox, not the command.",
+        sandbox.profile().name(),
+        sandbox.network().name()
+    );
+    if sandbox.profile() != crate::sandbox::SandboxProfile::HostFull {
+        note.push_str(" Writes are limited to the workspace.");
+    }
+    note.push_str(" See /sandbox");
+    if allow_escalation {
+        note.push_str("; escalate=true runs one command unsandboxed after user approval");
+    }
+    note.push(']');
+    Some(note)
+}
+
 fn resource_limit_error(
     status: CommandStatus,
     transcript: &OutputTranscript,
     limits: CommandLimits,
     max_output_lines: Option<u64>,
 ) -> ToolError {
+    if status == CommandStatus::NotStarted {
+        // The captured text is this program's own explanation (a refused or
+        // failed launch), not partial output of the command.
+        let reason = String::from_utf8_lossy(&transcript.channel_bytes(OutputChannel::Stderr))
+            .trim()
+            .to_string();
+        return ToolError::Msg(format!(
+            "[status: not_started; the command was not run] {reason}"
+        ));
+    }
     let metadata = match status {
         CommandStatus::TimedOut => format!(
             "[status: timed_out; timeout_ms: {}]",
@@ -2197,9 +2300,11 @@ fn resource_limit_error(
             )
         }
         CommandStatus::Failed => "[status: failed]".to_string(),
+        CommandStatus::NotStarted => unreachable!("handled above"),
         CommandStatus::Completed => unreachable!("completed output is handled before this helper"),
     };
-    let mut partial = bound_output_lines(render_transcript(transcript), max_output_lines);
+    let mut partial =
+        bound_output_lines(render_transcript(transcript), max_output_lines, transcript);
     push_log_footer(&mut partial, transcript);
     let message = if partial.is_empty() {
         metadata
@@ -2359,6 +2464,12 @@ mod tests {
             .await
             .unwrap();
         assert!(result.contains("lines omitted"), "{result}");
+        // mini-agent-sskdu.95: the marker points at the log, not at a re-run.
+        assert!(!result.contains("re-run with a narrower"), "{result}");
+        assert!(
+            result.contains("the omitted lines are saved in the output log"),
+            "{result}"
+        );
         let footer = result
             .lines()
             .find(|line| line.contains("saved to"))
@@ -2382,6 +2493,26 @@ mod tests {
             .unwrap();
         assert!(!small.contains("saved to"), "{small}");
         assert_eq!(std::fs::read_dir(&logs).unwrap().count(), 1);
+    }
+
+    // mini-agent-sskdu.85: a successful command with no output is confirmed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn successful_command_without_output_reports_exit_zero() {
+        let dir = crate::tests::support::temp::TempDir::new("no-output");
+        for command in [
+            "true".to_string(),
+            format!("printf x > {}", dir.path().join("f").display()),
+        ] {
+            let output = test_tool()
+                .call(BashArgs {
+                    command,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(output, "[exit code 0; no output]");
+        }
     }
 
     #[cfg(unix)]
@@ -2644,7 +2775,7 @@ mod tests {
         let tool = test_tool().with_foreground_timeout_secs(u64::MAX);
         assert!(tool.description().contains("600 second deadline"));
         assert!(
-            tool.parameters()["properties"]["timeout"]["description"]
+            tool.parameters()["properties"]["timeout_ms"]["description"]
                 .as_str()
                 .unwrap()
                 .contains("600000 foreground")
@@ -3072,7 +3203,9 @@ mod tests {
             .to_string();
 
         assert!(error.contains("between 1 and 120000 milliseconds"));
-        assert!(error.contains(r#"{"command":"cargo test","background":true,"timeout":120000}"#));
+        assert!(
+            error.contains(r#"{"command":"cargo test","background":true,"timeout_ms":120000}"#)
+        );
     }
 
     #[cfg(unix)]
@@ -3169,6 +3302,65 @@ mod tests {
         );
         assert_eq!(output.stdout.len(), limits.stdout_bytes);
         assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn sandbox_failure_note_needs_containment_a_failure_and_a_known_marker() {
+        let on = Sandbox::new(true, "bwrap");
+        let off = Sandbox::new(false, "bwrap");
+        for output in [
+            "touch: /Users/x/.cache/foo: Operation not permitted",
+            "rm: x: Read-only file system",
+            "curl: (6) Could not resolve host: example.com",
+            "connect: Network is unreachable",
+            "sandbox-exec: sandbox_apply: denied",
+            "bwrap: Can't mount proc",
+        ] {
+            let note = sandbox_failure_note(&on, false, true, output)
+                .unwrap_or_else(|| panic!("no note for {output}"));
+            assert!(
+                note.starts_with("[sandbox: profile workspace, network deny."),
+                "{note}"
+            );
+            assert!(
+                note.contains("may be the sandbox, not the command"),
+                "{note}"
+            );
+            assert!(note.contains("/sandbox"), "{note}");
+            assert!(!note.contains("escalate"), "{note}");
+            assert_eq!(sandbox_failure_note(&off, false, true, output), None);
+            assert_eq!(sandbox_failure_note(&on, false, false, output), None);
+        }
+        assert_eq!(
+            sandbox_failure_note(&on, false, true, "grep: no match"),
+            None
+        );
+        assert!(
+            sandbox_failure_note(&on, true, true, "Operation not permitted")
+                .unwrap()
+                .contains("escalate=true")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_launch_is_reported_as_not_started_not_as_partial_output() {
+        let tool = ShellTool::new(None, None, Sandbox::new(true, "no-such-backend"), None);
+        let error = tool
+            .call(BashArgs {
+                command: "echo hi".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("[status: not_started; the command was not run] "),
+            "{error}"
+        );
+        assert!(!error.contains("partial"), "{error}");
+        assert!(!error.contains("[stderr]"), "{error}");
+        assert!(!error.contains("[status: failed]"), "{error}");
     }
 
     #[cfg(unix)]

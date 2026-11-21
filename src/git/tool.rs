@@ -2358,7 +2358,7 @@ fn mutation_status(
         CommandStatus::TimedOut => "timed_out",
         CommandStatus::Cancelled => "cancelled",
         CommandStatus::OutputLimitExceeded(_) => "output_limit_exceeded",
-        CommandStatus::Failed => "failed",
+        CommandStatus::Failed | CommandStatus::NotStarted => "failed",
     }
 }
 

@@ -342,42 +342,100 @@ fn validate_toml_bounds_at(
 /// Parse repeated operator overrides as bounded literal TOML. Diagnostics never
 /// include the supplied key or value (a key can itself contain a credential).
 pub(crate) fn parse_overrides(args: &[String]) -> Result<Vec<toml::Value>, &'static str> {
+    parse_overrides_indexed(args).map_err(|(_, message)| message)
+}
+
+/// `parse_overrides` for the `--config` flag: names the failing override by its
+/// 1-based position and adds a fix hint that never echoes the typed key or
+/// value (a key can itself contain a credential).
+pub(crate) fn parse_cli_overrides(args: &[String]) -> Result<Vec<toml::Value>, String> {
+    parse_overrides_indexed(args).map_err(|(index, message)| {
+        let Some(index) = index else {
+            return message.to_owned();
+        };
+        let mut text = format!("--config #{}: {message}", index + 1);
+        let argument = &args[index];
+        if message.starts_with("invalid config override literal") {
+            text.push_str("; strings need TOML quotes, for example --config 'model=\"gpt-5\"'");
+        } else if message.starts_with("unknown config override key") {
+            let key = split_override(argument)
+                .ok()
+                .map(|(key, _)| {
+                    key.split('.')
+                        .next()
+                        .unwrap_or(key)
+                        .trim()
+                        .trim_matches(['"', '\''])
+                })
+                .and_then(super::keys::nearest_known_key);
+            if let Some(nearest) = key {
+                text.push_str(&format!("; did you mean `{nearest}`?"));
+            }
+        }
+        text
+    })
+}
+
+/// Split `key=literal` at the first `=` outside quotes.
+fn split_override(argument: &str) -> Result<(&str, &str), &'static str> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (at, character) in argument.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quote == Some('"') && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(active) = quote {
+            if character == active {
+                quote = None;
+            }
+        } else if character == '\'' || character == '"' {
+            quote = Some(character);
+        } else if character == '=' {
+            return Ok((&argument[..at], &argument[at + 1..]));
+        }
+    }
+    Err("config override requires key=literal TOML (values omitted)")
+}
+
+fn parse_overrides_indexed(
+    args: &[String],
+) -> Result<Vec<toml::Value>, (Option<usize>, &'static str)> {
     if args.len() > 64 || args.iter().map(String::len).sum::<usize>() > MAX_LAYER_BYTES {
-        return Err("too many or oversized config overrides (values omitted)");
+        return Err((
+            None,
+            "too many or oversized config overrides (values omitted)",
+        ));
+    }
+    if args.is_empty() {
+        // No override: skip generating and compiling the config schema.
+        return Ok(Vec::new());
     }
     let validator = jsonschema::validator_for(&super::schema::generate())
-        .map_err(|_| "config schema is unavailable")?;
+        .map_err(|_| (None, "config schema is unavailable"))?;
     let mut result = Vec::with_capacity(args.len());
-    for argument in args {
+    for (index, argument) in args.iter().enumerate() {
+        result.push(
+            parse_one_override(argument, &validator).map_err(|message| (Some(index), message))?,
+        );
+    }
+    Ok(result)
+}
+
+fn parse_one_override(
+    argument: &str,
+    validator: &jsonschema::Validator,
+) -> Result<toml::Value, &'static str> {
+    {
         if argument.len() > 32 * 1024 {
             return Err("config override exceeds 32 KiB (values omitted)");
         }
         validate_toml_bounds(argument)?;
-        let mut quote = None;
-        let mut escaped = false;
-        let mut separator = None;
-        for (at, character) in argument.char_indices() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            if quote == Some('"') && character == '\\' {
-                escaped = true;
-                continue;
-            }
-            if let Some(active) = quote {
-                if character == active {
-                    quote = None;
-                }
-            } else if character == '\'' || character == '"' {
-                quote = Some(character);
-            } else if character == '=' {
-                separator = Some(at);
-                break;
-            }
-        }
-        let at = separator.ok_or("config override requires key=literal TOML (values omitted)")?;
-        let (key, value) = (&argument[..at], &argument[at + 1..]);
+        let (key, value) = split_override(argument)?;
         let mut path: toml::Value = toml::from_str(&format!("{key}=0"))
             .map_err(|_| "invalid config override path (values omitted)")?;
         let mut literal: toml::Value = toml::from_str(&format!("value={value}"))
@@ -431,9 +489,8 @@ pub(crate) fn parse_overrides(args: &[String]) -> Result<Vec<toml::Value>, &'sta
                 .try_into()
                 .map_err(|_| "config override has an invalid type or value (values omitted)")?;
         }
-        result.push(path);
+        Ok(path)
     }
-    Ok(result)
 }
 
 #[cfg(feature = "mcp")]
@@ -888,6 +945,26 @@ mod tests {
             assert_eq!(cfg.model.as_deref(), Some("second"));
         }
         assert!(parse_overrides(&vec!["model=\"x\"".into(); 65]).is_err());
+    }
+
+    #[test]
+    fn empty_overrides_succeed_without_building_a_validator() {
+        assert!(parse_overrides(&[]).unwrap().is_empty());
+        assert!(parse_cli_overrides(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cli_override_errors_name_the_index_and_how_to_fix_it() {
+        let ok = "model=\"x\"".to_owned();
+        let bare = parse_cli_overrides(&[ok.clone(), "model=gpt-5".into()]).unwrap_err();
+        assert!(bare.starts_with("--config #2: "), "{bare}");
+        assert!(bare.contains("strings need TOML quotes"), "{bare}");
+        let unknown = parse_cli_overrides(&["modle=\"secret-value\"".into()]).unwrap_err();
+        assert!(unknown.starts_with("--config #1: "), "{unknown}");
+        assert!(unknown.contains("did you mean `model`?"), "{unknown}");
+        assert!(!unknown.contains("secret-value") && !unknown.contains("modle"));
+        let typed = parse_cli_overrides(&["max_tokens=\"many\"".into()]).unwrap_err();
+        assert!(typed.starts_with("--config #1: "), "{typed}");
     }
 
     #[test]

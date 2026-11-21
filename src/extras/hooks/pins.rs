@@ -24,7 +24,7 @@
 //! `docs/agent/CONFIG.md`).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
@@ -456,17 +456,7 @@ fn workspace_file(root: &Path, operand: &Path) -> Option<(PinnedLocation, PathBu
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            other => normalized.push(other.as_os_str()),
-        }
-    }
-    normalized
+    crate::fs::lexical_normalize(path)
 }
 
 /// SHA-256 of `path` plus, when it is provably stable and quiet, the stamp of

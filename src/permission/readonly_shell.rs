@@ -75,6 +75,14 @@ fn lex(script: &str) -> Option<Vec<Vec<String>>> {
         if c.is_control() && !matches!(c, '\n' | '\t') {
             return None;
         }
+        // A complete, whitespace-delimited fixed redirection to the null
+        // device cannot write anywhere, so it is dropped from the word list.
+        if !in_word && let Some(extra) = null_redirect_len(c, &chars) {
+            for _ in 0..extra {
+                chars.next();
+            }
+            continue;
+        }
         match c {
             '\'' => {
                 in_word = true;
@@ -90,7 +98,22 @@ fn lex(script: &str) -> Option<Vec<Vec<String>>> {
                 loop {
                     match chars.next()? {
                         '"' => break,
-                        '$' | '`' | '\\' => return None,
+                        // POSIX: a backslash is special in double quotes only
+                        // before `$`, a backtick, `"`, `\` or newline.
+                        // Anything else keeps the backslash literally, so a
+                        // regex such as "fn main\(" is not an expansion.
+                        '\\' => match chars.next()? {
+                            '"' => word.push('"'),
+                            '\\' => word.push('\\'),
+                            '$' => word.push('$'),
+                            '`' => word.push('`'),
+                            '\n' => {}
+                            other => {
+                                word.push('\\');
+                                word.push(other);
+                            }
+                        },
+                        '$' | '`' => return None,
                         other => word.push(other),
                     }
                 }
@@ -113,7 +136,12 @@ fn lex(script: &str) -> Option<Vec<Vec<String>>> {
                 }
                 end_segment!();
             }
-            '>' | '<' | '`' | '$' | '\\' | '(' | ')' | '{' | '}' | '#' | '@' => return None,
+            '>' | '<' | '`' | '$' | '\\' | '(' | ')' | '{' | '}' => return None,
+            // A comment (`#`) and PowerShell splatting (`@`) only begin at a
+            // word boundary; inside a word (`node_modules/@types`) they are
+            // ordinary characters.
+            '#' | '@' if !in_word => return None,
+            '#' | '@' => word.push(c),
             // An unquoted glob is expanded by the shell to paths the checker
             // never sees (`cat .e*` -> `.env`, `cat lin*/x` through a
             // symlink); quoted globs stay literal and are handled above.
@@ -131,6 +159,38 @@ fn lex(script: &str) -> Option<Vec<Vec<String>>> {
         segments.push(words);
     }
     Some(segments)
+}
+
+/// Redirections accepted verbatim, each as a whole token: stderr or stdout to
+/// `/dev/null`, and stderr joined to stdout. `/dev/null` is a fixed character
+/// device, so no path enters the report; every other `>` form is rejected.
+const NULL_REDIRECTS: [&str; 4] = ["2>/dev/null", "2>&1", ">/dev/null", "&>/dev/null"];
+
+/// When `first` plus the iterator's remaining chars start with an accepted
+/// redirect token that is followed by a delimiter (or the end), the number of
+/// characters after `first` to consume.
+fn null_redirect_len(
+    first: char,
+    chars: &std::iter::Peekable<std::str::Chars<'_>>,
+) -> Option<usize> {
+    if !matches!(first, '2' | '>' | '&') {
+        return None;
+    }
+    for token in NULL_REDIRECTS {
+        let mut token_chars = token.chars();
+        if token_chars.next() != Some(first) {
+            continue;
+        }
+        let mut probe = chars.clone();
+        if token_chars.all(|expected| probe.next() == Some(expected))
+            && probe
+                .next()
+                .is_none_or(|next| matches!(next, ' ' | '\t' | '\n' | ';' | '|' | '&'))
+        {
+            return Some(token.chars().count() - 1);
+        }
+    }
+    None
 }
 
 fn path_ok(value: &str, working_dir: &str) -> bool {
@@ -265,6 +325,56 @@ fn grep_selects_recursion(args: &[String]) -> bool {
     }) || grep_directories_action_may_recurse(args)
 }
 
+/// Index of the grep/rg search-pattern operand when it is provably the first
+/// non-option word: no option before it may take a value (`-e`, `-f`, `-A 3`,
+/// `--file x`, `--regexp x`) or turn the first operand into a path (`rg --files`).
+/// Returns `None` otherwise, which keeps the pattern confined like a path.
+fn search_pattern_index(command: &str, args: &[String]) -> Option<usize> {
+    let takes_value = match command {
+        "grep" => "efmABCdD",
+        "rg" => "efgmrtTABCjMEd",
+        _ => return None,
+    };
+    const BOOLEAN_LONG: [&str; 13] = [
+        "--recursive",
+        "--line-number",
+        "--ignore-case",
+        "--files-with-matches",
+        "--files-without-match",
+        "--count",
+        "--fixed-strings",
+        "--extended-regexp",
+        "--word-regexp",
+        "--no-filename",
+        "--with-filename",
+        "--invert-match",
+        "--no-heading",
+    ];
+    // Any spelling of the pattern/file options anywhere means the first
+    // operand is not the pattern (or is read as a file): keep it confined.
+    if args.iter().any(|a| {
+        long_opt_is(a, "regexp") || long_opt_is(a, "file") || short_cluster_has(a, &['e', 'f'])
+    }) {
+        return None;
+    }
+    for (index, arg) in args.iter().enumerate() {
+        if arg == "--" {
+            return (index + 1 < args.len()).then_some(index + 1);
+        }
+        if arg == "-" || !arg.starts_with('-') {
+            return (arg != "-").then_some(index);
+        }
+        if let Some(long) = arg.strip_prefix("--") {
+            if !long.contains('=') && !BOOLEAN_LONG.contains(&arg.as_str()) {
+                return None;
+            }
+        } else if arg.chars().skip(1).any(|c| takes_value.contains(c)) {
+            return None;
+        }
+    }
+    None
+}
+
 fn command_is_read_only(
     words: &[String],
     working_dir: &str,
@@ -277,7 +387,12 @@ fn command_is_read_only(
     // A sed address such as `/start/,/end/p` is a script, not a path; only the
     // one operand `sed_is_read_only` selects as the script is exempt, so a
     // file operand like `/etc/p` is still confined and screened.
-    let sed_script = (command == "sed").then(|| sed_script_index(args)).flatten();
+    // The same holds for the first operand of grep/rg, which is the search
+    // pattern (`grep -rn '/api/v1' src`), when no option can supply it.
+    let sed_script = (command == "sed")
+        .then(|| sed_script_index(args))
+        .flatten()
+        .or_else(|| search_pattern_index(command, args));
     // After a bare `--` every word is an operand, even one that starts with
     // `-` (a legal file name), so it is confined and screened like any path.
     let end_of_options = args.iter().position(|a| a == "--");
@@ -362,6 +477,35 @@ fn command_is_read_only(
             })
         }
         "sed" => sed_is_read_only(args),
+        "pwd" | "true" | "cut" | "tr" | "nl" | "basename" | "dirname" | "stat" => true,
+        "sort" => !args.iter().any(|a| {
+            short_cluster_has(a, &['o', 'T'])
+                || long_opt_is(a, "output")
+                || long_opt_is(a, "temporary-directory")
+                || long_opt_is(a, "compress-program")
+                || long_opt_is(a, "files0-from")
+        }),
+        // A second operand of `uniq` is an OUTPUT file.
+        "uniq" => {
+            args.iter()
+                .filter(|a| *a == "-" || !a.starts_with('-'))
+                .count()
+                <= 1
+                && !args.iter().any(|a| a == "--")
+        }
+        "du" => {
+            report.recursive = true;
+            !args.iter().any(|a| long_opt_is(a, "files0-from"))
+        }
+        "file" => !args.iter().any(|a| {
+            short_cluster_has(a, &['C', 'm', 'f', 'z', 'Z', 's', 'P'])
+                || long_opt_is(a, "compile")
+                || long_opt_is(a, "magic-file")
+                || long_opt_is(a, "files-from")
+                || long_opt_is(a, "uncompress")
+                || long_opt_is(a, "special-files")
+                || long_opt_is(a, "parameter")
+        }),
         "git" => {
             if !(allow_git && git_is_read_only(args)) {
                 return false;
@@ -499,6 +643,33 @@ mod tests {
             "ls src && cat Cargo.toml | head -n 3",
             "cat /work/repo/Cargo.toml",
             "grep 'a->b' src | wc -l\nls",
+            "ls src 2>/dev/null",
+            "git status 2>&1",
+            "cat a.txt b.txt 2>/dev/null",
+            "grep -rn foo src 2>/dev/null | head -20",
+            "ls >/dev/null",
+            "ls &>/dev/null",
+            "ls 2>&1 | head",
+            "grep -n \"fn main\\(\" src/main.rs",
+            "rg \"\\.unwrap\\(\\)\" src",
+            "grep \"a\\|b\" f",
+            "grep -rn '/api/v1' src",
+            "rg '~/.config' docs",
+            "grep -n '../lib' Makefile",
+            "rg -n --no-heading '/api' src",
+            "grep -- /api src",
+            "grep -rn TODO src | sort | uniq -c",
+            "git log --oneline | cut -c1-60",
+            "ls src | sort",
+            "wc -l src/a.rs src/b.rs | sort -n",
+            "pwd && ls",
+            "ls node_modules/@types",
+            "cat packages/@scope/pkg/package.json",
+            "du -sh src",
+            "stat Cargo.toml",
+            "file Cargo.toml",
+            "basename src/main.rs",
+            "ls src | tr a-z A-Z | nl",
         ] {
             yes(script);
         }
@@ -519,6 +690,40 @@ mod tests {
             "find . -ok rm x ;",
             "find . -fprint out",
             "find . -fprintf out x",
+            "ls 2>/dev/nullx",
+            "ls 2>/dev/null/../x",
+            "ls 2> /dev/null",
+            "ls 2>&3",
+            "ls 2>>f",
+            "ls >f",
+            "ls 2>/dev/null>f",
+            "ls x2>/dev/null",
+            "grep -e x /etc/passwd",
+            "grep -f /etc/shadow x",
+            "grep x /etc/passwd",
+            "grep --file=/etc/shadow x",
+            "grep --regexp x /etc/passwd",
+            "rg --files /etc",
+            "rg --glob /etc/x foo",
+            "grep -A 3 /etc/x f",
+            "cat \"\\$(rm x)\" \\x",
+            "ls \\x",
+            "sort -o out f",
+            "sort -no out f",
+            "sort --output=out f",
+            "sort --outp out f",
+            "sort -T /tmp f",
+            "sort --compress-program=sh f",
+            "sort --files0-from=f",
+            "uniq in out",
+            "uniq -c in out",
+            "file -C",
+            "file -m x f",
+            "file -f list",
+            "file --compile",
+            "du --files0-from=f",
+            "ls #x",
+            "ls @x",
             "echo hi > out",
             "cat a >> out",
             "ls 2> err",

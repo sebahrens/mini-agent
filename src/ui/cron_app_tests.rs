@@ -585,13 +585,16 @@ async fn cron_dynamic_fire_reschedules_from_its_clamped_tool_call_and_only_it_se
     assert_eq!(calls.len(), 2);
     assert!(calls.iter().all(offers_wakeup), "both cron requests offer it");
 
-    // An ordinary turn afterwards never sees the tool.
+    // While the entry lives, an ordinary turn sends the same tool list (a
+    // changing list would break the provider's prompt cache); the tool just
+    // refuses calls outside a cron turn.
     user(&mut app, UserEvent::Paste("plain question".into())).await;
     key(&mut app, KeyCode::Enter).await;
     assert!(settle(&mut app).await);
     let calls = provider.calls();
     assert_eq!(calls.len(), 3);
-    assert!(!offers_wakeup(&calls[2]), "{}", calls[2]["tools"]);
+    assert_eq!(calls[2]["tools"], calls[1]["tools"]);
+    assert!(offers_wakeup(&calls[2]));
     assert_eq!(user_rows(&app), ["watch ci", "plain question"]);
     drop(app);
     provider.finish().await;

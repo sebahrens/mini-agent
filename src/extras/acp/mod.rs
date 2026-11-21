@@ -127,6 +127,18 @@ struct SessionHistory {
     policy: policy::SessionPolicy,
     pending_question: Option<crate::question::QuestionRequired>,
     manual_compact: bool,
+    /// The goal gate's relaunch prompt for the next prompt of this session:
+    /// the editor drives each round, so the instruction (check output, judge
+    /// assessment) is carried to the next admitted prompt here.
+    #[cfg(feature = "goal")]
+    pending_goal_instruction: Option<String>,
+    /// Mid-turn or reactive context relief is pending: the next compaction
+    /// keeps a recent tail at a legal cut instead of summarizing everything
+    /// (mini-agent-sskdu.230).
+    relief_pending: bool,
+    /// What the last compaction did or why it did not, for the client
+    /// (mini-agent-sskdu.229, .243). Drained after each compaction.
+    compaction_events: Vec<String>,
     /// Servers and managers that outlive a single prompt.
     reuse: SessionReuse,
     /// Compaction triggers, refreshed from config and the routed model's
@@ -152,6 +164,9 @@ struct AcpHistoryLimits {
     max_turns: usize,
     max_bytes: usize,
     token_pressure: Option<AcpTokenPressure>,
+    /// Tokens of recent `read` windows a compaction re-attaches, as in the
+    /// TUI (`compact_restore_read_tokens`); `0` restores none.
+    restore_read_tokens: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -170,6 +185,7 @@ impl Default for AcpHistoryLimits {
             max_turns: MAX_ACP_HISTORY_TURNS,
             max_bytes: MAX_ACP_HISTORY_BYTES,
             token_pressure: None,
+            restore_read_tokens: 0,
         }
     }
 }
@@ -188,6 +204,7 @@ impl AcpHistoryLimits {
             // transcript and the thinking chain is restarted from it
             // (`restart_native_after_compaction`). The mid-turn path closes
             // the native epoch at a tool-batch boundary and does the same.
+            restore_read_tokens: cfg.resolve_compact_restore_read_tokens(window),
             token_pressure: (cfg.resolve_compact_enabled() && window > 0).then(|| {
                 AcpTokenPressure {
                     window,
@@ -295,6 +312,10 @@ impl Default for SessionHistory {
             policy: Default::default(),
             pending_question: None,
             manual_compact: false,
+            #[cfg(feature = "goal")]
+            pending_goal_instruction: None,
+            relief_pending: false,
+            compaction_events: Vec::new(),
             reuse: Default::default(),
             limits: Default::default(),
             context_window: 0,
@@ -391,7 +412,8 @@ impl SessionHistory {
     }
 
     fn needs_compaction(&self) -> bool {
-        (self.manual_compact && self.live_start() < self.session.messages.len())
+        ((self.manual_compact || self.relief_pending)
+            && self.live_start() < self.session.messages.len())
             || self.over_turn_cap()
             || self.over_token_pressure().is_some()
             || self.exceeds_hard_bound()
@@ -414,6 +436,26 @@ impl SessionHistory {
         .then_some(pressure)
     }
     fn next_cut(&self) -> usize {
+        if self.relief_pending && !self.manual_compact {
+            // Keep the most recent tokens verbatim, cutting at a legal
+            // boundary (a user or assistant record or a completed tool batch);
+            // when the recent tail alone is the problem, summarize everything
+            // rather than wedge.
+            let live = self.live_start();
+            let keep = self
+                .limits
+                .token_pressure
+                .map_or(20_000, |pressure| pressure.keep_recent_tokens);
+            let relative = crate::session::Session::select_compaction_cut(
+                &self.session.messages[live..],
+                keep,
+            );
+            return if relative == 0 {
+                self.session.messages.len()
+            } else {
+                live + relative
+            };
+        }
         if self.manual_compact {
             return self.session.messages.len();
         }
@@ -498,6 +540,7 @@ impl SessionHistory {
             // Retained pixels cannot be shrunk by repeatedly summarizing a recap.
             // Let the caller report the remaining fixed evidence pressure.
             if cut <= self.live_start() {
+                self.relief_pending = false;
                 // Nothing left to summarize: later byte-pressure checks must
                 // know a further relief cannot shrink what remains
                 // (mini-agent-cbjft).
@@ -521,16 +564,22 @@ impl SessionHistory {
             let output = match result {
                 Ok(output) if output.messages_included > 0 => output,
                 failed => {
-                    match &failed {
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "ACP summarizer failed; history compaction skipped"
-                        ),
-                        Ok(_) => tracing::warn!(
-                            "ACP summarizer included no messages; history compaction skipped"
-                        ),
-                    }
-                    self.fall_back_after_summary_failure();
+                    let reason = match &failed {
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "ACP summarizer failed; history compaction skipped"
+                            );
+                            format!("{error:#}")
+                        }
+                        Ok(_) => {
+                            tracing::warn!(
+                                "ACP summarizer included no messages; history compaction skipped"
+                            );
+                            "the summarizer covered no messages".to_owned()
+                        }
+                    };
+                    self.fall_back_after_summary_failure(&reason);
                     return Some(usage);
                 }
             };
@@ -555,14 +604,21 @@ impl SessionHistory {
                 .min(cut);
             // A partial summarizer prefix must finish a complete User-started
             // interval; otherwise take the explicit bounded emergency recap.
-            let completed_cut = self
-                .user_starts()
-                .into_iter()
-                .filter(|start| *start > self.live_start() && *start <= consumed)
-                .max()
-                .or_else(|| (consumed == self.session.messages.len()).then_some(consumed));
+            let completed_cut = if self.relief_pending && !self.manual_compact {
+                // Relief cuts mid-turn: any legal boundary at or before what
+                // the summarizer covered completes the compaction.
+                (self.live_start() + 1..=consumed)
+                    .rev()
+                    .find(|idx| crate::session::Session::is_legal_cut(&self.session.messages, *idx))
+            } else {
+                self.user_starts()
+                    .into_iter()
+                    .filter(|start| *start > self.live_start() && *start <= consumed)
+                    .max()
+                    .or_else(|| (consumed == self.session.messages.len()).then_some(consumed))
+            };
             let Some(completed_cut) = completed_cut else {
-                self.fall_back_after_summary_failure();
+                self.fall_back_after_summary_failure("the summary did not cover a whole turn");
                 return Some(usage);
             };
             // Honour the summarizer's window-scaled byte budget instead of the
@@ -577,9 +633,18 @@ impl SessionHistory {
                 completed_cut,
                 removed,
                 output.summary_byte_budget,
-                0,
+                self.limits.restore_read_tokens,
             );
             self.manual_compact = false;
+            self.relief_pending = false;
+            self.compaction_events.push(format!(
+                "compacted {} records into a summary (~{} tokens freed)",
+                completed_cut,
+                self.session
+                    .compactions
+                    .last()
+                    .map_or(0, |compaction| compaction.token_savings)
+            ));
             needs = self.needs_compaction();
         }
         Some(usage)
@@ -592,15 +657,23 @@ impl SessionHistory {
     /// byte guard or the turn cap) leaves no other way to proceed; plain token
     /// pressure keeps the transcript intact and lets the prompt run, since the
     /// reactive path still covers a real overflow (mini-agent-sskdu.229).
-    fn fall_back_after_summary_failure(&mut self) {
+    fn fall_back_after_summary_failure(&mut self, reason: &str) {
         if self.over_turn_cap() || self.exceeds_hard_bound() {
             self.emergency_compact();
+            self.compaction_events.push(format!(
+                "compaction failed ({reason}); older history was evicted to stay within the session limits"
+            ));
         } else {
             self.manual_compact = false;
+            self.relief_pending = false;
+            self.compaction_events.push(format!(
+                "compaction failed ({reason}); the history was kept unchanged"
+            ));
         }
     }
     fn emergency_compact(&mut self) {
         self.manual_compact = false;
+        self.relief_pending = false;
         while self.needs_compaction() {
             let cut = self.next_cut();
             if cut <= self.live_start() {
@@ -729,6 +802,14 @@ struct TurnControl {
     cancelled: Notify,
     runner_cancel: StdMutex<Option<crate::agent::runner::AgentWorkCancellation>>,
     sandbox: StdMutex<Option<crate::sandbox::Sandbox>>,
+    /// A goal's verification is running after the turn's own cancellation
+    /// ownership completed; `session/cancel` is routed to it instead.
+    #[cfg(feature = "goal")]
+    verifying: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "goal")]
+    verification_cancelled: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "goal")]
+    verification_cancel: Notify,
 }
 
 impl TurnControl {
@@ -738,6 +819,34 @@ impl TurnControl {
             cancelled: Notify::new(),
             runner_cancel: StdMutex::new(None),
             sandbox: StdMutex::new(None),
+            #[cfg(feature = "goal")]
+            verifying: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "goal")]
+            verification_cancelled: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "goal")]
+            verification_cancel: Notify::new(),
+        }
+    }
+
+    #[cfg(feature = "goal")]
+    fn begin_verification(&self) {
+        self.verifying.store(true, Ordering::Release);
+    }
+
+    #[cfg(feature = "goal")]
+    fn end_verification(&self) {
+        self.verifying.store(false, Ordering::Release);
+    }
+
+    /// Resolves when a `session/cancel` arrives during goal verification.
+    #[cfg(feature = "goal")]
+    async fn verification_cancelled(&self) {
+        loop {
+            let notified = self.verification_cancel.notified();
+            if self.verification_cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
         }
     }
 
@@ -752,6 +861,13 @@ impl TurnControl {
             )
             .is_err()
         {
+            // Too late for the turn itself, but a goal verification that runs
+            // after it can still be stopped.
+            #[cfg(feature = "goal")]
+            if self.verifying.load(Ordering::Acquire) {
+                self.verification_cancelled.store(true, Ordering::Release);
+                self.verification_cancel.notify_waiters();
+            }
             return false;
         }
         if let Some(cancel) = lock_unpoisoned(&self.runner_cancel).as_ref() {
@@ -1137,6 +1253,31 @@ struct TcpTransport {
     api_key: String,
     tls: Option<Arc<tls::AcpTlsConfig>>,
     idle: Arc<idle::Idle>,
+    accept_timeout: Option<std::time::Duration>,
+}
+
+/// Default seconds to wait for the first authenticated ACP TCP peer.
+const DEFAULT_ACCEPT_TIMEOUT_SECS: u64 = 300;
+
+/// Bound the first-peer accept: `None` waits indefinitely.
+async fn within_accept_deadline<T>(
+    timeout: Option<std::time::Duration>,
+    accept: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+    match timeout {
+        None => accept.await,
+        Some(limit) => tokio::time::timeout(limit, accept)
+            .await
+            .unwrap_or_else(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "no authenticated ACP peer within {} s (see --acp-accept-timeout-secs)",
+                        limit.as_secs()
+                    ),
+                ))
+            }),
+    }
 }
 
 impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
@@ -1156,12 +1297,15 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
 
         if let Some(tls) = self.tls {
             tracing::info!("ACP TCP listening on {} (TLS)", local_addr);
-            let (stream, peer_addr) = tls::accept_tls_peer_with_idle(
-                listener,
-                self.api_key,
-                tls,
-                MAX_PENDING_AUTHENTICATIONS,
-                self.idle,
+            let (stream, peer_addr) = within_accept_deadline(
+                self.accept_timeout,
+                tls::accept_tls_peer_with_idle(
+                    listener,
+                    self.api_key,
+                    tls,
+                    MAX_PENDING_AUTHENTICATIONS,
+                    self.idle,
+                ),
             )
             .await
             .map_err(|e| {
@@ -1183,11 +1327,14 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         let accept_error =
             |e| agent_client_protocol::util::internal_error(format!("TCP accept: {}", e));
         let listener = accept::tokio_listener(listener).map_err(accept_error)?;
-        let (stream, peer_addr) = accept_authenticated_peer_with_idle(
-            listener,
-            self.api_key,
-            MAX_PENDING_AUTHENTICATIONS,
-            self.idle,
+        let (stream, peer_addr) = within_accept_deadline(
+            self.accept_timeout,
+            accept_authenticated_peer_with_idle(
+                listener,
+                self.api_key,
+                MAX_PENDING_AUTHENTICATIONS,
+                self.idle,
+            ),
         )
         .await
         .map_err(accept_error)?;
@@ -1319,6 +1466,7 @@ struct TcpServerSettings {
     port: u16,
     api_key: String,
     tls: Option<Arc<tls::AcpTlsConfig>>,
+    accept_timeout: Option<std::time::Duration>,
 }
 
 /// Opt-in for a non-loopback plaintext ACP TCP bind. Without TLS the TCP
@@ -1409,6 +1557,13 @@ fn resolve_tcp_settings_with_key(
         port,
         api_key,
         tls: None,
+        accept_timeout: Some(
+            cli.acp_accept_timeout_secs
+                .or(cfg.acp_accept_timeout_secs)
+                .unwrap_or(DEFAULT_ACCEPT_TIMEOUT_SECS),
+        )
+        .filter(|secs| *secs > 0)
+        .map(std::time::Duration::from_secs),
     }))
 }
 
@@ -1614,6 +1769,7 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
                 api_key: settings.api_key,
                 tls: settings.tls,
                 idle,
+                accept_timeout: settings.accept_timeout,
             },
         )
         .await
@@ -2131,6 +2287,10 @@ async fn install_session(
                 policy,
                 pending_question,
                 manual_compact: false,
+                #[cfg(feature = "goal")]
+                pending_goal_instruction: None,
+                relief_pending: false,
+                compaction_events: Vec::new(),
                 reuse: Default::default(),
                 limits: Default::default(),
                 context_window: 0,
@@ -4600,6 +4760,23 @@ fn native_relief_stop(reliefs: usize, progress: &[Message], compacted: bool) -> 
     None
 }
 
+/// `/compact show`: the active compaction summary, bounded like the TUI's
+/// (mini-agent-sskdu.243).
+fn compaction_show_text(session: &crate::session::Session) -> String {
+    let Some(summary) = session.compacted_context().0 else {
+        return "no active compaction summary".to_owned();
+    };
+    let mut end = summary.len().min(64 * 1024);
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!(
+        "previous summary ({} lines):\n{}",
+        summary.lines().count(),
+        &summary[..end]
+    )
+}
+
 /// Text of the final assistant message of `progress`, if it ends with one.
 fn last_assistant_text(progress: &[Message]) -> String {
     match progress.last() {
@@ -4663,7 +4840,8 @@ async fn run_prompt(
             commands::Command::Undo | commands::Command::Compact | commands::Command::Rename(_) => {
                 true
             }
-            commands::Command::Model(_)
+            commands::Command::CompactShow
+            | commands::Command::Model(_)
             | commands::Command::Effort(_)
             | commands::Command::Cost => false,
             #[cfg(feature = "goal")]
@@ -4728,17 +4906,92 @@ async fn run_prompt(
             }
             #[cfg(feature = "goal")]
             commands::Command::Goal(arguments) => {
+                let arguments = arguments.trim();
+                let verb = arguments.split_whitespace().next().unwrap_or("");
+                let rest = arguments[verb.len()..].trim();
                 if arguments.is_empty() || arguments == "status" {
                     Some(goal_store.snapshot().map_or_else(
                         || "No goal is set.".into(),
-                        |goal| format!("Goal ({}): {}", goal.status.label(), goal.objective),
+                        |goal| crate::ui::slash::goal::render_status(&goal),
                     ))
                 } else if arguments == "clear" {
                     goal_store.clear();
                     Some("Goal cleared.".into())
+                } else if arguments == "pause" {
+                    Some(
+                        goal_store
+                            .with_mut(|goal| {
+                                if goal.status.is_running()
+                                    && goal.set_status(
+                                        crate::extras::goal::GoalStatus::Paused,
+                                        Some(crate::extras::goal::PauseReason::UserRequested),
+                                    )
+                                {
+                                    "Goal paused.".to_string()
+                                } else {
+                                    format!("The goal is already {}.", goal.status.label())
+                                }
+                            })
+                            .unwrap_or_else(|| "No goal to pause.".into()),
+                    )
+                } else if arguments == "resume" || arguments == "reopen" {
+                    let reopen = arguments == "reopen";
+                    Some(
+                        goal_store
+                            .with_mut(|goal| {
+                                let done = if reopen { goal.reopen() } else { goal.resume() };
+                                if done {
+                                    "Goal active again; send a prompt to continue.".to_string()
+                                } else if reopen {
+                                    "Only a goal marked impossible can reopen.".to_string()
+                                } else {
+                                    "The goal is final; set a new one with /goal <objective>."
+                                        .to_string()
+                                }
+                            })
+                            .unwrap_or_else(|| "No goal to resume.".into()),
+                    )
+                } else if verb == "bounds" {
+                    Some(
+                        goal_store
+                            .with_mut(|goal| {
+                                if rest.is_empty() {
+                                    return crate::ui::slash::goal::render_bounds(goal);
+                                }
+                                let mut lines = Vec::new();
+                                for assignment in rest.split_whitespace() {
+                                    lines.push(
+                                        crate::ui::slash::goal::parse_bound(goal, assignment)
+                                            .unwrap_or_else(|error| error),
+                                    );
+                                }
+                                // Raising a bound is how a budget stop is answered.
+                                if goal.status == crate::extras::goal::GoalStatus::BudgetLimited
+                                    && goal.resume()
+                                {
+                                    lines.push("goal active again".into());
+                                }
+                                lines.join("\n")
+                            })
+                            .unwrap_or_else(|| "No goal to configure.".into()),
+                    )
+                } else if verb == "check" && !rest.is_empty() {
+                    Some(
+                        goal_store
+                            .with_mut(|goal| {
+                                if rest == "clear" {
+                                    goal.checks.clear();
+                                    "Checks cleared.".to_string()
+                                } else {
+                                    goal.checks.push(crate::extras::goal::GoalCheck::new(rest));
+                                    format!("Check added: {rest}")
+                                }
+                            })
+                            .unwrap_or_else(|| "No goal to add a check to.".into()),
+                    )
                 } else {
                     let goal = match crate::extras::goal::Goal::configured(
-                        arguments.clone(),
+                        arguments.to_string(),
                         Vec::new(),
                         crate::extras::goal::GoalDefaults {
                             cfg: &state.cfg,
@@ -4769,6 +5022,7 @@ async fn run_prompt(
                 history.manual_compact = true;
                 None
             }
+            commands::Command::CompactShow => Some(compaction_show_text(&history.session)),
         };
         if let Some(line) = line {
             if !registration.control.complete() {
@@ -4863,6 +5117,24 @@ async fn run_prompt(
     let mut reactive_used = false;
     #[cfg(feature = "goal")]
     let mut carried_usage = rig::completion::Usage::default();
+    // The answer to a question the goal asked is what it was waiting for, as in
+    // the terminal: admitting the prompt resumes it, so the round it starts is
+    // settled. `/compact` is housekeeping and answers nothing.
+    #[cfg(feature = "goal")]
+    if !matches!(command, Some(commands::Command::Compact)) {
+        goal_store.with_mut(|goal| {
+            if goal.status == crate::extras::goal::GoalStatus::AwaitingUser {
+                goal.resume();
+            }
+        });
+        // The gate's last instruction (a failing check's output, the judge's
+        // assessment) reaches the worker as a non-persisted turn directive;
+        // otherwise the editor user sees the failure and the model never does.
+        let pending = history.pending_goal_instruction.take();
+        if let Some(instruction) = pending.filter(|_| goal_store.is_active()) {
+            current_input = acp_goal_directive(&current_input, &instruction);
+        }
+    }
     let result = loop {
         let compactions_at_segment_start = history.session.compaction_count();
         let result = crate::startup::heap_future(|| {
@@ -4903,6 +5175,7 @@ async fn run_prompt(
         // A compaction that could not shrink the history must not leave the
         // forced-compaction flag armed for the next prompt.
         history.manual_compact = false;
+        history.relief_pending = false;
         let mut outcome = match result {
             Ok(outcome)
                 if outcome.compaction_boundary
@@ -5018,8 +5291,9 @@ async fn run_prompt(
                 }),
             ))),
         ));
-        // The next segment compacts the whole persisted history first.
-        history.manual_compact = true;
+        // The next segment compacts the persisted history first, keeping a
+        // recent tail (mini-agent-sskdu.230).
+        history.relief_pending = true;
         // A manager this segment connected stays at the session's disposal so
         // the next segment reuses it instead of reconnecting.
         #[cfg(feature = "mcp")]
@@ -5115,7 +5389,9 @@ async fn run_prompt(
                 match crate::extras::goal::driver::park_for_question(&goal_store_for_gate, summary)
                 {
                     crate::extras::goal::driver::RoundOutcome::Stopped { line, .. } => {
-                        goal_store_for_gate.snapshot().map(|goal| (line, goal))
+                        goal_store_for_gate
+                            .snapshot()
+                            .map(|goal| (line, goal, None))
                     }
                     _ => None,
                 }
@@ -5134,6 +5410,7 @@ async fn run_prompt(
             &todo_snapshot,
             state,
             &sandbox_for_gate,
+            &control,
             &crate::extras::goal::driver::RoundCost {
                 usage: outcome.usage,
                 // What the agent worked for, excluding whatever the user spent
@@ -5252,7 +5529,8 @@ async fn run_prompt(
     // thoughts, and an agent that kept working with no visible reason is the
     // complaint this exists to prevent.
     #[cfg(feature = "goal")]
-    if let Some((line, goal)) = goal_line {
+    if let Some((line, goal, relaunch)) = goal_line {
+        history.pending_goal_instruction = relaunch;
         let mut meta = serde_json::Map::new();
         meta.insert(
             "goal".to_string(),
@@ -5524,8 +5802,9 @@ async fn settle_acp_goal_round(
     todos: &[crate::agent::tools::todo::TodoItem],
     state: &AcpState,
     sandbox: &crate::sandbox::Sandbox,
+    control: &TurnControl,
     cost: &crate::extras::goal::driver::RoundCost,
-) -> Option<(String, crate::extras::goal::Goal)> {
+) -> Option<(String, crate::extras::goal::Goal, Option<String>)> {
     let cfg = &state.cfg;
     use crate::extras::goal::driver::{self, RoundOutcome};
     use crate::extras::goal::gate::RoundEnd;
@@ -5548,7 +5827,7 @@ async fn settle_acp_goal_round(
             .is_some_and(|command| !command.trim().is_empty()),
     );
     summary.end = match (error, reason) {
-        (Some(error), _) => RoundEnd::Failed(error.to_string()),
+        (Some(error), _) => RoundEnd::from_error(error.to_string()),
         (None, StopReason::EndTurn) => RoundEnd::Done,
         (None, StopReason::Cancelled) => RoundEnd::Cancelled,
         (None, other) => RoundEnd::Failed(format!("{other:?}")),
@@ -5559,48 +5838,68 @@ async fn settle_acp_goal_round(
     // the line and in `_meta`, wherever it is settled.
     let (main_provider, main_model) = acp_provider_and_model(&state.cli, cfg);
     let judge = crate::extras::goal::judge::resolve(&goal.judge, cfg, &main_provider, &main_model);
+    store.record_judge(judge.as_ref());
     let transcript = crate::extras::goal::judge::transcript_from_interactions(interactions);
+    // The turn's own cancellation ownership has completed by now, so a
+    // `session/cancel` during verification is observed through this separate
+    // signal rather than through `TurnControl::cancel`'s success.
+    control.begin_verification();
     let outcome = driver::settle_round(store, summary, |request| async move {
-        let checks = crate::extras::goal::checks::run(&goal, &request, sandbox, cfg).await;
+        let (checks, mut interrupted) =
+            crate::extras::goal::checks::run_with_interrupt(&goal, &request, sandbox, cfg, async {
+                control.verification_cancelled().await;
+                Ok(())
+            })
+            .await;
         // A failing check already decides the claim, so the judge is not asked
         // for an answer the gate will not read.
         let checks_rejected = checks.as_ref().is_some_and(|o| !o.all_passed);
         let judged = match judge {
-            Some(resolved) if request.run_judge && !checks_rejected => {
+            Some(resolved) if request.run_judge && !checks_rejected && !interrupted => {
                 match state
                     .provider_clients
                     .get(&state.cli, cfg, &resolved.provider)
                 {
-                    Ok(client) => Some(
-                        crate::extras::goal::judge::ask_with_transcript_observed(
-                            &goal,
-                            &request,
-                            &resolved,
-                            &client,
-                            &transcript,
-                            cfg,
-                            checks.as_ref(),
-                            crate::spend::run::Run::current().map_or_else(
-                                Default::default,
-                                |run| {
-                                    crate::spend::run::UsageObserver::with_run(
-                                        run.for_judge(
-                                            &resolved,
-                                            cfg,
-                                            resolved
-                                                .same_provider_as_session
-                                                .then(|| {
-                                                    client.listing_key(&resolved.provider).ok()
-                                                })
-                                                .flatten()
-                                                .as_ref(),
-                                        ),
-                                    )
-                                },
+                    Ok(client) => {
+                        let call = crate::extras::goal::driver::unless_interrupted(
+                            crate::extras::goal::judge::ask_with_transcript_observed(
+                                &goal,
+                                &request,
+                                &resolved,
+                                &client,
+                                &transcript,
+                                cfg,
+                                checks.as_ref(),
+                                crate::spend::run::Run::current().map_or_else(
+                                    Default::default,
+                                    |run| {
+                                        crate::spend::run::UsageObserver::with_run(
+                                            run.for_judge(
+                                                &resolved,
+                                                cfg,
+                                                resolved
+                                                    .same_provider_as_session
+                                                    .then(|| {
+                                                        client.listing_key(&resolved.provider).ok()
+                                                    })
+                                                    .flatten()
+                                                    .as_ref(),
+                                            ),
+                                        )
+                                    },
+                                ),
                             ),
+                            async {
+                                control.verification_cancelled().await;
+                                Ok(())
+                            },
                         )
-                        .await,
-                    ),
+                        .await;
+                        if call.is_none() {
+                            interrupted = true;
+                        }
+                        call
+                    }
                     // Fail open, like every other judge failure: an editor
                     // without a reachable judge still gets its checks.
                     Err(error) => Some(crate::extras::goal::judge::JudgeCall::unmetered(
@@ -5616,15 +5915,45 @@ async fn settle_acp_goal_round(
             checks,
             judge_tokens: judged.as_ref().map_or(0, |call| call.tokens),
             judge: judged.map(|call| call.outcome),
+            interrupted,
             ..driver::Verification::default()
         }
     })
     .await;
-    let line = match outcome {
+    control.end_verification();
+    let (line, relaunch) = match outcome {
         RoundOutcome::Inactive => return None,
-        RoundOutcome::Relaunch { line, .. } | RoundOutcome::Stopped { line, .. } => line,
+        RoundOutcome::Relaunch { line, relaunch } => (line, Some(relaunch.prompt)),
+        RoundOutcome::Stopped { line, .. } => (line, None),
     };
-    store.snapshot().map(|goal| (line, goal))
+    store.snapshot().map(|goal| (line, goal, relaunch))
+}
+
+/// The turn directive that carries the gate's last instruction into the next
+/// ACP prompt. A directive is bounded, so a long instruction keeps its first
+/// line (the round header) and its end, where a failing command's cause is.
+#[cfg(feature = "goal")]
+fn acp_goal_directive(
+    input: &crate::agent::input::PromptInput,
+    instruction: &str,
+) -> crate::agent::input::PromptInput {
+    const BUDGET: usize = crate::agent::input::TURN_DIRECTIVE_MAX_BYTES - 128;
+    let framed = if instruction.len() <= BUDGET {
+        instruction.to_string()
+    } else {
+        let head = instruction.lines().next().unwrap_or("");
+        let head = &head[..head.len().min(120)];
+        let mut start = instruction.len() - (BUDGET - head.len() - 8);
+        while !instruction.is_char_boundary(start) {
+            start += 1;
+        }
+        format!("{head}\n…\n{}", &instruction[start..])
+    };
+    let directive = match input.turn_directive() {
+        Some(existing) => format!("{existing}\n\n[goal] {framed}"),
+        None => format!("[goal] {framed}"),
+    };
+    input.clone().with_turn_directive(Some(directive))
 }
 
 /// Mid-turn compaction trigger for one ACP segment (mini-agent-sgzh0): real
@@ -6029,9 +6358,11 @@ async fn execute_prompt(
     if needs_compaction {
         #[cfg(feature = "hooks")]
         let compactions_before = history.session.compaction_count();
+        // `PreCompact` fires from the first summarizer request, so a relief
+        // that finds nothing to cut does not announce a compaction that never
+        // ran (mini-agent-sskdu.239).
         #[cfg(feature = "hooks")]
-        crate::startup::heap_future(|| crate::extras::hooks::dispatch_pre_compact(true, None))
-            .await;
+        let pre_compact_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let quick_models = crate::config::quick_models_map(&state.cfg);
         let context_window =
             state
@@ -6092,7 +6423,16 @@ async fn execute_prompt(
                 move |messages, previous_summary| {
                     let observed = observed.clone();
                     let provider_str = provider_str.clone();
+                    #[cfg(feature = "hooks")]
+                    let pre_compact_sent = pre_compact_sent.clone();
                     async move {
+                        #[cfg(feature = "hooks")]
+                        if !pre_compact_sent.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            crate::startup::heap_future(|| {
+                                crate::extras::hooks::dispatch_pre_compact(true, None)
+                            })
+                            .await;
+                        }
                         let mut output = compaction_client
                             .compress_messages_observed_with_timeout(
                                 compaction_model,
@@ -6151,6 +6491,32 @@ async fn execute_prompt(
         }
         #[cfg(not(feature = "goal"))]
         let _ = usage;
+    }
+    // Tell the client what the compaction did, or why it did nothing; a
+    // `/compact` otherwise ends as an empty reply (mini-agent-sskdu.229, .243).
+    let events = std::mem::take(&mut history.compaction_events);
+    if compact_only {
+        let line = if events.is_empty() {
+            "Nothing to compact: the session has no history older than its current summary."
+                .to_owned()
+        } else {
+            events.join("\n")
+        };
+        let _ = cx.send_notification(SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                TextContent::new(line),
+            ))),
+        ));
+    } else {
+        for event in events {
+            let _ = cx.send_notification(SessionNotification::new(
+                session_id.clone(),
+                SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(event),
+                ))),
+            ));
+        }
     }
     if compact_only {
         return Ok(PromptOutcome {
@@ -7185,6 +7551,18 @@ mod history_tests {
         panic!("fake ACP turn ended without a terminal event")
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn first_peer_accept_gives_up_after_the_configured_deadline() {
+        let silent = std::future::pending::<std::io::Result<()>>();
+        let error = within_accept_deadline(Some(std::time::Duration::from_secs(30)), silent)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("within 30 s"), "{error}");
+        let ready = within_accept_deadline(None, async { Ok::<_, std::io::Error>(7) }).await;
+        assert_eq!(ready.unwrap(), 7);
+    }
+
     #[tokio::test]
     async fn second_prompt_receives_the_first_committed_turn_exactly_once() {
         let mut history = SessionHistory::default();
@@ -7915,6 +8293,110 @@ mod history_tests {
         assert!(result.is_some());
         assert_eq!(history.session.messages.len(), before);
         assert_eq!(history.session.compaction_count(), 0);
+        // The client is told why (mini-agent-sskdu.229).
+        assert!(
+            history
+                .compaction_events
+                .iter()
+                .any(|event| event.contains("429 after retries") && event.contains("kept")),
+            "{:?}",
+            history.compaction_events
+        );
+    }
+
+    /// mini-agent-sskdu.230: relief keeps a recent tail at a legal cut and does
+    /// not re-clamp a long summary to 16 KiB.
+    #[tokio::test]
+    async fn relief_keeps_the_recent_tool_pair_and_the_long_summary() {
+        let mut history = SessionHistory::default();
+        history.limits.token_pressure = Some(AcpTokenPressure {
+            window: 1_000_000,
+            reserve: 1_000,
+            keep_recent_tokens: 400,
+            keep_recent_tool_results: 4,
+        });
+        history
+            .session
+            .add_message(crate::session::MessageRole::User, "do the work");
+        for i in 0..6 {
+            let id = format!("c{i}");
+            history
+                .session
+                .add_tool_call_with_id(&id, "read", &serde_json::json!({"path": "f"}));
+            history
+                .session
+                .add_tool_result_with_id(&id, "read", &"x".repeat(800));
+        }
+        history.relief_pending = true;
+        assert!(history.needs_compaction());
+        let long = "s".repeat(40 * 1024);
+        let result = history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| {
+                    let long = long.clone();
+                    async move {
+                        let mut output = compaction_output(&long, messages.len());
+                        output.summary_byte_budget = 64 * 1024;
+                        Ok(output)
+                    }
+                },
+            )
+            .await;
+        assert!(result.is_some());
+        assert!(!history.relief_pending);
+        assert_eq!(history.session.compaction_count(), 1);
+        let last = history.session.messages.last().unwrap();
+        assert_eq!(last.role, crate::session::MessageRole::ToolResult);
+        assert!(history.session.messages.len() > 2, "a recent tail is kept");
+        let (summary, _) = history.session.compacted_context();
+        assert!(summary.unwrap().len() > 16 * 1024);
+        // No call is separated from its result.
+        let calls = history
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::session::MessageRole::ToolCall)
+            .count();
+        let results = history
+            .session
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::session::MessageRole::ToolResult)
+            .count();
+        assert_eq!(calls, results);
+    }
+
+    #[tokio::test]
+    async fn successful_compaction_records_a_client_event_and_show_text() {
+        // mini-agent-sskdu.243
+        let mut history = SessionHistory::default();
+        history.commit_completed_turn(
+            &"oversized".repeat(MAX_ACP_HISTORY_BYTES),
+            vec![Message::assistant("old answer")],
+        );
+        history
+            .compact_with(
+                &TurnControl::new(),
+                #[cfg(feature = "goal")]
+                None,
+                |messages, _| async move { Ok(compaction_output("the recap", messages.len())) },
+            )
+            .await
+            .unwrap();
+        assert!(
+            history
+                .compaction_events
+                .iter()
+                .any(|event| event.starts_with("compacted ") && event.contains("tokens freed"))
+        );
+        assert!(compaction_show_text(&history.session).contains("the recap"));
+        assert_eq!(
+            compaction_show_text(&crate::session::Session::new("", "", 1, "")),
+            "no active compaction summary"
+        );
     }
 
     /// mini-agent-p9oyv: the turn's memory block leaves out a daily-log copy
@@ -15203,8 +15685,9 @@ mod workspace_tests {
             .unwrap_err();
         let error = error.to_string();
         assert!(
-            error.contains("Permission denied")
-                || error.contains("workspace capability requires a contained relative path")
+            error.to_lowercase().contains("permission denied")
+                || error.contains("workspace capability requires a contained relative path"),
+            "{error}"
         );
         assert!(!error.contains("second-only"));
     }
@@ -16026,6 +16509,37 @@ mod goal_acp_tests {
         map
     }
 
+    /// The gate's instruction rides the next ACP prompt as a bounded,
+    /// non-persisted directive that keeps the cause at the end of a long
+    /// failing output (mini-agent-sskdu.215).
+    #[test]
+    fn the_gate_instruction_becomes_a_bounded_turn_directive() {
+        let input = crate::agent::input::PromptInput::text("continue".into());
+        let short = acp_goal_directive(&input, "Verification failed:\nno");
+        assert_eq!(
+            short.turn_directive(),
+            Some("[goal] Verification failed:\nno")
+        );
+        assert_eq!(
+            short.literal_text(),
+            "continue",
+            "the prompt text is untouched"
+        );
+
+        let long = format!(
+            "--- Goal round 2 of 9 ---\n{}\nROOT CAUSE",
+            "x".repeat(5_000)
+        );
+        let bounded = acp_goal_directive(&input, &long);
+        let directive = bounded.turn_directive().expect("directive");
+        assert!(directive.len() <= crate::agent::input::TURN_DIRECTIVE_MAX_BYTES);
+        assert!(
+            directive.contains("ROOT CAUSE"),
+            "the end survives: {directive}"
+        );
+        assert!(directive.contains("Goal round 2"));
+    }
+
     fn store_with(objective: &str) -> crate::extras::goal::GoalStore {
         let store = crate::extras::goal::GoalStore::default();
         store
@@ -16144,14 +16658,11 @@ mod goal_acp_tests {
             })
             .await;
 
-        let summary = history
-            .session
-            .compacted_context()
-            .0
-            .expect("history was summarized");
+        assert!(history.session.compacted_context().0.is_some());
+        let recap = history.session.live_recap_blocks();
         assert!(
-            summary.contains("finish the migration"),
-            "the objective must survive ACP compaction: {summary}"
+            recap.contains("finish the migration"),
+            "the objective must survive ACP compaction: {recap}"
         );
     }
 

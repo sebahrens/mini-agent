@@ -157,6 +157,10 @@ pub mod id;
 pub mod image_generation;
 pub mod integrations;
 pub(crate) mod json_utils;
+/// Marker for tool calls whose streamed argument text was not valid JSON.
+pub use json_utils::{
+    INVALID_TOOL_ARGUMENTS_ERROR_KEY, INVALID_TOOL_ARGUMENTS_KEY, invalid_tool_arguments_error,
+};
 pub mod loaders;
 pub mod markers;
 pub mod memory;

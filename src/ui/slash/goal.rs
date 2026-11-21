@@ -3,6 +3,7 @@
 //! Owning specification: `docs/specs/goals.md` (Surfaces).
 
 use crate::extras::goal::{Goal, GoalStatus, PauseReason};
+use crate::ui::slash::write_usage;
 use crate::ui::slash::{SlashCtx, write_error, write_ok, write_result};
 
 const USAGE: &str = "usage: /goal <objective>  |  /goal status | pause | resume | reopen | clear \
@@ -35,7 +36,7 @@ pub(crate) fn parse_objective(body: &str) -> (String, Vec<String>) {
     (objective.join(" "), criteria)
 }
 
-fn parse_bound(goal: &mut Goal, assignment: &str) -> Result<String, String> {
+pub(crate) fn parse_bound(goal: &mut Goal, assignment: &str) -> Result<String, String> {
     let (key, value) = assignment
         .split_once('=')
         .ok_or_else(|| format!("expected key=value, got {assignment:?}"))?;
@@ -56,12 +57,12 @@ fn parse_bound(goal: &mut Goal, assignment: &str) -> Result<String, String> {
         "max_tokens" => {
             let parsed = number(value)?;
             goal.bounds.max_tokens = (parsed > 0).then_some(parsed);
-            Ok(format!("max_tokens = {parsed}"))
+            Ok(format!("max_tokens = {}", unlimited_or(parsed)))
         }
         "max_active_secs" => {
             let parsed = number(value)?;
             goal.bounds.max_active_secs = (parsed > 0).then_some(parsed);
-            Ok(format!("max_active_secs = {parsed}"))
+            Ok(format!("max_active_secs = {}", unlimited_or(parsed)))
         }
         "no_progress_rounds" => {
             let parsed = number(value)?.clamp(1, 100) as u32;
@@ -74,7 +75,8 @@ fn parse_bound(goal: &mut Goal, assignment: &str) -> Result<String, String> {
             Ok(format!("blocked_rounds = {parsed}"))
         }
         "wrap_up_max_agent_turns" => {
-            let parsed = number(value)?.clamp(1, 100) as u32;
+            // Zero is meaningful, as in the config: it makes the bound exact.
+            let parsed = number(value)?.min(100) as u32;
             goal.bounds.wrap_up_max_agent_turns = parsed;
             Ok(format!("wrap_up_max_agent_turns = {parsed}"))
         }
@@ -117,6 +119,74 @@ fn parse_bound(goal: &mut Goal, assignment: &str) -> Result<String, String> {
     }
 }
 
+/// A zero token or time bound removes the bound; echo it as such, not as a
+/// zero budget.
+fn unlimited_or(value: u64) -> String {
+    if value == 0 {
+        "unlimited".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+/// Every bound with what has been used, for `/goal bounds` with no argument and
+/// for `/goal status`.
+pub(crate) fn render_bounds(goal: &Goal) -> String {
+    let b = &goal.bounds;
+    let p = &goal.progress;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "max_rounds = {} (used {})\n",
+        b.max_rounds, p.rounds
+    ));
+    out.push_str(&format!(
+        "max_tokens = {} (used {})\n",
+        b.max_tokens
+            .map_or("unlimited".to_string(), |v| v.to_string()),
+        p.tokens_used
+    ));
+    out.push_str(&format!(
+        "max_active_secs = {} (used {})\n",
+        b.max_active_secs
+            .map_or("unlimited".to_string(), |v| v.to_string()),
+        p.active_secs
+    ));
+    out.push_str(&format!(
+        "no_progress_rounds = {}\nblocked_rounds = {}\nwrap_up_max_agent_turns = {}\n\
+         reinject_every = {}\njudge_every = {}\ncheck_every_round = {}\ncontinuation = {}\n",
+        b.no_progress_rounds,
+        b.blocked_rounds,
+        b.wrap_up_max_agent_turns,
+        b.reinject_every,
+        b.judge_every,
+        b.check_every_round,
+        match goal.continuation {
+            crate::extras::goal::ContinuationMode::Continue => "continue",
+            crate::extras::goal::ContinuationMode::Restart { .. } => "restart",
+        }
+    ));
+    out
+}
+
+/// What `/goal resume` says for a goal that will not resume.
+fn cannot_resume(status: GoalStatus) -> &'static str {
+    match status {
+        GoalStatus::Impossible => "an impossible goal cannot resume; /goal reopen",
+        _ => "the goal is met and final; set a new one with /goal <objective> (or /goal clear)",
+    }
+}
+
+/// Whether this session talks to the native Anthropic route, which has no
+/// round publication owner for automatic goal rounds.
+pub(crate) fn native_goal_refusal(ctx: &SlashCtx<'_>) -> Option<&'static str> {
+    let native = matches!(&*ctx.client, crate::provider::AnyClient::Anthropic(_))
+        || ctx.session.native_history_snapshot().is_some();
+    native.then_some(
+        "automatic goal rounds are not available on the direct Anthropic route; \
+         switch to a non-native provider route to use /goal or /loop",
+    )
+}
+
 /// Human-readable status, used by `/goal status` and the headless summary.
 /// The `/goal status` line saying how many judge tokens the session cost
 /// leaves out because the judge model's price is unknown (mini-agent-kfsup).
@@ -142,12 +212,32 @@ pub(crate) fn render_status(goal: &Goal) -> String {
     }
     out.push('\n');
     out.push_str(&format!(
-        "round: {} of {}\n",
-        goal.progress.rounds, goal.bounds.max_rounds
+        "round: {} of {}{}\n",
+        goal.progress.rounds.min(goal.bounds.max_rounds),
+        goal.bounds.max_rounds,
+        if goal.progress.wrap_up_issued {
+            " (wrap-up round issued)"
+        } else {
+            ""
+        }
     ));
-    out.push_str(&format!("tokens: {}\n", goal.progress.tokens_used));
-    if goal.progress.active_secs > 0 {
-        out.push_str(&format!("active: {}s\n", goal.progress.active_secs));
+    out.push_str(&format!(
+        "tokens: {}{}\n",
+        goal.progress.tokens_used,
+        goal.bounds
+            .max_tokens
+            .map(|max| format!(" of {max}"))
+            .unwrap_or_default()
+    ));
+    if goal.progress.active_secs > 0 || goal.bounds.max_active_secs.is_some() {
+        out.push_str(&format!(
+            "active: {}s{}\n",
+            goal.progress.active_secs,
+            goal.bounds
+                .max_active_secs
+                .map(|max| format!(" of {max}s"))
+                .unwrap_or_default()
+        ));
     }
     out.push_str(&format!(
         "verification: {}\n",
@@ -165,6 +255,15 @@ pub(crate) fn render_status(goal: &Goal) -> String {
             )
         }
     ));
+    for check in &goal.checks {
+        let command: String = check.command.chars().take(120).collect();
+        let ellipsis = if check.command.chars().count() > 120 {
+            "…"
+        } else {
+            ""
+        };
+        out.push_str(&format!("  - {command}{ellipsis}\n"));
+    }
     out.push_str(&format!(
         "judge: {}\n",
         goal.resolved_judge
@@ -185,7 +284,7 @@ pub(crate) fn render_status(goal: &Goal) -> String {
         }
     }
     if let Some(verdict) = &goal.last_verdict {
-        out.push_str(&format!("last check: {}\n", verdict.reason));
+        out.push_str(&format!("last decision: {}\n", verdict.reason));
         if goal.met_unverified() {
             out.push_str("note: completion was not proved by any command\n");
         }
@@ -220,13 +319,26 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
             None => write_result(ctx.renderer, "no goal to clear"),
         },
         "pause" if bare => {
+            // A goal that is already parked keeps the status and reason the
+            // harness gave it; pausing it again would overwrite them.
             let changed = store.with_mut(|goal| {
-                (
-                    goal.set_status(GoalStatus::Paused, Some(PauseReason::UserRequested)),
-                    goal.status,
-                )
+                if goal.status.is_running() {
+                    (
+                        goal.set_status(GoalStatus::Paused, Some(PauseReason::UserRequested)),
+                        goal.status,
+                    )
+                } else {
+                    (false, goal.status)
+                }
             });
             match changed {
+                Some((true, current)) if *ctx.is_running => write_ok(
+                    ctx.renderer,
+                    format!(
+                        "goal {} — the current round will finish first (Esc stops it now)",
+                        current.label()
+                    ),
+                ),
                 Some((true, status)) => write_ok(ctx.renderer, format!("goal {}", status.label())),
                 Some((false, status)) => write_error(
                     ctx.renderer,
@@ -238,26 +350,71 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 None => write_error(ctx.renderer, "no goal to pause"),
             }
         }
-        "resume" if bare => match store.with_mut(Goal::resume) {
-            Some(true) => write_ok(ctx.renderer, "goal resumed"),
-            Some(false) => write_error(ctx.renderer, "a finished goal cannot resume; /goal reopen"),
-            None => write_error(ctx.renderer, "no goal to resume"),
-        },
-        "reopen" if bare => match store.with_mut(Goal::reopen) {
-            Some(true) => {
-                write_ok(ctx.renderer, "goal reopened");
-                ctx.rebuild_agent().await;
+        "resume" if bare => {
+            let resumed = store.with_mut(|goal| {
+                let resumed = goal.resume();
+                (
+                    resumed,
+                    goal.status,
+                    crate::extras::goal::gate::exhausted_bound_now(goal),
+                )
+            });
+            match resumed {
+                Some((true, _, Some(bound))) => {
+                    write_ok(
+                        ctx.renderer,
+                        format!(
+                            "goal resumed, but a bound is already used up ({bound}): it will stop \
+                             again after one more round. Raise it with /goal bounds \
+                             max_rounds=<n> (or max_tokens, max_active_secs); send a message to continue"
+                        ),
+                    );
+                    ctx.rebuild_agent().await;
+                }
+                Some((true, _, None)) => {
+                    write_ok(ctx.renderer, "goal resumed — send a message to continue");
+                    // `goal_report` is registered only for an active goal at
+                    // build time, so a parked build would lack it.
+                    ctx.rebuild_agent().await;
+                }
+                Some((false, current, _)) => write_error(ctx.renderer, cannot_resume(current)),
+                None => write_error(ctx.renderer, "no goal to resume"),
             }
-            Some(false) => write_error(ctx.renderer, "only a goal marked impossible can reopen"),
-            None => write_error(ctx.renderer, "no goal to reopen"),
-        },
+        }
+        "reopen" if bare => {
+            let reopened = store.with_mut(|goal| (goal.reopen(), goal.status));
+            match reopened {
+                Some((true, _)) => {
+                    write_ok(ctx.renderer, "goal reopened");
+                    ctx.rebuild_agent().await;
+                }
+                Some((false, GoalStatus::Met)) => write_error(
+                    ctx.renderer,
+                    "the goal is met and final; set a new one with /goal <objective> (or /goal clear)",
+                ),
+                Some((false, _)) => {
+                    write_error(ctx.renderer, "only a goal marked impossible can reopen")
+                }
+                None => write_error(ctx.renderer, "no goal to reopen"),
+            }
+        }
         "bounds" => {
             if parts.len() < 3 {
-                write_error(ctx.renderer, "usage: /goal bounds <key>=<value>");
+                match store.snapshot() {
+                    Some(goal) => write_result(
+                        ctx.renderer,
+                        format!(
+                            "{}set one with /goal bounds <key>=<value>",
+                            render_bounds(&goal)
+                        ),
+                    ),
+                    None => write_error(ctx.renderer, "no goal to configure"),
+                }
                 return;
             }
             let mut applied = Vec::new();
             let mut failed = Vec::new();
+            let mut rearmed = false;
             store.with_mut(|goal| {
                 for assignment in parts[2..].iter().flat_map(|rest| rest.split_whitespace()) {
                     match parse_bound(goal, assignment) {
@@ -268,7 +425,7 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 // Raising a bound is how a user answers a budget stop, so the
                 // wrap-up is re-armed for the new budget.
                 if !applied.is_empty() && goal.status == GoalStatus::BudgetLimited {
-                    goal.resume();
+                    rearmed = goal.resume();
                 }
             });
             if store.is_empty() {
@@ -281,10 +438,14 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
             if !applied.is_empty() {
                 write_ok(ctx.renderer, applied.join(", "));
             }
+            if rearmed {
+                write_ok(ctx.renderer, "goal resumed — send a message to continue");
+                ctx.rebuild_agent().await;
+            }
         }
         "check" => {
             if parts.len() < 3 {
-                write_error(
+                write_usage(
                     ctx.renderer,
                     "usage: /goal check <command>  |  /goal check clear",
                 );
@@ -314,6 +475,10 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
         _ => {
             if body.trim().is_empty() {
                 write_error(ctx.renderer, USAGE);
+                return;
+            }
+            if let Some(refusal) = native_goal_refusal(ctx) {
+                write_error(ctx.renderer, refusal);
                 return;
             }
             let (objective, criteria) = parse_objective(body);
@@ -349,7 +514,10 @@ pub(crate) async fn handle_goal(parts: &[&str], body: &str, ctx: &mut SlashCtx<'
                 .snapshot()
                 .map(|g| g.objective.clone())
                 .unwrap_or_default();
-            write_ok(ctx.renderer, format!("goal set: {summary}"));
+            write_ok(
+                ctx.renderer,
+                format!("goal set: {summary} — send a message to start working on it"),
+            );
             ctx.rebuild_agent().await;
         }
     }
@@ -397,6 +565,63 @@ mod tests {
 
         // Read as one string it is neither.
         assert!(parse_bound(&mut goal, tail).is_err());
+    }
+
+    /// `/goal resume` on a met goal must not send the user to `/goal reopen`,
+    /// which refuses met goals (mini-agent-sskdu.114).
+    #[test]
+    fn resuming_a_met_goal_does_not_recommend_reopen() {
+        assert!(!cannot_resume(GoalStatus::Met).contains("reopen"));
+        assert!(cannot_resume(GoalStatus::Met).contains("/goal <objective>"));
+        assert!(cannot_resume(GoalStatus::Impossible).contains("/goal reopen"));
+    }
+
+    #[test]
+    fn zero_bounds_agree_with_config() {
+        let mut goal = Goal::new("x", Vec::new()).unwrap();
+        assert_eq!(
+            parse_bound(&mut goal, "wrap_up_max_agent_turns=0").unwrap(),
+            "wrap_up_max_agent_turns = 0"
+        );
+        assert_eq!(goal.bounds.wrap_up_max_agent_turns, 0);
+        assert_eq!(
+            parse_bound(&mut goal, "max_tokens=0").unwrap(),
+            "max_tokens = unlimited"
+        );
+        assert_eq!(
+            parse_bound(&mut goal, "max_active_secs=0").unwrap(),
+            "max_active_secs = unlimited"
+        );
+    }
+
+    #[test]
+    fn status_lists_checks_and_budget_left() {
+        let mut goal = Goal::new("x", Vec::new()).unwrap();
+        goal.checks
+            .push(crate::extras::goal::GoalCheck::new("cargo test --lib"));
+        goal.bounds.max_tokens = Some(1000);
+        goal.progress.tokens_used = 250;
+        goal.bounds.max_rounds = 5;
+        goal.progress.rounds = 6;
+        goal.progress.wrap_up_issued = true;
+        let rendered = render_status(&goal);
+        assert!(rendered.contains("- cargo test --lib"), "{rendered}");
+        assert!(rendered.contains("tokens: 250 of 1000"), "{rendered}");
+        assert!(
+            rendered.contains("round: 5 of 5 (wrap-up round issued)"),
+            "{rendered}"
+        );
+        assert!(render_bounds(&goal).contains("max_tokens = 1000 (used 250)"));
+    }
+
+    #[test]
+    fn bounds_and_check_are_allowed_while_a_round_runs() {
+        assert!(crate::ui::allowed_while_running(
+            "/goal bounds max_rounds=9"
+        ));
+        assert!(crate::ui::allowed_while_running("/goal check cargo test"));
+        assert!(!crate::ui::allowed_while_running("/goal clear"));
+        assert!(!crate::ui::allowed_while_running("/goal resume"));
     }
 
     #[test]

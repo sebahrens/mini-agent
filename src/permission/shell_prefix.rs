@@ -70,6 +70,29 @@ pub(crate) fn literal_argv(script: &str) -> Option<Vec<&str>> {
     Some(argv)
 }
 
+/// Programs whose next word can itself be a command or code, so a two-word
+/// prefix would authorize an unbounded range of other programs.
+const NEVER_OFFERED: [&str; 16] = [
+    "sh", "bash", "zsh", "dash", "fish", "ksh", "env", "sudo", "doas", "xargs", "eval", "exec",
+    "nohup", "timeout", "su", "find",
+];
+
+/// The prefix the prompt may offer as a reusable session grant for `script`:
+/// its first two words, only when the whole script is a literal argv of at
+/// least two words (so `ls; rm x` and quoted or expanded scripts get none) and
+/// the program is not a launcher for other commands.
+pub(crate) fn offered_prefix(script: &str) -> Option<String> {
+    let argv = literal_argv(script)?;
+    if argv.len() < 2 {
+        return None;
+    }
+    let program = argv[0].rsplit('/').next().unwrap_or(argv[0]);
+    if NEVER_OFFERED.contains(&program.to_ascii_lowercase().as_str()) {
+        return None;
+    }
+    Some(format!("{} {}", argv[0], argv[1]))
+}
+
 impl ShellPrefix {
     pub(crate) fn compatibility_fields(&self) -> (&[String], usize) {
         (&self.argv, self.specificity)
@@ -101,6 +124,32 @@ impl ShellPrefix {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn offered_prefix_needs_a_literal_two_word_command_that_is_not_a_launcher() {
+        assert_eq!(
+            offered_prefix("cargo test foo").as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            offered_prefix("npm run lint --fix").as_deref(),
+            Some("npm run")
+        );
+        for script in [
+            "ls",
+            "ls; rm x",
+            "cargo test && rm x",
+            "cargo test $(x)",
+            "cargo test 'a b'",
+            "bash -c ls",
+            "/bin/sh script.sh",
+            "sudo rm x",
+            "find . -delete",
+            "FOO=1 cargo test",
+        ] {
+            assert_eq!(offered_prefix(script), None, "{script}");
+        }
+    }
+
     #[test]
     fn portable_prefix_requires_the_whole_script_to_be_literal_argv() {
         let prefix = ShellPrefix::parse("git status").unwrap();

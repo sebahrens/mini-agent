@@ -2387,6 +2387,15 @@ where
     .await
 }
 
+/// `response` with the truncation marker appended when the provider reported
+/// that it stopped at the output limit.
+pub(crate) fn mark_cut_off_summary(mut response: String, cut_off: bool) -> String {
+    if cut_off {
+        response.push_str(SUMMARY_TRUNCATED_MARKER);
+    }
+    response
+}
+
 /// Appended to a summary whose response used the whole output allowance.
 pub(crate) const SUMMARY_TRUNCATED_MARKER: &str = "\n\n[summary truncated by the output limit]";
 
@@ -2432,18 +2441,7 @@ where
         )
         .await
         {
-            Ok((mut text, usage)) => {
-                // A response that used its whole output allowance was cut off:
-                // say so instead of storing it as complete (mini-agent-sskdu.233).
-                if max_output_tokens > 0 && usage.output_tokens >= max_output_tokens {
-                    tracing::warn!(
-                        max_output_tokens,
-                        "compaction summary hit the output limit and was cut off"
-                    );
-                    text.push_str(SUMMARY_TRUNCATED_MARKER);
-                }
-                return Ok((text, usage));
-            }
+            Ok(done) => return Ok(done),
             Err(SummarizerFailure::Fatal(error)) => return Err(error),
             Err(SummarizerFailure::Retry(delay, error)) => {
                 tracing::warn!(
@@ -2575,6 +2573,7 @@ where
     let mut usage = rig::completion::Usage::new();
     let mut finished = false;
     let mut unexpected_tool = false;
+    let mut cut_off = false;
     while let Some(item) = stream.next().await {
         match item {
             Ok(StreamedAssistantContent::Text(text)) => {
@@ -2591,6 +2590,9 @@ where
                 usage = crate::event::UsageDelta::from(usage)
                     .saturating_add(delta)
                     .into();
+                // The provider's own stop reason: the response hit the output
+                // limit (mini-agent-sskdu.233).
+                cut_off |= raw.output_truncated();
                 finished = true;
             }
             Ok(
@@ -2616,7 +2618,13 @@ where
     if response.is_empty() {
         return Err(anyhow::anyhow!("Compression returned empty response").into());
     }
-    Ok((response, usage))
+    if cut_off {
+        tracing::warn!(
+            max_output_tokens,
+            "compaction summary hit the output limit and was cut off"
+        );
+    }
+    Ok((mark_cut_off_summary(response, cut_off), usage))
 }
 
 #[derive(Default)]
@@ -3474,7 +3482,6 @@ pub struct AnyAgent {
     /// Non-persisted host directive for the next headless turn only, shared
     /// by clones and taken by the first `run_print_with_output` that starts a
     /// request, so later goal rounds never repeat it.
-    #[cfg(feature = "subagents")]
     headless_turn_directive: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
     /// Typed user content (text plus attached images) for the next headless
     /// turn only, taken by the first `run_print_with_output` that starts a
@@ -4303,7 +4310,6 @@ impl AnyAgent {
             js_probe_pending: false,
             native_host: None,
             question_turn: None,
-            #[cfg(feature = "subagents")]
             headless_turn_directive: None,
             #[cfg(feature = "multimodal")]
             headless_user: None,
@@ -4650,7 +4656,6 @@ impl AnyAgent {
     /// Attach a non-persisted host directive (an `@agent` routing note) to
     /// the next headless turn this agent or any clone of it dispatches. The
     /// UserPromptSubmit hook and persistence see only the literal prompt.
-    #[cfg(feature = "subagents")]
     pub(crate) fn with_headless_turn_directive(mut self, directive: Option<String>) -> Self {
         self.headless_turn_directive =
             directive.map(|directive| std::sync::Arc::new(std::sync::Mutex::new(Some(directive))));
@@ -4678,7 +4683,6 @@ impl AnyAgent {
         })
     }
 
-    #[cfg(feature = "subagents")]
     fn take_headless_turn_directive(&self) -> Option<String> {
         self.headless_turn_directive.as_ref().and_then(|cell| {
             cell.lock()
@@ -5018,6 +5022,14 @@ impl AnyAgent {
         &self,
         tool: impl rig::tool::ToolDyn + 'static,
     ) -> anyhow::Result<()> {
+        // Idempotent: re-adding must not disturb an already advertised tool.
+        if self
+            .tool_server()
+            .advertises_static_tool(&tool.name())
+            .await
+        {
+            return Ok(());
+        }
         Ok(self.tool_server().add_tool(tool).await?)
     }
 
@@ -5068,7 +5080,6 @@ impl AnyAgent {
             js_probe_pending: false,
             native_host: None,
             question_turn: None,
-            #[cfg(feature = "subagents")]
             headless_turn_directive: None,
             #[cfg(feature = "multimodal")]
             headless_user: None,
@@ -5306,8 +5317,7 @@ impl AnyAgent {
             #[cfg(not(feature = "multimodal"))]
             let prompt_input = crate::agent::input::PromptInput::text(prompt.to_string());
             let prompt = prompt_input;
-            #[cfg(feature = "subagents")]
-            let prompt = prompt.with_turn_directive(self.take_headless_turn_directive());
+            let prompt = prompt.with_host_turn_directive(self.take_headless_turn_directive());
             #[cfg(not(feature = "agent-skills"))]
             let inner = &self.inner;
             // One provider dispatch, reused for the primary attempt and, when

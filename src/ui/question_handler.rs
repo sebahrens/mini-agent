@@ -103,14 +103,20 @@ impl QuestionState {
             .collect::<Vec<_>>();
         if self.text_mode {
             options.push(format!("Answer: {}", sanitize_for_review(&self.draft)));
-            options.push("[Enter] submit answer  [Esc/Ctrl+C] cancel and stop".into());
+            options.push(
+                if question.options.is_empty() {
+                    "[Enter] submit answer  [Esc/Ctrl+C] cancel and stop"
+                } else {
+                    "[Enter] submit answer  [Esc] back to the options  [Ctrl+C] cancel and stop"
+                }
+                .into(),
+            );
         } else {
             options.push(if question.allow_free_text { "[1–8] choose an advertised option  [t] type another answer  [Esc/Ctrl+C] cancel and stop" } else { "[1–8] choose an advertised option  [Esc/Ctrl+C] cancel and stop" }.into());
         }
         renderer.permission_prompt = Some(PermissionPrompt {
             tool: format!(
-                "[question {}] {}/{}: {}",
-                request.id,
+                "[question {}/{}] {}",
                 self.answers.len() + 1,
                 request.questions.0.len(),
                 sanitize_for_review(&question.question)
@@ -162,6 +168,18 @@ impl QuestionState {
                 // the batch before the user has reviewed it.
                 return Ok(QuestionEvent::Waiting);
             }
+            // Esc in free-text mode of a choice question goes back to the
+            // options (as it does in the permission prompt's note draft);
+            // from the option list, or for a text-only question, it stops.
+            UserEvent::Key(key)
+                if key.code == KeyCode::Esc
+                    && key.modifiers.is_empty()
+                    && self.text_mode
+                    && !question.options.is_empty() =>
+            {
+                self.text_mode = false;
+                self.draft.clear();
+            }
             UserEvent::Key(key)
                 if key.code == KeyCode::Esc
                     || (key.modifiers.contains(KeyModifiers::CONTROL)
@@ -204,15 +222,19 @@ impl QuestionState {
             }
             // Check the existing input without allocating an unbounded
             // filtered copy or silently changing the user's task answer.
-            UserEvent::Paste(text)
-                if question.allow_free_text
-                    && self.draft.len().saturating_add(text.len()) <= MAX_ANSWER_BYTES
-                    && !text
-                        .chars()
-                        .any(|c| c.is_control() && !matches!(c, '\n' | '\t')) =>
-            {
-                self.text_mode = true;
-                self.draft.push_str(text);
+            UserEvent::Paste(text) if question.allow_free_text => {
+                // Terminals send pasted newlines as `\r` (iTerm2, VTE):
+                // normalise like the editor does, and drop escapes.
+                let text = crate::ui::input::sanitize_paste(text);
+                if self.draft.len().saturating_add(text.len()) > MAX_ANSWER_BYTES {
+                    renderer.show_notice(
+                        &format!("answer limit is {MAX_ANSWER_BYTES} bytes; paste not added"),
+                        crossterm::style::Color::Yellow,
+                    );
+                } else if !text.is_empty() {
+                    self.text_mode = true;
+                    self.draft.push_str(&text);
+                }
             }
             _ => {}
         }
@@ -283,14 +305,9 @@ mod tests {
         let id = request.id.clone();
         let mut renderer = Renderer::for_app_test().unwrap();
         let mut state = QuestionState::begin(request, &mut renderer).unwrap();
-        assert!(
-            renderer
-                .permission_prompt
-                .as_ref()
-                .unwrap()
-                .tool
-                .contains(&id)
-        );
+        let header = &renderer.permission_prompt.as_ref().unwrap().tool;
+        assert!(header.starts_with("[question 1/2]"), "{header}");
+        assert!(!header.contains(&id), "the internal id is not shown");
         assert!(
             renderer
                 .permission_prompt
@@ -365,9 +382,13 @@ mod tests {
         state
             .handle(&key(KeyCode::Char('t')), &mut renderer)
             .unwrap();
-        let answer = "first line\n\t雪; allow_once";
+        // CR-separated lines (iTerm2, VTE) arrive as `\n`; tabs expand.
+        let answer = "first line\n    雪; allow_once";
         state
-            .handle(&UserEvent::Paste(answer.into()), &mut renderer)
+            .handle(
+                &UserEvent::Paste("first line\r\n\t雪; allow_once".into()),
+                &mut renderer,
+            )
             .unwrap();
         assert_eq!(state.draft, answer);
         state
@@ -435,5 +456,28 @@ mod tests {
             .unwrap();
         assert!(state.answers.is_empty() && state.draft.is_empty());
         assert!(!state.text_mode);
+    }
+
+    #[test]
+    fn esc_in_free_text_mode_returns_to_the_options_and_only_then_stops() {
+        let (request, _reply) = request();
+        let mut renderer = Renderer::for_app_test().unwrap();
+        let mut state = QuestionState::begin(request, &mut renderer).unwrap();
+        state
+            .handle(&key(KeyCode::Char('t')), &mut renderer)
+            .unwrap();
+        state
+            .handle(&key(KeyCode::Char('x')), &mut renderer)
+            .unwrap();
+        assert!(state.text_mode && state.draft == "x");
+        assert!(matches!(
+            state.handle(&key(KeyCode::Esc), &mut renderer).unwrap(),
+            QuestionEvent::Waiting
+        ));
+        assert!(!state.text_mode && state.draft.is_empty());
+        assert!(matches!(
+            state.handle(&key(KeyCode::Esc), &mut renderer).unwrap(),
+            QuestionEvent::Stop
+        ));
     }
 }

@@ -22,6 +22,10 @@ pub(crate) use memory::verify_memory_editor_preservation;
 pub(crate) mod providers;
 pub(crate) mod review;
 mod session;
+#[cfg(feature = "export")]
+pub(crate) fn default_export_filename(session_id: &str) -> String {
+    session::default_export_filename(session_id)
+}
 pub(crate) use session::{is_persistence_restart_required, rewind_selected_turn};
 pub(crate) mod settings;
 
@@ -420,6 +424,17 @@ pub(crate) fn write_result(renderer: &mut Renderer, msg: impl std::fmt::Display)
     let _ = renderer.write_line(&msg.to_string(), C_RESULT);
 }
 
+/// A usage line: one severity for every command, always `usage:`-prefixed.
+pub(crate) fn write_usage(renderer: &mut Renderer, msg: impl std::fmt::Display) {
+    let text = msg.to_string();
+    let text = if text.starts_with("usage:") {
+        text
+    } else {
+        format!("usage: {text}")
+    };
+    let _ = renderer.write_line(&text, C_ERROR);
+}
+
 pub(crate) fn write_error(renderer: &mut Renderer, msg: impl std::fmt::Display) {
     let _ = renderer.write_line(&msg.to_string(), C_ERROR);
 }
@@ -607,9 +622,12 @@ async fn handle_compress_unfloored(
 
     // Announce only once we know compression will actually run.
     if auto {
-        renderer.write_line("auto-compacting...", crossterm::style::Color::DarkGrey)?;
+        renderer.write_line(
+            "auto-compacting... (Esc cancels)",
+            crossterm::style::Color::DarkGrey,
+        )?;
     } else {
-        renderer.write_line("compressing...", C_AGENT)?;
+        renderer.write_line("compressing... (Esc cancels)", C_AGENT)?;
     }
     renderer.write_line("", crossterm::style::Color::White)?;
 
@@ -659,7 +677,11 @@ async fn handle_compress_unfloored(
     let restore_read_tokens = ui
         .cfg
         .resolve_compact_restore_read_tokens(ui.session.context_window);
-    let compacted = compact_session_with_restoring(
+    // The input thread consumes Esc/Ctrl-C while this is registered, so a slow
+    // or stalled summarizer can be abandoned; history is only touched after the
+    // summary arrives, so a cancelled compaction leaves it intact.
+    let cancel = crate::ui::CompactionCancel::begin();
+    let compaction = compact_session_with_restoring(
         ui.session,
         cut_idx,
         summarizer_input_budget,
@@ -721,8 +743,15 @@ async fn handle_compress_unfloored(
             #[cfg(not(feature = "memory"))]
             let _ = (summary, first_kept_index);
         },
-    )
-    .await;
+    );
+    let compacted = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow::anyhow!(
+            "compaction cancelled; the history is unchanged"
+        )),
+        result = compaction => result,
+    };
+    drop(cancel);
     let (first_kept_index, tokens_before, usage) = match compacted {
         Ok(compacted) => compacted,
         Err(error) => {
@@ -788,13 +817,23 @@ async fn handle_compress_unfloored(
         .messages
         .first()
         .map_or(0, |m| m.estimated_tokens);
+    let kept = if ui.cli.no_session {
+        String::new()
+    } else {
+        crate::session::storage::precompact_path(&ui.session.id, ui.session.compaction_count())
+            .map_or_else(
+                |_| String::new(),
+                |path| format!("; the replaced transcript is kept at {}", path.display()),
+            )
+    };
     renderer.write_line(
         &format!(
-            "compressed {} messages (freed ~{} tokens net; removed ~{}, new summary ~{})",
+            "compressed {} messages (freed ~{} tokens net; removed ~{}, new summary ~{}){}",
             first_kept_index,
             tokens_before.saturating_sub(summary_tokens),
             tokens_before,
             summary_tokens,
+            kept,
         ),
         C_AGENT,
     )?;
@@ -1189,10 +1228,7 @@ pub(crate) async fn handle_slash(
             }
             #[cfg(not(feature = "git-worktree"))]
             {
-                write_error(
-                    ctx.renderer,
-                    "Git commands require the git-worktree feature",
-                );
+                write_error(ctx.renderer, feature_missing("git command", "git-worktree"));
                 Ok(())
             }
         }
@@ -1232,6 +1268,15 @@ pub(crate) async fn handle_slash(
         "/context" => crate::startup::heap_future(|| context::handle(&parts, &mut ctx)).await,
         "/doctor" => in_one_frame(&mut ctx, |ctx| doctor::handle(&parts, ctx))?,
         "/jobs" => in_one_frame(&mut ctx, |ctx| jobs::handle(&parts, ctx))?,
+        "/notices" => in_one_frame(&mut ctx, |ctx| {
+            let notices = ctx.renderer.recent_notices();
+            if notices.is_empty() {
+                write_ok(ctx.renderer, "no recent notices");
+            }
+            for notice in notices {
+                write_ok(ctx.renderer, notice);
+            }
+        }),
         #[cfg(feature = "subagents")]
         "/tasks" => in_one_frame(&mut ctx, |ctx| tasks::handle(&parts, ctx))?,
         "/help" => in_one_frame(&mut ctx, |ctx| help::handle(&parts, ctx)),
@@ -1292,10 +1337,7 @@ pub(crate) async fn handle_slash(
         }
         #[cfg(not(feature = "goal"))]
         "/goal" => {
-            write_error(
-                ctx.renderer,
-                "/goal requires the 'goal' feature: cargo install --path . --features goal",
-            );
+            write_error(ctx.renderer, feature_missing("/goal", "goal"));
             Ok(())
         }
         _ => {
@@ -1324,6 +1366,61 @@ pub(crate) async fn handle_slash(
         }
     }
 }
+
+/// The one message for a command whose Cargo feature is not compiled in.
+pub(crate) fn feature_missing(command: &str, feature: &str) -> String {
+    format!(
+        "{command} requires the '{feature}' feature: cargo install --path . --features {feature}"
+    )
+}
+
+#[cfg(test)]
+mod feature_missing_tests {
+    #[test]
+    fn names_the_install_command_never_cargo_build() {
+        let message = super::feature_missing("/loop", "loop");
+        assert_eq!(
+            message,
+            "/loop requires the 'loop' feature: cargo install --path . --features loop"
+        );
+        assert!(!message.contains("cargo build"));
+    }
+}
+
+/// A slash command that finishes in the app loop (it needs the runner, the
+/// terminal or the event thread), signalled through `Err` and downcast once in
+/// `App::handle_slash_result`.
+#[derive(Debug)]
+pub(crate) enum DeferredSlash {
+    /// `/compact [instructions]`.
+    Compress(Option<String>),
+    /// `/init`: the prompt that creates AGENTS.md.
+    Init(String),
+    /// `/review`: the prompt to run as an internal turn.
+    Review(String),
+    /// `/memory editor`: the file to open.
+    #[cfg(feature = "memory")]
+    Editor(std::path::PathBuf),
+    /// `/mcp login <server>`: the OAuth login runs as a background task.
+    #[cfg(feature = "mcp")]
+    McpLogin(String),
+}
+
+impl std::fmt::Display for DeferredSlash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Compress(_) => "deferred slash action: compact",
+            Self::Init(_) => "deferred slash action: init",
+            Self::Review(_) => "deferred slash action: review",
+            #[cfg(feature = "memory")]
+            Self::Editor(_) => "deferred slash action: editor",
+            #[cfg(feature = "mcp")]
+            Self::McpLogin(_) => "deferred slash action: mcp login",
+        })
+    }
+}
+
+impl std::error::Error for DeferredSlash {}
 
 #[cfg(test)]
 mod argument_split_tests {

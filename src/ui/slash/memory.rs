@@ -6,6 +6,8 @@ use crate::ui::slash::write_error;
 use crate::ui::slash::write_ok;
 #[cfg(feature = "memory")]
 use crate::ui::slash::write_result;
+#[cfg(feature = "memory")]
+use crate::ui::slash::write_usage;
 use smallvec::SmallVec;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -38,10 +40,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
     #[cfg(not(feature = "memory"))]
     {
         let _ = parts;
-        write_error(
-            ctx.renderer,
-            "/memory is not available. Rebuild with:\n  cargo install --path . --debug --features memory",
-        );
+        write_error(ctx.renderer, super::feature_missing("/memory", "memory"));
     }
     #[cfg(feature = "memory")]
     {
@@ -53,7 +52,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
             Some("editor") => return handle_editor(ctx),
             Some("clear") => handle_clear(parts, ctx),
             _ => {
-                write_error(
+                write_usage(
                     ctx.renderer,
                     "usage: /memory [status|search|read|write|editor|clear]",
                 );
@@ -67,7 +66,7 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
 fn handle_status(ctx: &mut SlashCtx<'_>) {
     let mem = Mem::open();
     write_ok(ctx.renderer, "memory status:");
-    write_result(
+    write_usage(
         ctx.renderer,
         "usage: /memory <status|search|read|write|editor|clear>  (press Tab for options)",
     );
@@ -121,7 +120,7 @@ fn handle_status(ctx: &mut SlashCtx<'_>) {
 #[cfg(feature = "memory")]
 fn handle_search(parts: &[&str], ctx: &mut SlashCtx<'_>) {
     if parts.len() < 3 {
-        write_error(ctx.renderer, "usage: /memory search <query>");
+        write_usage(ctx.renderer, "usage: /memory search <query>");
         return;
     }
     let query = parts[2..].join(" ");
@@ -142,7 +141,7 @@ fn handle_read(parts: &[&str], ctx: &mut SlashCtx<'_>) {
 #[cfg(feature = "memory")]
 fn handle_read_with_mem(parts: &[&str], renderer: &mut crate::ui::renderer::Renderer, mem: &Mem) {
     if parts.len() < 3 {
-        write_error(renderer, "usage: /memory read <source> [YYYY-MM-DD|name]");
+        write_usage(renderer, "usage: /memory read <source> [YYYY-MM-DD|name]");
         write_result(
             renderer,
             "  sources: long_term, scratchpad, daily [YYYY-MM-DD], note <name>",
@@ -196,7 +195,7 @@ fn handle_read_with_mem(parts: &[&str], renderer: &mut crate::ui::renderer::Rend
 #[cfg(feature = "memory")]
 fn handle_write(parts: &[&str], ctx: &mut SlashCtx<'_>) {
     if parts.len() < 4 {
-        write_error(ctx.renderer, "usage: /memory write <target> <content>");
+        write_usage(ctx.renderer, "usage: /memory write <target> <content>");
         write_result(
             ctx.renderer,
             "  targets: long_term, scratchpad, daily, note:<name>",
@@ -239,7 +238,7 @@ fn handle_editor(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         ctx.renderer,
         format!("opening {} in editor...", path.display()),
     );
-    Err(anyhow::anyhow!("DEFER_EDITOR:{}", path.display()))
+    Err(super::DeferredSlash::Editor(path).into())
 }
 
 struct EditorTempFile {
@@ -369,7 +368,7 @@ fn verify_memory_editor_preservation_at(root: &Path) -> std::io::Result<()> {
 #[cfg(feature = "memory")]
 fn handle_clear(parts: &[&str], ctx: &mut SlashCtx<'_>) {
     if parts.len() < 3 {
-        write_error(ctx.renderer, "usage: /memory clear scratchpad|daily");
+        write_usage(ctx.renderer, "usage: /memory clear scratchpad|daily");
         return;
     }
     let mem = Mem::open();

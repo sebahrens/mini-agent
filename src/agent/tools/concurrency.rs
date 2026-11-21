@@ -133,6 +133,28 @@ fn access_for_call(access: ToolAccess, args: &str) -> ToolAccess {
     }
 }
 
+/// One reader/writer lane plus the ticket that keeps exclusive calls in order.
+///
+/// An exclusive call takes the `order` ticket first and keeps it for the whole
+/// call, including a permission prompt during which it gives the writer lease
+/// back. Shared calls then run while a prompt is open, but no later exclusive
+/// call of the batch can start before the earlier one finished: the prompt
+/// released the lease to readers only (mini-agent-sskdu.248).
+#[derive(Clone)]
+struct Lane {
+    rw: Arc<RwLock<()>>,
+    order: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl Lane {
+    fn new() -> Self {
+        Self {
+            rw: Arc::new(RwLock::new(())),
+            order: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
 enum Lease {
     Shared(#[allow(dead_code)] tokio::sync::OwnedRwLockReadGuard<()>),
     Exclusive(#[allow(dead_code)] tokio::sync::OwnedRwLockWriteGuard<()>),
@@ -148,8 +170,11 @@ enum Lease {
 /// must treat every identity it captured before the prompt as stale and
 /// re-capture it under the re-acquired lease.
 struct LaneSlot {
-    lane: Arc<RwLock<()>>,
+    lane: Lane,
     lease: std::sync::Mutex<Option<Lease>>,
+    /// The exclusive ordering ticket; held until the call ends.
+    #[allow(dead_code)]
+    ticket: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 /// Set by a tool around its permission check to allow that check to release
@@ -203,14 +228,14 @@ pub(crate) fn suspend_for_prompt() -> Option<SuspendedLease> {
 impl SuspendedLease {
     /// Wait for the exclusive lease again. Queues behind any other holder.
     pub(crate) async fn resume(self) {
-        let guard = Arc::clone(&self.slot.lane).write_owned().await;
+        let guard = Arc::clone(&self.slot.lane.rw).write_owned().await;
         *self.slot.lease.lock().unwrap_or_else(|e| e.into_inner()) = Some(Lease::Exclusive(guard));
     }
 }
 
 struct ConcurrencyBoundTool {
     inner: Box<dyn ToolDyn>,
-    lane: Arc<RwLock<()>>,
+    lane: Lane,
     access: ToolAccess,
     /// Foreground `shell` calls claim their announced internal call id so
     /// their live output preview is labelled like the transcript; other
@@ -222,7 +247,7 @@ struct ConcurrencyBoundTool {
 impl ConcurrencyBoundTool {
     fn new(
         inner: Box<dyn ToolDyn>,
-        lane: Arc<RwLock<()>>,
+        lane: Lane,
         shared_names: &std::collections::HashSet<String>,
     ) -> Self {
         let name = inner.name();
@@ -241,15 +266,25 @@ impl ConcurrencyBoundTool {
     }
 
     async fn lease(&self, args: &str) -> Arc<LaneSlot> {
-        let lease = match access_for_call(self.access, args) {
-            ToolAccess::Read => Lease::Shared(Arc::clone(&self.lane).read_owned().await),
+        let (lease, ticket) = match access_for_call(self.access, args) {
+            ToolAccess::Read => (
+                Lease::Shared(Arc::clone(&self.lane.rw).read_owned().await),
+                None,
+            ),
             ToolAccess::Write | ToolAccess::JobStatus | ToolAccess::Task | ToolAccess::Git => {
-                Lease::Exclusive(Arc::clone(&self.lane).write_owned().await)
+                // Ticket first, then the writer lease: a ticket holder is the
+                // only exclusive call that can be waiting on the lease.
+                let ticket = Arc::clone(&self.lane.order).lock_owned().await;
+                (
+                    Lease::Exclusive(Arc::clone(&self.lane.rw).write_owned().await),
+                    Some(ticket),
+                )
             }
         };
         Arc::new(LaneSlot {
-            lane: Arc::clone(&self.lane),
+            lane: self.lane.clone(),
             lease: std::sync::Mutex::new(Some(lease)),
+            ticket,
         })
     }
 
@@ -377,15 +412,12 @@ pub(crate) fn bind_with_shared(
     tools: Vec<Box<dyn ToolDyn>>,
     shared_names: &std::collections::HashSet<String>,
 ) -> Vec<Box<dyn ToolDyn>> {
-    let lane = Arc::new(RwLock::new(()));
+    let lane = Lane::new();
     tools
         .into_iter()
         .map(|tool| {
-            Box::new(ConcurrencyBoundTool::new(
-                tool,
-                Arc::clone(&lane),
-                shared_names,
-            )) as Box<dyn ToolDyn>
+            Box::new(ConcurrencyBoundTool::new(tool, lane.clone(), shared_names))
+                as Box<dyn ToolDyn>
         })
         .collect()
 }
@@ -1254,7 +1286,7 @@ mod prompt_release_tests {
     }
 
     #[tokio::test]
-    async fn two_same_file_edits_needing_approval_never_publish_a_stale_identity() {
+    async fn two_same_file_edits_needing_approval_run_in_call_order() {
         let root = crate::tests::OwnedTestDirectory::new("prompt-release-two-edits");
         let file = root.path().join("shared.txt");
         std::fs::write(&file, "one\ntwo\n").unwrap();
@@ -1266,7 +1298,6 @@ mod prompt_release_tests {
         ]));
         let extensions = Arc::new(ToolCallExtensions::new());
         let mut calls = Vec::new();
-        let mut requests = Vec::new();
         for (index, (search, replace)) in [("one", "ONE"), ("two", "TWO")].into_iter().enumerate() {
             let tools = Arc::clone(&tools);
             let extensions = Arc::clone(&extensions);
@@ -1274,11 +1305,15 @@ mod prompt_release_tests {
             calls.push(tokio::spawn(async move {
                 tools[index].call_structured(args, &extensions).await
             }));
-            // Both prompts must be open at once: the first edit gave the lane back.
-            requests.push(next_request(&mut receiver).await);
         }
-        let second = requests.pop().unwrap();
-        let first = requests.pop().unwrap();
+        // Only the first prompt opens: the second edit waits for its turn.
+        let first = next_request(&mut receiver).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), receiver.recv())
+                .await
+                .is_err(),
+            "the second exclusive call must not prompt before the first finished"
+        );
         first.reply.send(UserDecision::AllowOnce).unwrap();
         let first_result = tokio::time::timeout(WAIT, calls.remove(0))
             .await
@@ -1287,20 +1322,73 @@ mod prompt_release_tests {
         assert!(matches!(first_result.outcome(), ToolOutcome::Success));
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "ONE\ntwo\n");
 
-        second.reply.send(UserDecision::AllowOnce).unwrap();
+        next_request(&mut receiver)
+            .await
+            .reply
+            .send(UserDecision::AllowOnce)
+            .unwrap();
         let second_result = tokio::time::timeout(WAIT, calls.remove(0))
             .await
             .unwrap()
             .unwrap();
-        assert!(!matches!(second_result.outcome(), ToolOutcome::Success));
         assert!(
-            second_result
-                .model_output()
-                .contains("Path changed after permission check"),
+            matches!(second_result.outcome(), ToolOutcome::Success),
             "{}",
             second_result.model_output()
         );
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ONE\ntwo\n");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ONE\nTWO\n");
+    }
+
+    #[tokio::test]
+    async fn a_prompt_releases_the_lease_to_readers_only() {
+        let root = crate::tests::OwnedTestDirectory::new("prompt-release-order");
+        let (first_probe, first_entered, first_release, _) = probe("write");
+        let (second_probe, second_entered, second_release, _) = probe("write");
+        let (read_probe, read_entered, read_release, _) = probe("read");
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(4);
+        let asking = AskingProbe {
+            permission: asking_permission(root.path()),
+            ask_tx: sender,
+            probe: first_probe,
+            name: "write",
+        };
+        let tools = Arc::new(bind(vec![
+            Box::new(asking),
+            Box::new(second_probe),
+            Box::new(read_probe),
+        ]));
+        let first_tools = Arc::clone(&tools);
+        let first = tokio::spawn(async move { first_tools[0].call("{}".to_owned()).await });
+        let request = next_request(&mut receiver).await;
+        let second_tools = Arc::clone(&tools);
+        let second = tokio::spawn(async move { second_tools[1].call("{}".to_owned()).await });
+        let read_tools = Arc::clone(&tools);
+        let reader = tokio::spawn(async move { read_tools[2].call("{}".to_owned()).await });
+
+        // A read proceeds while the first write awaits approval ...
+        tokio::time::timeout(WAIT, read_entered.notified())
+            .await
+            .expect("a read must run during the prompt");
+        read_release.notify_one();
+        reader.await.unwrap().unwrap();
+        // ... but the second write stays out until the first has finished.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(60), second_entered.notified())
+                .await
+                .is_err(),
+            "a later exclusive call must not run during an earlier call's prompt"
+        );
+        request.reply.send(UserDecision::AllowOnce).unwrap();
+        tokio::time::timeout(WAIT, first_entered.notified())
+            .await
+            .expect("approved write proceeds");
+        first_release.notify_one();
+        first.await.unwrap().unwrap();
+        tokio::time::timeout(WAIT, second_entered.notified())
+            .await
+            .expect("the second write runs after the first");
+        second_release.notify_one();
+        second.await.unwrap().unwrap();
     }
 
     #[tokio::test]

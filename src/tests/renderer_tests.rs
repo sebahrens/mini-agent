@@ -609,6 +609,127 @@ mod dirty {
     }
 
     #[test]
+    fn wrapped_text_and_urls_copy_and_open_as_one_logical_line() {
+        let mut r = Renderer::new().unwrap();
+        let width = r.line_width();
+        let url = format!("https://example.com/{}", "a".repeat(width * 2));
+        r.feed_mut().push_line(BlockStyle::Plain, &url);
+        let rows = r.buffer_len();
+        assert!(rows >= 3);
+        r.selection_active = true;
+        r.selection_start = Some(SelectionPoint::new(0, 0));
+        r.selection_end = Some(SelectionPoint::new(rows - 1, 500));
+        assert_eq!(r.selected_text().as_deref(), Some(url.as_str()));
+        for row in 0..rows {
+            assert_eq!(
+                r.link_url_at(row, 1).as_deref(),
+                Some(url.as_str()),
+                "row {row}"
+            );
+        }
+        let mut r = Renderer::new().unwrap();
+        let words = "word ".repeat(width);
+        r.feed_mut().push_line(BlockStyle::Plain, words.trim_end());
+        r.selection_active = true;
+        r.selection_start = Some(SelectionPoint::new(0, 0));
+        r.selection_end = Some(SelectionPoint::new(r.buffer_len() - 1, 500));
+        assert_eq!(r.selected_text().as_deref(), Some(words.trim_end()));
+    }
+
+    fn scrolled_renderer_with_fold() -> (Renderer, usize) {
+        let mut r = Renderer::new().unwrap();
+        for i in 0..40 {
+            r.feed_mut().push_line(BlockStyle::Plain, format!("p{i}"));
+        }
+        let expanded = (0..30)
+            .map(|i| format!("e{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        r.feed_mut().place_block_after_anchor(
+            "",
+            crate::ui::feed::Block::foldable(BlockStyle::ToolResult, "summary", expanded, false),
+        );
+        for i in 0..40 {
+            r.feed_mut().push_line(BlockStyle::Plain, format!("q{i}"));
+        }
+        let summary = 40;
+        let visible = r.visible_lines() as u16;
+        for _ in 0..200 {
+            if (0..visible).any(|row| r.buffer_line_at_row(row) == Some(summary)) {
+                break;
+            }
+            r.scroll_line_up();
+        }
+        (r, summary)
+    }
+
+    #[test]
+    fn unfolding_while_scrolled_keeps_the_clicked_summary_under_the_pointer() {
+        let (mut r, summary) = scrolled_renderer_with_fold();
+        let visible = r.visible_lines() as u16;
+        let row = (0..visible)
+            .find(|row| r.buffer_line_at_row(*row) == Some(summary))
+            .unwrap();
+        assert_eq!(r.toggle_tool_output_at_line(summary), Some(true));
+        assert_eq!(r.buffer_line_at_row(row), Some(summary));
+        assert_eq!(r.toggle_tool_output_at_line(summary), Some(false));
+        assert_eq!(r.buffer_line_at_row(row), Some(summary));
+        // `/expand` keeps the viewport too.
+        assert_eq!(r.set_tool_output_fold(1, Some(true)), Some(true));
+        assert_eq!(r.buffer_line_at_row(row), Some(summary));
+    }
+
+    #[test]
+    fn ctrl_t_prefers_a_result_in_view_and_only_the_newest_shows_the_hint() {
+        let (mut r, summary) = scrolled_renderer_with_fold();
+        for _ in 0..3 {
+            r.scroll_line_up();
+        }
+        assert_eq!(r.ctrl_t_fold_target(), 1);
+        // A newer result below the viewport: Ctrl+T still picks the visible one.
+        r.feed_mut().place_block_after_anchor(
+            "",
+            crate::ui::feed::Block::foldable(BlockStyle::ToolResult, "newer", "x\ny", false),
+        );
+        assert_eq!(r.ctrl_t_fold_target(), 2);
+        r.feed_mut().refresh_fold_hint();
+        let w = r.line_width();
+        let lines = r.feed().lines(w);
+        assert!(!lines[summary].text.contains("(Ctrl+T)"));
+        assert!(lines[lines.len() - 1].text.contains("(Ctrl+T)"));
+    }
+
+    #[test]
+    fn trailing_punctuation_is_not_part_of_a_url() {
+        use crate::ui::renderer::trim_url;
+        assert_eq!(trim_url("https://e.com/a."), "https://e.com/a");
+        assert_eq!(trim_url("https://e.com)"), "https://e.com");
+        assert_eq!(trim_url("https://e.com`"), "https://e.com");
+        assert_eq!(trim_url("https://e.com/a_(b)"), "https://e.com/a_(b)");
+        assert_eq!(trim_url("https://e.com/a),"), "https://e.com/a");
+    }
+
+    #[test]
+    fn recent_notices_keep_the_last_twenty_in_order() {
+        let mut r = Renderer::new().unwrap();
+        for i in 0..25 {
+            r.show_notice(&format!("notice {i}"), crossterm::style::Color::White);
+        }
+        let notices = r.recent_notices();
+        assert_eq!(notices.len(), 20);
+        assert_eq!(notices[0], "notice 5");
+        assert_eq!(notices[19], "notice 24");
+    }
+
+    #[test]
+    fn error_notices_are_kept_in_the_transcript() {
+        let mut r = Renderer::new().unwrap();
+        let before = r.feed().block_count();
+        r.show_notice("copy failed: wl-copy missing", crate::ui::C_ERROR);
+        assert_eq!(r.feed().block_count(), before + 1);
+    }
+
+    #[test]
     fn copy_notices_are_transient_and_never_enter_the_transcript() {
         let mut r = Renderer::new().unwrap();
         let before = r.feed().block_count();
@@ -671,7 +792,7 @@ mod dirty {
     }
 
     #[test]
-    fn feed_retention_resets_scroll_and_selection_indices() {
+    fn feed_pruning_keeps_a_scrolled_view_and_drops_the_selection() {
         let mut r = Renderer::new().unwrap();
         let (max_blocks, _, _) = Feed::retention_limits_for_test();
         for index in 0..max_blocks {
@@ -687,7 +808,8 @@ mod dirty {
 
         r.reconcile_feed_retention();
 
-        assert!(!r.is_scrolling());
+        // Rows are measured from the bottom, so pruning the front keeps the view.
+        assert!(r.is_scrolling());
         assert!(!r.selection_active);
         assert_eq!(r.selection_start, None);
         assert_eq!(r.selection_end, None);
@@ -1013,6 +1135,55 @@ mod permission_prompt_layout_tests {
     use crate::ui::utils::display_width;
 
     const OPTIONS: &str = "  (y) allow once  (n) deny";
+
+    #[test]
+    fn question_options_keep_the_answer_draft_and_key_hint_on_a_short_terminal() {
+        let mut options: Vec<String> = (1..=6)
+            .map(|n| format!("  ({n}) option {n} — {}", "description ".repeat(12)))
+            .collect();
+        options.push("Answer: my typed answer".into());
+        options.push("[Enter] submit answer  [Esc] back".into());
+        let rows =
+            permission_prompt_rows("[question 1/1] Which?", &options.join("\n"), 80, 12, true);
+        assert!(rows.len() <= expanded_prompt_max_rows(12), "{rows:?}");
+        assert!(rows.iter().all(|row| display_width(row) <= 80), "{rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("Answer: my typed answer")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.last().unwrap().contains("[Enter] submit answer"),
+            "{rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("option 1")), "{rows:?}");
+        // Roomy terminals show every option in full, one per row group.
+        let roomy =
+            permission_prompt_rows("[question 1/1] Which?", &options.join("\n"), 80, 60, true);
+        assert!(roomy.iter().any(|r| r.contains("option 6")), "{roomy:?}");
+    }
+
+    #[test]
+    fn deny_note_stays_visible_under_a_long_multiline_request() {
+        let header = format!(
+            "[permission] bash: {}",
+            (0..20)
+                .map(|n| format!("line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let options = "note for the model: do it differently\n[Enter] deny and send the note  [Esc] back to the prompt";
+        let rows = permission_prompt_rows(&header, options, 80, 24, false);
+        assert!(rows.len() <= prompt_max_rows(24), "{rows:?}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("note for the model: do it differently")),
+            "{rows:?}"
+        );
+        assert!(
+            rows.last().unwrap().contains("[Enter] deny and send"),
+            "{rows:?}"
+        );
+    }
 
     #[test]
     fn a_long_path_wraps_instead_of_being_clipped() {
@@ -1554,6 +1725,10 @@ mod tool_output_folding {
         assert!(looks_like_error("  error reading file"));
         assert!(looks_like_error("Permission denied by user"));
         assert!(!looks_like_error("File: src/main.rs (10 lines)"));
+        assert!(!looks_like_error("errors.rs\nlib.rs"));
+        assert!(!looks_like_error("error_codes.go:12: match"));
+        assert!(looks_like_error("Error: boom"));
+        assert!(looks_like_error("error"));
     }
 
     #[test]
@@ -1692,7 +1867,9 @@ mod tool_output_folding {
             .push_anchored_block("b", BlockStyle::Tool, "◈ read \"b\"");
         let view = tool_result_view(&long_output(), false, ResolvedToolOutput::Collapsed);
         r.write_tool_result("a", &view).unwrap();
-        assert_eq!(r.feed().block_text(1), Some(view.collapsed.as_str()));
+        // The newest folded summary carries the Ctrl+T hint.
+        let hinted = format!("{} (Ctrl+T)", view.collapsed);
+        assert_eq!(r.feed().block_text(1), Some(hinted.as_str()));
         assert_eq!(r.feed().block_count(), 3);
         r.mark_chat_clean();
         assert_eq!(r.set_tool_output_fold(1, None), Some(true));

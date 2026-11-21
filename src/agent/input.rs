@@ -50,6 +50,15 @@ impl PromptInput {
         self.turn_directive = directive.and_then(bounded_turn_directive);
         self
     }
+    /// Like [`Self::with_turn_directive`] for host-owned text that is already
+    /// bounded by its producer (the `--output-schema` contract, at most 64 KiB):
+    /// blank is dropped, the 1 KiB routing budget does not apply.
+    pub(crate) fn with_host_turn_directive(mut self, directive: Option<String>) -> Self {
+        self.turn_directive = directive
+            .map(|directive| directive.trim().to_owned())
+            .filter(|directive| !directive.is_empty());
+        self
+    }
     /// Mark (or, with `None`, unmark) this turn so its first model request
     /// forces `tool`. See [`PromptInput::first_request_tool`].
     #[cfg(feature = "subagents")]
@@ -63,7 +72,7 @@ impl PromptInput {
     pub(crate) fn first_request_tool(&self) -> Option<&'static str> {
         self.first_request_tool
     }
-    #[cfg(test)]
+    #[cfg(any(test, all(feature = "goal", feature = "acp")))]
     pub(crate) fn turn_directive(&self) -> Option<&str> {
         self.turn_directive.as_deref()
     }
@@ -119,6 +128,21 @@ impl PromptInput {
         self.text = text;
         Ok(())
     }
+}
+
+/// Prefix of every host-authored instruction injected as a user-role message
+/// (continuations after verification, hook blocks, truncation, retries).
+pub(crate) const HOST_MESSAGE_PREFIX: &str = "[Host:";
+
+/// One constructor for host continuation text, so the model can tell it from the
+/// human and the transcript can store it as a host row rather than a user prompt.
+pub(crate) fn host_instruction(kind: &str, body: &str) -> String {
+    format!("{HOST_MESSAGE_PREFIX} {kind}; not written by the user]\n{body}")
+}
+
+/// Whether `text` was produced by [`host_instruction`].
+pub(crate) fn is_host_instruction(text: &str) -> bool {
+    text.starts_with(HOST_MESSAGE_PREFIX)
 }
 
 fn bounded_turn_directive(directive: String) -> Option<String> {
@@ -234,6 +258,21 @@ mod tests {
         assert_eq!(
             prompt.with_turn_directive(None).to_message(),
             plain.to_message()
+        );
+    }
+
+    #[test]
+    fn host_directive_is_unbounded_but_stays_out_of_the_literal_text() {
+        let long = "s".repeat(TURN_DIRECTIVE_MAX_BYTES * 4);
+        let prompt = PromptInput::text("question".into())
+            .with_host_turn_directive(Some(format!("  {long}  ")));
+        assert_eq!(prompt.turn_directive(), Some(long.as_str()));
+        assert_eq!(prompt.literal_text(), "question");
+        assert!(
+            PromptInput::text("x".into())
+                .with_host_turn_directive(Some("  ".into()))
+                .turn_directive()
+                .is_none()
         );
     }
 

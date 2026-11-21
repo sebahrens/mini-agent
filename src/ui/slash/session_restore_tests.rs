@@ -1096,7 +1096,7 @@ fn rewind_shell_picker_restores_only_the_command_and_keeps_redo_complete() {
         crate::ui::rewind_targets(&session),
         crate::ui::pickers::rewind::RewindBinding::capture(&session, &workspace).unwrap(),
     );
-    for code in [KeyCode::Down, KeyCode::Enter, KeyCode::Enter] {
+    for code in [KeyCode::Up, KeyCode::Enter, KeyCode::Enter] {
         assert!(input.handle_picker_key(KeyEvent::new(code, KeyModifiers::NONE)));
     }
     let Some(RewindOutcome::Confirmed(index, _, _)) = input.take_rewind_outcome() else {

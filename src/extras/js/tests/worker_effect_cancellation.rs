@@ -112,7 +112,15 @@ async fn worker_effect_cancellation_drains_reconciliation_then_recycles_and_reco
         .expect("next invocation must start with fresh authority and worker state");
     assert_eq!(next.outcome, StepOutcome::Value("success".into()));
     assert_eq!(supervisor.generation_for_test().await, Some(2));
+    // mini-agent-sskdu.155: an idle worker exits in milliseconds, so shutdown must not
+    // sleep a whole effect-liveness poll (250 ms) first.
+    let started = std::time::Instant::now();
     supervisor.shutdown_for_test().await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "idle shutdown took {:?}",
+        started.elapsed()
+    );
 }
 
 #[tokio::test]

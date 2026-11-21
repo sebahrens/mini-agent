@@ -377,6 +377,39 @@ fn headless_text_only_turn_persists_single_assistant_message() {
     assert_eq!(session.messages[1].content, "hello");
 }
 
+// mini-agent-sskdu.187: a host continuation instruction (here a verification
+// failure) is stored as a host row by both frontends, never as a user prompt,
+// and replays as a marked user-side message.
+#[test]
+fn host_continuation_instruction_is_a_system_row_in_both_frontends() {
+    let instruction = crate::agent::input::host_instruction(
+        "the configured verification command failed",
+        "The host ran `cargo test`.",
+    );
+    let interactions = vec![
+        Message::assistant("done"),
+        Message::user(instruction.clone()),
+        Message::assistant("fixed"),
+    ];
+    let mut headless = session();
+    persist_headless_turn(&mut headless, "fix it", "fixed", &interactions);
+    assert_eq!(
+        roles(&headless),
+        [
+            MessageRole::User,
+            MessageRole::Assistant,
+            MessageRole::System,
+            MessageRole::Assistant
+        ]
+    );
+    assert_eq!(headless.messages[2].content, instruction);
+
+    let mut tui = session();
+    crate::ui::event_handler::commit_turn_response(&mut tui, "fixed", &interactions);
+    assert_eq!(roles(&tui), [MessageRole::System, MessageRole::Assistant]);
+    assert_eq!(tui.messages[0].content, instruction);
+}
+
 // mini-agent-knwk1: text written before a tool call is its own assistant
 // record ahead of that call, and the final answer is not concatenated onto it.
 #[test]

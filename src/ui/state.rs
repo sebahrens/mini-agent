@@ -419,24 +419,38 @@ impl PendingMainTurn {
             .filter(|message| message.role == crate::session::MessageRole::ToolResult)
             .filter_map(|message| message.tool_call_id.as_deref().map(str::to_owned))
             .collect();
-        let mut unresolved = Vec::new();
+        let mut unresolved: Vec<(String, String)> = Vec::new();
         let mut seen = std::collections::HashSet::new();
-        for id in session.messages[turn_start..]
+        for message in session.messages[turn_start..]
             .iter()
             .filter(|message| message.role == crate::session::MessageRole::ToolCall)
-            .filter_map(|message| message.tool_call_id.as_deref())
         {
+            let Some(id) = message.tool_call_id.as_deref() else {
+                continue;
+            };
             if !resolved.contains(id) && seen.insert(id.to_owned()) {
-                unresolved.push(id.to_owned());
+                // The call message names the tool; keep it on the closing result.
+                let name = match &message.tool {
+                    Some(crate::session::PersistedToolMessage::Call { name, .. }) => {
+                        name.to_string()
+                    }
+                    _ => "unknown".to_owned(),
+                };
+                unresolved.push((id.to_owned(), name));
             }
         }
 
-        for id in unresolved {
-            session.add_tool_result_with_id(
-                &id,
-                "unknown",
-                crate::agent::runner::UNKNOWN_TOOL_OUTCOME,
-            );
+        for (id, name) in unresolved {
+            // A call that finished while its batch was still running has a real
+            // result; only calls that really did not finish are "unknown".
+            match crate::agent::runner::take_settled_result(&id) {
+                Some(result) => session.add_tool_result_with_id(&id, &name, &result),
+                None => session.add_tool_result_with_id(
+                    &id,
+                    &name,
+                    crate::agent::runner::UNKNOWN_TOOL_OUTCOME,
+                ),
+            };
         }
     }
 
@@ -511,6 +525,9 @@ impl PendingMainTurn {
 /// stream and abort handle, queued user input, and streaming-response scratch.
 #[derive(Default)]
 pub(crate) struct AgentRunState {
+    /// A `ToolLoop` notice arrived for the result that follows; that result
+    /// is persisted but not rendered (the notice is the diagnostic).
+    pub(crate) loop_guard_result_pending: bool,
     pub(crate) native_checkpointed: bool,
     pub(crate) native_session_end: Option<crate::provider::NativeSessionEndOwner>,
     /// Current native actor's exact writer and prepared-history binding.
@@ -546,6 +563,10 @@ pub(crate) struct AgentRunState {
     /// turn-scoped `schedule_wakeup` tool bound to this slot on the agent it
     /// runs, and the scheduler removes the tool when that turn ends.
     pub(crate) cron_wakeup: Option<crate::agent::tools::schedule_wakeup::WakeupSlot>,
+    /// Present while a self-paced `/cron` entry exists: the tool stays
+    /// registered on the agent (every turn, rebuilds included) so the request's
+    /// tool list is stable; only the cell's armed slot changes per fire.
+    pub(crate) cron_wakeup_cell: Option<crate::agent::tools::schedule_wakeup::WakeupCell>,
     /// Typed marker armed with `next_turn_directive` for an `@agent` mention
     /// turn when `agent_mention_tool_choice = "force"`: the tool the turn's
     /// first model request must call. Taken by the same start attempt.

@@ -34,6 +34,25 @@ pub(super) fn premature_prompt_key(
     }
 }
 
+/// A paste into a one-line draft: line breaks become single spaces (so pasted
+/// lines are not glued together) and every other control character is dropped.
+fn one_line_paste(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\r' => {
+                chars.next_if_eq(&'\n');
+                out.push(' ');
+            }
+            '\n' => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 pub(super) fn prompt_arming_delay() -> std::time::Duration {
     PROMPT_ARMING_DELAY
 }
@@ -50,6 +69,9 @@ enum PromptInput {
     AllowFolder,
     /// Only native write/edit under the captured workspace, for this session.
     AllowWorkspaceEdits,
+    /// `x`: any literal command starting with the offered argv prefix, for
+    /// this session (mini-agent-sskdu.149).
+    AllowPrefix,
     Deny,
     /// `t`: deny once and tell the model what to do differently (one line).
     DenyWithNote,
@@ -62,16 +84,61 @@ enum PromptInput {
     Ignore,
 }
 
-/// Options line for an ordinary approval. Session-scoped grants are labelled
-/// as such: nothing here persists beyond the session.
-fn permission_options(folder: Option<&std::path::Path>) -> String {
-    match folder {
-        Some(folder) => format!(
-            "  (y) allow once  (a) allow for this session  (f) allow read+edit+list in {} for this session  (n) deny once  (t) deny and tell the model why  (s) deny and stop with instruction  (ESC) deny and stop",
-            folder.display()
-        ),
-        None => "  (y) allow once  (a) allow for this session  (n) deny once  (t) deny and tell the model why  (s) deny and stop with instruction  (ESC) deny and stop".to_string(),
+/// Tools whose approvals are answered by a one-shot channel the sender owns
+/// and never recorded in the permission checker. A session or project grant
+/// for them would be shown as saved but never honoured (mini-agent-sskdu.145):
+/// an escalation asks every time; a network host is remembered in memory by
+/// the proxy for this process only.
+fn grant_support(tool: &str) -> (bool, bool) {
+    // (offers a session grant, may persist it for the project)
+    match tool {
+        "sandbox_escalation" => (false, false),
+        "sandbox_network" => (true, false),
+        _ => (true, true),
     }
+}
+
+/// Plain-words scope of what `(a)` / `(p)` grant for this request, so the user
+/// sees it before answering and in the decision line (mini-agent-sskdu.40).
+fn grant_scope(tool: &str, input: &str, pattern: &str) -> String {
+    const MAX: usize = 100;
+    let scope = if tool == "sandbox_network" {
+        input.to_string()
+    } else if pattern == input {
+        match tool {
+            "bash" | "shell" => "this exact command".to_string(),
+            _ => format!("this exact {tool} request"),
+        }
+    } else {
+        format!(
+            "{tool} on {}",
+            crate::permission::pattern::describe_allow_pattern(pattern)
+        )
+    };
+    let scope = sanitize_for_review(&scope).replace('\n', " ");
+    if scope.chars().count() > MAX {
+        scope.chars().take(MAX - 1).chain(['…']).collect()
+    } else {
+        scope
+    }
+}
+
+/// Options line for an ordinary approval. Session-scoped grants are labelled
+/// as such, with the scope they cover: nothing here persists beyond the
+/// session. `scope` is `None` when the request offers no reusable grant.
+fn permission_options(folder: Option<&std::path::Path>, scope: Option<&str>) -> String {
+    let mut line = String::from("  (y) allow once");
+    if let Some(scope) = scope {
+        line.push_str(&format!("  (a) allow {scope} for this session"));
+    }
+    if let Some(folder) = folder {
+        line.push_str(&format!(
+            "  (f) allow read+edit+list in {} for this session",
+            folder.display()
+        ));
+    }
+    line.push_str("  (n) deny once  (t) deny and tell the model why  (s) deny and stop with instruction  (ESC) deny and stop");
+    line
 }
 
 /// Appended last so a narrow terminal truncates it before any answer key.
@@ -101,6 +168,7 @@ fn classify_prompt_key(key: KeyEvent) -> PromptInput {
         KeyCode::Char('p' | 'P') if plain => PromptInput::AllowProject,
         KeyCode::Char('f' | 'F') if plain => PromptInput::AllowFolder,
         KeyCode::Char('w' | 'W') if plain => PromptInput::AllowWorkspaceEdits,
+        KeyCode::Char('x' | 'X') if plain => PromptInput::AllowPrefix,
         KeyCode::Char('n' | 'N') if plain => PromptInput::Deny,
         KeyCode::Char('t' | 'T') if plain => PromptInput::DenyWithNote,
         KeyCode::Char('s' | 'S') if plain => PromptInput::StopWithInstruction,
@@ -186,6 +254,11 @@ pub(crate) struct PermissionState {
     request: Option<crate::permission::ask::AskRequest>,
     offer: Option<PromptGrantOffer>,
     folder: Option<std::path::PathBuf>,
+    /// What `(a)` / `(p)` would grant, shown in the options and decision line.
+    /// `None` when the request offers no session or project grant.
+    grant_scope: Option<String>,
+    /// Offered argv prefix for a literal shell command (`cargo test`).
+    shell_prefix: Option<String>,
     workspace_edits: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     /// Canonical workspace root when `persist_project_approvals` is on.
     project: Option<std::path::PathBuf>,
@@ -227,19 +300,31 @@ impl PermissionState {
             renderer.write_line("", Color::White)?;
             run.agent_line_started = false;
         }
-        let (offer, folder) = ui.permission.as_ref().map_or((None, None), |permission| {
-            let guard = permission.lock().unwrap_or_else(|error| error.into_inner());
-            (
-                guard.prompt_grant_offer_for(&request.tool, &request.input),
-                guard.folder_grant_scope(&request.tool, &request.input),
-            )
-        });
+        let (offer, folder, shell_prefix) =
+            ui.permission
+                .as_ref()
+                .map_or((None, None, None), |permission| {
+                    let guard = permission.lock().unwrap_or_else(|error| error.into_inner());
+                    (
+                        guard.prompt_grant_offer_for(&request.tool, &request.input),
+                        guard.folder_grant_scope(&request.tool, &request.input),
+                        guard.shell_prefix_offer(&request.tool, &request.input),
+                    )
+                });
         let workspace_edits = ui.permission.as_ref().and_then(|permission| {
             permission
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .can_offer_workspace_edits(&request.tool, &request.input, &ui.workspace)
                 .then(|| ui.workspace.clone())
+        });
+        let (offers_session, may_persist) = grant_support(&request.tool);
+        let grant_scope = offers_session.then(|| {
+            let pattern = request
+                .suggested_pattern
+                .clone()
+                .unwrap_or_else(|| suggest_pattern(&request.tool, &request.input));
+            grant_scope(&request.tool, &request.input, &pattern)
         });
         let state = Self {
             origin_valid: None,
@@ -248,11 +333,10 @@ impl PermissionState {
             request: Some(request),
             offer,
             folder,
+            grant_scope,
+            shell_prefix,
             workspace_edits,
-            project: ui
-                .cfg
-                .persist_project_approvals
-                .unwrap_or(false)
+            project: (may_persist && ui.cfg.persist_project_approvals.unwrap_or(false))
                 .then(|| ui.workspace.root().to_path_buf()),
             was_at_bottom: !renderer.is_scrolling(),
             instruction: None,
@@ -273,6 +357,8 @@ impl PermissionState {
             request: None,
             offer: None,
             folder: None,
+            grant_scope: None,
+            shell_prefix: None,
             workspace_edits: None,
             project: None,
             was_at_bottom: !renderer.is_scrolling(),
@@ -345,7 +431,7 @@ impl PermissionState {
             Some(offer) => (prompt_grant_header(offer), PROMPT_GRANT_OPTIONS.to_string()),
             None => (
                 format!("[permission] {}: {}", request.tool, request.input),
-                permission_options(self.folder.as_deref()),
+                permission_options(self.folder.as_deref(), self.grant_scope.as_deref()),
             ),
         };
         if let Some(workspace) = &self.workspace_edits {
@@ -354,8 +440,19 @@ impl PermissionState {
                 workspace.root().display()
             ));
         }
+        if self.offer.is_none()
+            && let Some(prefix) = &self.shell_prefix
+        {
+            options.push_str(&format!(
+                "  (x) allow commands starting with \"{}\" for this session",
+                sanitize_for_review(prefix)
+            ));
+        }
         if self.offer.is_none() && self.project.is_some() {
-            options.push_str("  (p) always allow in this project");
+            options.push_str(&format!(
+                "  (p) always allow {} in this project",
+                self.grant_scope.as_deref().unwrap_or("this request")
+            ));
         }
         if self.offer.is_none() {
             options.push_str(PERMISSION_MODE_HINT);
@@ -384,14 +481,19 @@ impl PermissionState {
     fn show_note(&self, renderer: &mut Renderer) -> anyhow::Result<()> {
         let request = self.request.as_ref().expect("approval owns its request");
         renderer.permission_prompt = Some(super::renderer::PermissionPrompt {
+            // The request stays the header (long ones are elided there); the
+            // note sits in the options block, which the layout never cuts.
             tool: format!(
-                "[permission] {}: {} - note for the model: {}",
+                "[permission] {}: {}",
                 request.tool,
                 sanitize_for_review(&request.input),
+            )
+            .into(),
+            options: format!(
+                "note for the model: {}\n[Enter] deny and send the note  [Esc] back to the prompt",
                 sanitize_for_review(self.note.as_deref().unwrap_or_default())
             )
             .into(),
-            options: "[Enter] deny and send the note to the model  [Esc] back to the prompt".into(),
             expanded: false,
         });
         draw_prompt(renderer)?;
@@ -483,9 +585,7 @@ impl PermissionState {
                     }
                     _ => {}
                 },
-                UserEvent::Paste(text) => {
-                    note.extend(text.chars().filter(|character| !character.is_control()));
-                }
+                UserEvent::Paste(text) => note.push_str(&one_line_paste(text)),
                 _ => return Ok(PermissionEvent::Unhandled),
             }
             self.show_note(renderer)?;
@@ -522,7 +622,7 @@ impl PermissionState {
                 },
                 UserEvent::Paste(text) => {
                     // One line; a paste cannot submit or replay queued input.
-                    instruction.extend(text.chars().filter(|character| !character.is_control()));
+                    instruction.push_str(&one_line_paste(text));
                 }
                 _ => return Ok(PermissionEvent::Unhandled),
             }
@@ -547,7 +647,12 @@ impl PermissionState {
         if input == PromptInput::Ignore
             || (input == PromptInput::AllowFolder && self.folder.is_none())
             || (input == PromptInput::AllowWorkspaceEdits && self.workspace_edits.is_none())
+            || (input == PromptInput::AllowPrefix
+                && (self.shell_prefix.is_none() || self.offer.is_some()))
             || (input == PromptInput::AllowProject && self.project.is_none())
+            || (input == PromptInput::AllowSession
+                && self.offer.is_none()
+                && self.grant_scope.is_none())
             || (self.offer.is_some()
                 && matches!(
                     input,
@@ -663,6 +768,37 @@ impl PermissionState {
             return Ok(PermissionEvent::Finished);
         }
         let request = self.request.take().expect("approval owns its request");
+        if input == PromptInput::AllowPrefix {
+            let mut allowed = false;
+            let mut scope = String::new();
+            let entries = if request.reply.send(UserDecision::AllowOnce).is_ok() {
+                allowed = true;
+                match (&self.shell_prefix, &ui.permission) {
+                    (Some(prefix), Some(permission)) => {
+                        scope =
+                            format!("commands starting with \"{}\"", sanitize_for_review(prefix));
+                        permission
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .add_session_shell_prefix(prefix)
+                    }
+                    _ => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            self.finish(renderer)?;
+            if allowed {
+                note_decision(
+                    renderer,
+                    &request.tool,
+                    &request.input,
+                    &format!("allowed (this session: {scope})"),
+                )?;
+            }
+            record_session_grants(entries, renderer, ui, run)?;
+            return Ok(PermissionEvent::Finished);
+        }
         if input == PromptInput::AllowFolder {
             let mut allowed = false;
             let entries = if request.reply.send(UserDecision::AllowOnce).is_ok() {
@@ -706,22 +842,30 @@ impl PermissionState {
                         .iter()
                         .map(|extra| (request.tool.to_string(), extra.clone())),
                 );
+                // The sender remembers its own grant; a checker entry for it
+                // would be saved with the session yet never consulted.
+                if !grant_support(&request.tool).1 {
+                    entries.clear();
+                }
                 (UserDecision::AllowAlways(pattern), entries)
             }
             _ => (UserDecision::Deny, Vec::new()),
         };
         let persist = input == PromptInput::AllowProject;
+        let scope = self.grant_scope.as_deref().unwrap_or("this request");
         let verb = match &decision {
-            UserDecision::AllowOnce => "allowed",
-            UserDecision::AllowAlways(_) if persist => "allowed (always, this project)",
-            UserDecision::AllowAlways(_) => "allowed (this session)",
-            _ => "denied",
+            UserDecision::AllowOnce => "allowed".to_string(),
+            UserDecision::AllowAlways(_) if persist => {
+                format!("allowed (always, this project: {scope})")
+            }
+            UserDecision::AllowAlways(_) => format!("allowed (this session: {scope})"),
+            _ => "denied".to_string(),
         };
         let sent = request.reply.send(decision).is_ok();
         let entries = if sent { entries } else { Vec::new() };
         self.finish(renderer)?;
         if sent {
-            note_decision(renderer, &request.tool, &request.input, verb)?;
+            note_decision(renderer, &request.tool, &request.input, &verb)?;
         }
         if persist && let Some(project) = &self.project {
             persist_project_rules(&entries, project, renderer)?;
@@ -848,6 +992,61 @@ mod tests {
     }
 
     #[test]
+    fn pasted_line_breaks_in_one_line_drafts_become_spaces() {
+        assert_eq!(one_line_paste("a\r\nb\rc\nd\x1b[0me"), "a b c d[0me");
+        assert_eq!(one_line_paste("tab\tx"), "tabx");
+    }
+
+    #[test]
+    fn session_grant_scope_is_named_before_and_after_the_answer() {
+        let edit = "/repo/src/ui/app.rs";
+        let scope = grant_scope("edit", edit, &suggest_pattern("edit", edit));
+        assert!(scope.starts_with("edit on anything under "), "{scope}");
+        assert!(scope.contains("ui"), "{scope}");
+        assert!(!scope.contains("app.rs"), "{scope}");
+        let script = "cargo test foo";
+        assert_eq!(
+            grant_scope("shell", script, &suggest_pattern("shell", script)),
+            "this exact command"
+        );
+        assert_eq!(
+            grant_scope("sandbox_network", "example.com:443", "example.com:443"),
+            "example.com:443"
+        );
+        let options = permission_options(None, Some(&scope));
+        assert!(
+            options.contains(&format!("(a) allow {scope} for this session")),
+            "{options}"
+        );
+        assert!(
+            decision_line("edit", edit, &format!("allowed (this session: {scope})"))
+                .contains(&scope)
+        );
+        let long = "x".repeat(300);
+        assert!(grant_scope("shell", &long, "other").chars().count() <= 100);
+    }
+
+    #[test]
+    fn prefix_answer_requires_plain_x() {
+        let key = |c, m| classify_prompt_key(KeyEvent::new(KeyCode::Char(c), m));
+        assert_eq!(key('x', KeyModifiers::NONE), PromptInput::AllowPrefix);
+        assert_eq!(key('X', KeyModifiers::SHIFT), PromptInput::AllowPrefix);
+        assert_eq!(key('x', KeyModifiers::CONTROL), PromptInput::Ignore);
+    }
+
+    #[test]
+    fn escalation_and_network_prompts_do_not_offer_grants_nothing_honours() {
+        // No reusable grant at all for an escalation: every one asks.
+        assert_eq!(grant_support("sandbox_escalation"), (false, false));
+        let options = permission_options(None, None);
+        assert!(!options.contains("(a)"), "{options}");
+        assert!(options.contains("(y) allow once"));
+        // A network host lasts for the session in the proxy only.
+        assert_eq!(grant_support("sandbox_network"), (true, false));
+        assert_eq!(grant_support("edit"), (true, true));
+    }
+
+    #[test]
     fn control_c_and_d_abort_permission_prompt() {
         for code in [KeyCode::Char('c'), KeyCode::Char('d')] {
             assert_eq!(
@@ -961,7 +1160,7 @@ mod tests {
             classify_prompt_key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL)),
             PromptInput::Ignore
         );
-        assert!(permission_options(None).contains("(t) deny and tell the model why"));
+        assert!(permission_options(None, None).contains("(t) deny and tell the model why"));
     }
 
     #[test]
@@ -978,20 +1177,20 @@ mod tests {
 
     #[test]
     fn session_grants_are_labelled_as_session_scoped() {
-        let plain = permission_options(None);
-        assert!(plain.contains("(a) allow for this session"));
+        let plain = permission_options(None, Some("this exact command"));
+        assert!(plain.contains("(a) allow this exact command for this session"));
         assert!(!plain.contains("allow always"));
         assert!(!plain.contains("(f)"));
         assert!(PERMISSION_MODE_HINT.contains("Shift+Tab"));
         assert!(PERMISSION_MODE_HINT.contains("yolo"));
 
         let folder = std::path::Path::new("/home/me/.config/mini");
-        let with_folder = permission_options(Some(folder));
+        let with_folder = permission_options(Some(folder), Some("this exact command"));
         assert!(
             with_folder
                 .contains("(f) allow read+edit+list in /home/me/.config/mini for this session")
         );
-        assert!(with_folder.contains("(a) allow for this session"));
+        assert!(with_folder.contains("(a) allow this exact command for this session"));
     }
 
     #[test]

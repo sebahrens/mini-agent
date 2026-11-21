@@ -2,6 +2,8 @@
 use crate::ui::slash::write_ok;
 #[cfg(feature = "loop")]
 use crate::ui::slash::write_result;
+#[cfg(any(feature = "loop", feature = "git-worktree"))]
+use crate::ui::slash::write_usage;
 use crate::ui::slash::{SlashCtx, write_error};
 
 /// Canonical `/loop` usage; `status` is accepted too.
@@ -20,12 +22,10 @@ pub async fn handle(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
 }
 
 fn handle_compress(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    if _parts.get(1) == Some(&"show") {
-        if _parts.len() != 2 {
-            write_error(_ctx.renderer, "usage: /compact show");
-        } else {
-            super::show_compaction_summary(_ctx.renderer, _ctx.session);
-        }
+    // `show` is a verb only when bare; `/compact show more detail on the
+    // API` is an instruction, as in /goal.
+    if _parts.len() == 2 && _parts[1] == "show" {
+        super::show_compaction_summary(_ctx.renderer, _ctx.session);
         return Ok(());
     }
     let instructions = if _parts.len() > 1 {
@@ -33,8 +33,7 @@ fn handle_compress(_parts: &[&str], _ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
     } else {
         None
     };
-    let instr_str = instructions.unwrap_or_default();
-    Err(anyhow::anyhow!("DEFER_COMPRESS:{}", instr_str))
+    Err(super::DeferredSlash::Compress(instructions.filter(|text| !text.trim().is_empty())).into())
 }
 
 #[cfg(feature = "loop")]
@@ -45,7 +44,7 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
     let store = ctx.session.goal_store.clone();
     let is_loop = |goal: &crate::extras::goal::Goal| goal.context_file.is_some();
 
-    if parts.len() < 2 || parts[1] == "status" {
+    if parts.len() < 2 || (parts.len() == 2 && parts[1] == "status") {
         match store.snapshot().filter(is_loop) {
             Some(goal) => {
                 write_ok(
@@ -70,7 +69,7 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         return Ok(());
     }
 
-    if parts[1] == "stop" {
+    if parts.len() == 2 && parts[1] == "stop" {
         match store.snapshot().filter(is_loop) {
             Some(_) => {
                 store.clear();
@@ -114,6 +113,10 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         write_error(ctx.renderer, LOOP_USAGE);
         return Ok(());
     }
+    if let Some(refusal) = super::goal::native_goal_refusal(ctx) {
+        write_error(ctx.renderer, refusal);
+        return Ok(());
+    }
     // The plan lives in the workspace the agent edits, not wherever the
     // process happened to start: after `/worktree` the two differ, and a
     // relative path would have every round re-read the original checkout's
@@ -153,17 +156,14 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
 
 #[cfg(not(feature = "loop"))]
 async fn handle_loop(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
-    write_error(
-        ctx.renderer,
-        "/loop requires the 'loop' feature: cargo build --features loop",
-    );
+    write_error(ctx.renderer, super::feature_missing("/loop", "loop"));
     Ok(())
 }
 
 #[cfg(feature = "git-worktree")]
 async fn handle_worktree(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     if parts.len() < 2 {
-        write_error(ctx.renderer, "usage: /worktree <name>");
+        write_usage(ctx.renderer, "usage: /worktree <name>");
         return Ok(());
     }
     let name = parts[1].trim();
@@ -198,7 +198,7 @@ async fn handle_worktree(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Resu
 async fn handle_worktree(_parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     write_error(
         ctx.renderer,
-        "/worktree requires a build with the git-worktree feature",
+        super::feature_missing("/worktree", "git-worktree"),
     );
     Ok(())
 }

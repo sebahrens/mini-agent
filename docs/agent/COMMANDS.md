@@ -43,7 +43,7 @@ Completed and cancelled todos count as done; a temporarily locked store displays
 | `/undo` | Remove the last user turn, including its tool calls/results and assistant responses, persisting both the shorter history and its redo point immediately. An explicit `!command` interaction is one user turn. The working tree is never touched. |
 | `/undo stash` | Same as `/undo`, then `git stash` the working tree. There is no interactive prompt; stashing only happens when asked for explicitly. |
 | `/redo` | Restore whatever the most recent `/undo` or `/rewind` removed and persist the restored history immediately. |
-| `/rewind` | Pick an earlier user turn, confirm, and put its input back in the editor. Shell turns are labeled `[shell]` and restore only `!command`, without captured output. `/redo` restores the removed transcript. |
+| `/rewind` | Pick an earlier user turn, confirm, and put its input back in the editor. Shell turns are labeled `[shell]` and restore only `!command`, without captured output. `/redo` restores the removed transcript. The picker opens on the newest turn (at most 50 rows are shown); type to filter by text, PgUp/PgDn/Home/End move, Backspace edits the filter. |
 | `/retry` | Load the last user message into the input editor for editing. |
 | `/copy [N]` | Copy the last assistant reply to the clipboard, or only its Nth fenced code block (1-based; `~~~` and longer fences count). Uses the same clipboard path as a mouse selection (platform tool, else an OSC 52 request that the terminal cannot confirm) and the same 4 MiB cap: a larger reply is not copied and the error says so, so use `/copy N` for one block or `/export`. The outcome and byte count, or why nothing was copied, is always shown. |
 | `/quit` | Exit mini-agent. |
@@ -61,6 +61,7 @@ Completed and cancelled todos count as done; a temporarily locked store displays
 | `/share confirm` | Upload the HTML export as a secret GitHub gist and print the URL. The upload gives up after 10 seconds connecting or 30 seconds in total. Requires `GITHUB_TOKEN` or `GH_TOKEN` and the `export` feature. |
 | `/queue` | List input queued while the agent is busy (same as `/queue ls`). Interrupting or failing the main run drops queued inputs and reports how many were dropped. |
 | `/jobs` | List this session's retained background job IDs, command summaries, statuses and exit codes; captured output is not included. Works while the main agent runs. |
+| `/notices` | Print the last 20 status-line notices (copy confirmations, `/expand` errors, "opening <url>"). The status line shows a notice for a few seconds and truncates it; error notices are also written to the transcript. |
 | `/jobs stop <job-id>` | Request cancellation of that exact owned job. `stopping` is a request, not proof of cleanup; the record stays owned until its process family settles. Works while busy. |
 | `/queue clear` | Empty the queue. |
 | `/queue pop` | Remove the last queued input. |
@@ -115,9 +116,9 @@ build does not know parks it.
 
 | Command | Description |
 | ------- | ----------- |
-| `/add` | List files currently added to context (with sizes). |
+| `/add` | List files currently added to context (with sizes), numbered from 1: files first, then pending media. |
 | `/add <path>...` | Add one or more files to the agent's context (absolute or relative paths). Quote a path that contains spaces (`/add "my notes.md" src/lib.rs`). |
-| `/drop <path>...` | Remove one or more files (or pending media indexes) from the agent's context. |
+| `/drop <number\|path>...` | Remove files or pending media from the agent's context. A number is the one-based position shown by `/add` (files, then media); all numbers are resolved against the list as shown before anything is removed. Use `./3` for a file literally named `3`. |
 | `/drop-all` | Remove all added files from the agent's context. |
 
 After `/add `, Tab opens captured-workspace file completion for the current unquoted operand.
@@ -252,7 +253,7 @@ row, and its result becomes one summary row under it:
 
 | Row | Meaning |
 | --- | ------- |
-| `  ▸ 126 lines, 4963 chars` | Folded result; unfold with `Ctrl+T` (latest), `/expand [n]`, or a click on the row. |
+| `  ▸ 126 lines, 4963 chars` | Folded result; unfold with `Ctrl+T` (the newest result in view, else the latest; the newest summary shows a `(Ctrl+T)` hint), `/expand [n]`, or a click on the row. |
 | `  ▾ 126 lines, 4963 chars` | Unfolded result; the full output follows. Fold it again the same way. |
 | `  ⎿ ok: 3 files` | A short one-line result shown verbatim; there is nothing to unfold. |
 | `  ✗ Error: file not found (3 lines, 80 chars)` | A failed call: its first line always stays visible, and the rest unfolds like any result. |
@@ -460,8 +461,8 @@ and rolls the transcript back.
 | Command | Description |
 | ------- | ----------- |
 | `/loop [prompt]` | Start the iterative coding loop (bounded to 100 iterations). |
-| `/loop stop` | Stop future rounds of the active loop, even during a round. The current agent run finishes; an in-flight verification is cancelled. |
-| `/loop status` | Show current loop status, including during an active round. |
+| `/loop stop` | (Only when nothing follows; `/loop stop the flaky test` starts a loop.) Stop future rounds of the active loop, even during a round. The current agent run finishes; an in-flight verification is cancelled. |
+| `/loop status` | Show current loop status, including during an active round. Like `stop`, it is a verb only on its own: `/loop status page returns 500` starts a loop. |
 
 `/loop` is not a timer: it starts round 1 immediately. To repeat a prompt on a
 schedule, use [`/cron`](#cron); a `/loop` whose first argument is an interval
@@ -478,7 +479,7 @@ and stopping only edit the schedule.
 | Command | Description |
 | ------- | ----------- |
 | `/cron <interval> <prompt>` | Arm a schedule. The interval is digits plus `s`, `m` or `h` (`90s`, `5m`, `2h`). The minimum is `1m` (a shorter interval is raised to it with a notice) and the maximum is `24h`. The first fire is one interval from now. |
-| `/cron <prompt>` | Arm a self-paced schedule (see below). Any first word that is not an interval and not `list`, `stop` or `run` starts the prompt; `resume` is a verb only on its own. The first fire runs at the next idle point. |
+| `/cron <prompt>` | Arm a self-paced schedule (see below). Any first word that is not an interval and not `list`, `stop` or `run` starts the prompt; `resume` is a verb only on its own. A lone `status`, `clear`, `pause`, `help`, `delete`, `cancel` or `remove` is refused with a `did you mean /cron list or /cron stop` hint instead of arming a schedule. The first fire runs at the next idle point. |
 | `/cron` or `/cron list` | List schedules: id (`c1`, `c2`, ...), `every <interval>` or `self-paced`, time until the next fire (`due at next idle` for a parked fire, `running` while a self-paced fire's turn has not chosen one yet, `suspended` after the USD budget refused a fire, `disarmed` for a schedule restored with a resumed session), fires so far out of `cron_max_fires`, and the prompt. |
 | `/cron stop <id>` / `/cron stop all` | Remove one schedule or every schedule. |
 | `/cron run <id>` | Mark a schedule due now; it fires at the next idle point without waiting for its deadline. |
@@ -495,8 +496,8 @@ and stopping only edit the schedule.
   command or argument form) stays refused, so a schedule can never re-arm
   itself or steer a turn.
 - **Self-paced schedules.** A `/cron <prompt>` schedule has no interval.
-  Only during the turn of one of its fires, the model is offered the
-  `schedule_wakeup` tool (`delay_secs` integer, `reason` string, `noop`
+  While a self-paced entry exists, the model is offered the
+  `schedule_wakeup` tool (it only succeeds in a fire's turn) (`delay_secs` integer, `reason` string, `noop`
   boolean; see [TOOL_RUNTIME.md](TOOL_RUNTIME.md#turn-scoped-cron-tool)). The
   delay is clamped to `60..=3600` seconds (`5` becomes 60, `99999` becomes
   3600) and the next fire is set that long after the turn ends; the last call
@@ -551,9 +552,9 @@ and stopping only edit the schedule.
 - **Saved disarmed.** Schedules are saved with the session (id, interval,
   prompt, fires so far and the wall-clock time the next fire was expected),
   updated whenever one is armed, stopped, fired or retired. They only fire in
-  the process that armed them: quitting, `/resume`, `/new`, `/clear` or any
+  the process that armed them: quitting, `/sessions`, `/new`, `/clear` or any
   other session switch stops them. Resuming a session with saved schedules
-  (`/resume`, `--continue`) never re-arms them on its own, to avoid surprise
+  (`/sessions`, `--continue`) never re-arms them on its own, to avoid surprise
   spend; it shows one notice such as `this session had 2 /cron schedules (c1
   every 5m: ...); /cron resume to re-arm`. Until then `/cron list` shows them
   as `disarmed`, `/cron stop` removes them, and new schedules take ids after
@@ -617,15 +618,16 @@ A goal never changes the security mode, the permission allowlist, or the sandbox
 | Command | Description |
 | ------- | ----------- |
 | `/goal <objective>` | Set the objective. Lines after a `done when:` line become criteria. |
-| `/goal status` | Objective, criteria, status, round, tokens, verification, judge, last check. |
+| `/goal status` | Objective, criteria, status, round, bounds used, check commands, judge, last decision. |
 | `/goal check <cmd>` | Require a command to exit zero before the goal may be reported complete. |
-| `/goal bounds <k>=<v>` | Change `max_rounds`, `max_tokens`, `continuation`, and the rest. |
-| `/goal pause` / `/goal resume` | Park the goal, or put it back to work. |
+| `/goal bounds [<k>=<v>]` | Change `max_rounds`, `max_tokens`, `continuation`, and the rest; with no argument, list them. Works while a round runs. |
+| `/goal pause` / `/goal resume` | Park the goal, or put it back to work (send a message to continue). |
 | `/goal reopen` | Reopen a goal that was declared impossible. |
 | `/goal clear` | Discard the goal. Setting a new one over an unfinished goal is refused. |
 
 Headless flags: `--goal`, `--goal-done` (repeatable), `--goal-check` (repeatable),
-`--goal-max-rounds`, `--goal-continuation continue|restart`, `--goal-replace`. A goal with
+`--goal-max-rounds`, `--goal-continuation continue|restart`, `--goal-replace`, `--goal-resume` (with
+`--continue`: resume the parked goal). A goal with
 `--no-tools` is refused: the agent could never report progress, so every round would look like a
 stall.
 
@@ -654,7 +656,10 @@ After process cleanup, the command and captured result are saved immediately unl
 `--no-session` is set. In the TUI, a save failure shows a warning and retains the live transcript.
 While the command runs, the TUI shows a live tail of its output (the last 12
 lines, refreshed at most every 100 ms) under the echoed command; when it exits
-the tail is replaced by the saved final output.
+the tail is replaced by the saved final output. While it runs, typing, cursor keys,
+resize and scrolling keep working in the prompt, a notice says which key cancels
+(the `interrupt` binding, default Ctrl+C; Ctrl+D also cancels), and other keys such
+as Enter wait until the command ends.
 Works in both TUI and `--print` mode.
 In `--print` mode, a failed command or empty `!` exits nonzero. Captured output is still
 rendered and saved before reporting a command failure; `--output json` marks that result
@@ -678,8 +683,8 @@ provider request, with the error naming the valid personas on stderr (and in the
 [SUBAGENTS.md](SUBAGENTS.md#referencing-a-specialist-with-agent).
 
 At startup, mini-agent resolves the configured shell once against the canonical
-workspace and captured `PATH`. Supported Windows contracts are PowerShell/pwsh
-with `-Command` and Bash/sh with `-c`; Unix uses Bash/sh with `-c`. The resolved
+workspace and captured `PATH`. Supported Windows contracts are Command Prompt
+(`cmd.exe`, the default), PowerShell/pwsh with `-Command` and Bash/sh with `-c`; Unix uses Bash/sh with `-c`. The resolved
 executable identity and argument contract are retained across agent rebuilds.
 If the executable is missing or unsupported, the model-visible compatibility
 tool named `shell` and its prompt guidance are omitted, and shell execution fails
@@ -877,8 +882,13 @@ Explicit local-owner promotion remains its existing, separate authorization path
 
 `-p --compact-instructions "preserve file names and blockers"` supplies a bounded
 4096-byte compaction preference when automatic compaction actually runs. It does
-not force a compaction and is unavailable in TUI, ACP, or loop mode. Preferences
-are fenced below the summarization contract, just like manual `/compact` instructions.
+not force a compaction and is unavailable in TUI, ACP, or loop mode. It is the only
+standing preference: automatic compaction in the TUI and ACP takes none, and the TUI's
+manual `/compact <instructions>` applies to that one compaction. Preferences are fenced
+below the summarization contract. A headless result that compacted carries a
+`compactions` object (`count`, `messages`, `tokens_freed`); ACP answers `/compact` with
+what it did and `/compact show` with the active summary. Esc or Ctrl-C cancels a TUI
+compaction in progress and leaves the history unchanged.
 
 ## Custom prompt commands
 

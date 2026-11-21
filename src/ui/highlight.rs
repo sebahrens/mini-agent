@@ -15,8 +15,16 @@ const MAX_SPANS: usize = 4096;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TokenSpan {
     pub range: Range<usize>,
+    /// `Color::Reset` keeps the row's own colour (attribute-only spans).
     pub color: Color,
+    /// `ATTR_*` bits painted over the span.
+    pub attrs: u8,
 }
+
+pub(crate) const ATTR_BOLD: u8 = 1;
+pub(crate) const ATTR_ITALIC: u8 = 2;
+pub(crate) const ATTR_STRIKE: u8 = 4;
+pub(crate) const ATTR_UNDERLINE: u8 = 8;
 
 #[cfg(test)]
 thread_local! {
@@ -194,6 +202,7 @@ impl CodeState {
             return Some(
                 vec![TokenSpan {
                     range: 0..display.len(),
+                    attrs: 0,
                     color,
                 }]
                 .into(),
@@ -452,7 +461,11 @@ fn push_span(spans: &mut Vec<TokenSpan>, range: Range<usize>, color: Color) {
     {
         last.range.end = range.end;
     } else {
-        spans.push(TokenSpan { range, color });
+        spans.push(TokenSpan {
+            range,
+            color,
+            attrs: 0,
+        });
     }
 }
 fn is_keyword(language: Language, word: &str) -> bool {
@@ -616,6 +629,7 @@ pub(crate) fn within_budget(text: &str) -> bool {
 /// Incremental form of [`within_budget`] for append-only text. Every limit is
 /// monotone under appends, so once a scan is over budget it stays over and
 /// further appends cost nothing.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct BudgetScan {
     bytes: usize,
@@ -626,6 +640,7 @@ pub(crate) struct BudgetScan {
     over: bool,
 }
 
+#[cfg(test)]
 impl BudgetScan {
     /// Scan `text` from the start (counted by `budget_scans_for_test`).
     pub(crate) fn of(text: &str) -> Self {

@@ -41,6 +41,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/models",
     "/models-add",
     "/new",
+    "/notices",
     "/permissions",
     "/prompt",
     "/provider",
@@ -301,17 +302,6 @@ impl ListPicker {
     #[cfg(test)]
     pub(crate) fn is_monochrome(&self) -> bool {
         self.monochrome
-    }
-
-    /// Move the item names out, leaving the list empty.
-    pub(crate) fn take_items(&mut self) -> Vec<String> {
-        self.items_lower.clear();
-        self.name_width = 0;
-        self.match_indices.clear();
-        std::mem::take(&mut self.items)
-            .into_iter()
-            .map(Cow::into_owned)
-            .collect()
     }
 
     pub fn set_items(&mut self, items: Vec<String>) {

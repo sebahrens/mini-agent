@@ -1884,26 +1884,44 @@ pub(crate) fn atomic_write_with_failure_sync(
 }
 
 fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
+    if path.is_absolute() {
+        Ok(lexical_normalize(path))
+    } else {
+        Ok(lexical_normalize(&std::env::current_dir()?.join(path)))
+    }
+}
+
+/// Collapse `.` and `..` without touching the filesystem. A `..` that has a
+/// normal component to remove removes it; one directly under a root or prefix
+/// is dropped (nothing is above the root); in a relative path with nothing
+/// left to remove it is kept, so `../docs/x` never becomes `docs/x`.
+pub(crate) fn lexical_normalize(path: &Path) -> PathBuf {
     use std::path::Component;
 
-    let source = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(path)
-    };
     let mut normalized = PathBuf::new();
-    for component in source.components() {
+    for component in path.components() {
         match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
             Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => match normalized.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    normalized.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                _ => normalized.push(".."),
+            },
+            other => normalized.push(other.as_os_str()),
         }
     }
-    Ok(normalized)
+    normalized
+}
+
+/// [`lexical_normalize`] of `path`, resolved against `base` when relative.
+pub(crate) fn absolute_lexical_from_base(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        lexical_normalize(path)
+    } else {
+        lexical_normalize(&base.join(path))
+    }
 }
 
 fn relative_target<'a>(
@@ -3232,6 +3250,38 @@ mod tests {
     use super::*;
 
     use crate::tests::support::temp::TempDir;
+
+    #[test]
+    fn lexical_normalize_table() {
+        let case = |input: &str, expected: &str| {
+            assert_eq!(
+                lexical_normalize(Path::new(input)),
+                PathBuf::from(expected),
+                "{input}"
+            );
+        };
+        case("/a/b/../c/./d", "/a/c/d");
+        case("/a/../..", "/");
+        case("/..", "/");
+        case("a/./b/../c", "a/c");
+        case("../docs/x", "../docs/x");
+        case("a/../../x", "../x");
+        case("../../a", "../../a");
+        case("", "");
+        case(".", "");
+        #[cfg(windows)]
+        {
+            case(r"C:\a\..\..\b", r"C:\b");
+        }
+        assert_eq!(
+            absolute_lexical_from_base(Path::new("/base"), Path::new("x/../y")),
+            PathBuf::from("/base/y")
+        );
+        assert_eq!(
+            absolute_lexical_from_base(Path::new("/base"), Path::new("/abs/./z")),
+            PathBuf::from("/abs/z")
+        );
+    }
 
     #[test]
     fn content_digest_file_checks_preserve_shared_cursors() {

@@ -46,6 +46,32 @@ pub enum RoundEnd {
     AwaitingUser,
     /// The user interrupted.
     Cancelled,
+    /// The round ran into the per-run turn or token cap the runner enforces.
+    /// That is a bound doing its job, not a failed run: the round is counted,
+    /// its tool work stands, and it never feeds the failure streak.
+    Capped(String),
+}
+
+impl RoundEnd {
+    /// Classify an error message from a run's event stream.
+    ///
+    /// The runner reports an exhausted turn or token budget as an ordinary
+    /// error event; classifying the text here keeps that distinction out of
+    /// the runner and in one place for every surface.
+    pub fn from_error(message: impl Into<String>) -> Self {
+        let message = message.into();
+        if message.starts_with("Agent exhausted its maximum turn budget")
+            || message.starts_with("Agent exhausted its cumulative token budget")
+        {
+            Self::Capped(message)
+        } else {
+            Self::Failed(message)
+        }
+    }
+
+    fn is_failed_or_capped(&self) -> bool {
+        matches!(self, Self::Failed(_) | Self::Capped(_))
+    }
 }
 
 /// Everything the gate knows about the round that just ended.
@@ -161,9 +187,23 @@ pub enum Step {
     Verify(VerifyRequest),
 }
 
+/// Why a check did not pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CheckFailureKind {
+    /// The command ran and exited non-zero (or was interrupted): a finding
+    /// about the work, which the worker can act on.
+    #[default]
+    Exit,
+    /// The command timed out, could not start, or was refused by the spend
+    /// budget: a configuration problem that editing code does not fix.
+    Unavailable,
+}
+
 /// Result of running the checks tier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckOutcome {
+    /// Why a failed outcome failed. Meaningless when `all_passed`.
+    pub failure_kind: CheckFailureKind,
     pub all_passed: bool,
     /// Rendered tail of the first failure, shown to the model.
     pub failure_tail: Option<String>,
@@ -379,8 +419,25 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
         ));
     }
 
+    // A wrap-up round that ended on a run error or its own turn cap spent the
+    // budget it was given: the stop is final, not a failure to retry with a
+    // full uncapped round. A completion claim it filed before the error is
+    // still adjudicated, as in row 5. A context overflow keeps its own, more
+    // actionable pause below.
+    if progress.wrap_up_issued
+        && round.end.is_failed_or_capped()
+        && !matches!(&round.end, RoundEnd::Failed(d) if crate::retry::is_context_length_error_message(d))
+    {
+        if round.report_status() == Some(ReportStatus::Met) && round.open_todos == 0 {
+            return Step::Verify(met_claim_request(goal, round));
+        }
+        return Step::Decided(bound_decision(goal, round));
+    }
+
     // Rows 2 to 4. A failed run gets retried; repeated failure parks the goal
-    // so a broken provider or workspace cannot burn the whole budget.
+    // so a broken provider or workspace cannot burn the whole budget. A run
+    // that merely hit its turn or token cap is not a failure and falls through
+    // to the ordinary rows.
     if let RoundEnd::Failed(diagnostic) = &round.end {
         // A context overflow that compaction could not clear will not clear by
         // running the same round again, so it parks immediately rather than
@@ -424,11 +481,7 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
         if round.report_status() == Some(ReportStatus::Met) && round.open_todos == 0 {
             return Step::Verify(met_claim_request(goal, round));
         }
-        return Step::Decided(GateDecision::stop(
-            GoalStatus::BudgetLimited,
-            "the goal reached its configured budget",
-            VerdictSource::Bounds,
-        ));
+        return Step::Decided(bound_decision(goal, round));
     }
 
     // Row 6. A bound is exhausted. Issue one bounded wrap-up round, ahead of
@@ -535,19 +588,30 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
     // Rows 12 and 13. Not a completion claim, or one contradicted by the
     // agent's own open task list.
     if round.report_status() != Some(ReportStatus::Met) {
-        let instruction = goal
-            .last_verdict
-            .as_ref()
-            .map(|v| v.reason.clone())
-            .filter(|reason| !reason.is_empty())
-            .unwrap_or_else(|| KEEP_WORKING_INSTRUCTION.to_string());
+        // The previous decision's text is never replayed: it described the
+        // previous round (a failed check, a stop reason, the agent's own
+        // question), and repeating it tells the worker something false.
+        let feedback_checks = goal.bounds.check_every_round && !goal.checks.is_empty();
+        // A read-only round leaves the workspace as the last check run saw it,
+        // so that result stands and the suite is not run again.
+        let reuse_feedback =
+            feedback_checks && round.mutating_tool_calls == 0 && progress.last_feedback_checked;
+        let instruction = if reuse_feedback {
+            match progress.last_feedback_failure.as_deref() {
+                Some(tail) => failing_feedback(tail),
+                None => KEEP_WORKING_INSTRUCTION.to_string(),
+            }
+        } else {
+            KEEP_WORKING_INSTRUCTION.to_string()
+        };
 
         // A drift check is cheap insurance against an agent that has quietly
-        // wandered off the objective. It can only ever return guidance.
+        // wandered off the objective. It can only ever return guidance. It
+        // does not displace the per-round checks: both are requested.
         if should_drift_check(goal, round) {
             return Step::Verify(VerifyRequest {
                 run_verify_command: false,
-                run_checks: false,
+                run_checks: feedback_checks && !reuse_feedback,
                 run_judge: true,
                 cause: VerifyCause::DriftCheck,
             });
@@ -555,7 +619,7 @@ pub fn gate_pre(goal: &Goal, round: &RoundSummary) -> Step {
         // Continuous verification: the agent hears about a failing check at the
         // end of the round that broke it rather than only when it claims to be
         // finished.
-        if goal.bounds.check_every_round && !goal.checks.is_empty() {
+        if feedback_checks && !reuse_feedback {
             return Step::Verify(VerifyRequest {
                 run_verify_command: false,
                 run_checks: true,
@@ -607,6 +671,20 @@ fn should_drift_check(goal: &Goal, round: &RoundSummary) -> bool {
 
 /// Which bound, if any, is exhausted.
 fn exhausted_bound(goal: &Goal, round: &RoundSummary) -> Option<String> {
+    exhausted_bound_with(goal, round.tokens_used, round.active.as_secs())
+}
+
+/// Which bound, if any, the goal's recorded progress has already used up.
+///
+/// For surfaces that resume a parked goal and want to say so when the same
+/// bound would stop it again at the end of the next round.
+pub fn exhausted_bound_now(goal: &Goal) -> Option<String> {
+    // `current_round` counts the round about to run, so a goal that has run
+    // exactly `max_rounds` rounds reports as exhausted here as it will then.
+    exhausted_bound_with(goal, 0, 0)
+}
+
+fn exhausted_bound_with(goal: &Goal, round_tokens: u64, round_secs: u64) -> Option<String> {
     let bounds = &goal.bounds;
     let progress = &goal.progress;
     let rounds = progress.current_round();
@@ -614,18 +692,77 @@ fn exhausted_bound(goal: &Goal, round: &RoundSummary) -> Option<String> {
         return Some(format!("round {rounds} of {}", bounds.max_rounds));
     }
     if let Some(max) = bounds.max_tokens {
-        let used = progress.tokens_used.saturating_add(round.tokens_used);
+        let used = progress.tokens_used.saturating_add(round_tokens);
         if used >= max {
             return Some(format!("{used} of {max} tokens"));
         }
     }
     if let Some(max) = bounds.max_active_secs {
-        let used = progress.active_secs.saturating_add(round.active.as_secs());
+        let used = progress.active_secs.saturating_add(round_secs);
         if used >= max {
             return Some(format!("{used}s of {max}s"));
         }
     }
     None
+}
+
+/// Record what a checks run said, for the read-only-round shortcut and the
+/// check-unavailable streak. Called by the driver after [`apply`].
+pub fn note_checks(goal: &mut Goal, checks: Option<&CheckOutcome>) {
+    let Some(outcome) = checks else {
+        return;
+    };
+    if outcome.all_passed {
+        goal.progress.check_unavailable = 0;
+        goal.progress.last_feedback_checked = true;
+        goal.progress.last_feedback_failure = None;
+        return;
+    }
+    match outcome.failure_kind {
+        CheckFailureKind::Unavailable => {
+            goal.progress.check_unavailable = goal.progress.check_unavailable.saturating_add(1);
+            // An unavailable check says nothing about the workspace.
+            goal.progress.last_feedback_checked = false;
+            goal.progress.last_feedback_failure = None;
+        }
+        CheckFailureKind::Exit => {
+            goal.progress.check_unavailable = 0;
+            goal.progress.last_feedback_checked = true;
+            goal.progress.last_feedback_failure = outcome.failure_tail.clone();
+        }
+    }
+}
+
+/// Consecutive unavailable checks tolerated before the goal is parked.
+pub const MAX_CHECK_UNAVAILABLE: u32 = 2;
+
+fn failing_feedback(tail: &str) -> String {
+    format!("Verification is currently failing. Fix this before continuing:\n{tail}")
+}
+
+/// The decision for a check that timed out or could not start: not a finding
+/// about the work, so the worker is not told its code failed. A repeat parks
+/// the goal with the setting that bounds a check.
+fn check_unavailable_decision(goal: &Goal, tail: &str, source: VerdictSource) -> GateDecision {
+    let first_line = tail.lines().next().unwrap_or("a goal check").trim();
+    if goal.progress.check_unavailable.saturating_add(1) >= MAX_CHECK_UNAVAILABLE {
+        return GateDecision::paused(
+            format!(
+                "a goal check could not run to completion twice in a row ({first_line}). A check \
+                 is limited by verify_timeout_secs; raise it or fix the command, then /goal resume"
+            ),
+            PauseReason::CheckUnavailable,
+            VerdictSource::Runtime,
+        );
+    }
+    GateDecision::cont(
+        format!(
+            "A goal check could not run to completion, so the goal could not be verified this \
+             round ({first_line}). That is a timeout or launch problem, not necessarily a \
+             failure of your work; continue, and prove the objective another way if you can."
+        ),
+        source,
+    )
 }
 
 /// Second phase: finish a completion or impossibility claim once the driver has
@@ -664,19 +801,19 @@ fn gate_post_tiers(
             // Feedback, not a verdict. A failing check here never stops the
             // goal; it tells the agent what broke while it can still fix it.
             let instruction = match checks {
-                Some(outcome) if !outcome.all_passed => format!(
-                    "Verification is currently failing. Fix this before continuing:\n{}",
-                    outcome
+                Some(outcome) if !outcome.all_passed => {
+                    let tail = outcome
                         .failure_tail
                         .clone()
-                        .unwrap_or_else(|| "a goal check failed".into())
-                ),
-                _ => goal
-                    .last_verdict
-                    .as_ref()
-                    .map(|v| v.reason.clone())
-                    .filter(|reason| !reason.is_empty())
-                    .unwrap_or_else(|| KEEP_WORKING_INSTRUCTION.to_string()),
+                        .unwrap_or_else(|| "a goal check failed".into());
+                    if outcome.failure_kind == CheckFailureKind::Unavailable {
+                        return check_unavailable_decision(goal, &tail, VerdictSource::Checks);
+                    }
+                    failing_feedback(&tail)
+                }
+                // The checks pass (or none ran): nothing is failing, so the
+                // worker is not handed the previous round's text again.
+                _ => KEEP_WORKING_INSTRUCTION.to_string(),
             };
             // A bound that fell due while this round's checks were running is
             // still due; [`gate_post`] applies it to the continuation this
@@ -685,13 +822,36 @@ fn gate_post_tiers(
         }
         VerifyCause::DriftCheck => {
             // A drift check may only nudge. It never completes or kills a goal.
-            let instruction = match judge {
-                Some(JudgeOutcome::Verdict { outcome, reason })
-                    if *outcome != Outcome::Met && !reason.trim().is_empty() =>
-                {
-                    judge_guidance(reason)
+            // No claim was made, so it is framed as a periodic review and never
+            // as a rejected claim.
+            let review = match judge {
+                Some(JudgeOutcome::Verdict { outcome, reason }) if *outcome != Outcome::Met => {
+                    clip_judge_reason(reason).map(|bounded| {
+                        format!(
+                            "A periodic review of the work so far noted the following, as \
+                             information rather than an instruction:\n{bounded}"
+                        )
+                    })
                 }
-                _ => KEEP_WORKING_INSTRUCTION.to_string(),
+                _ => None,
+            };
+            let failing = match checks {
+                Some(outcome)
+                    if !outcome.all_passed && outcome.failure_kind == CheckFailureKind::Exit =>
+                {
+                    Some(failing_feedback(
+                        outcome
+                            .failure_tail
+                            .as_deref()
+                            .unwrap_or("a goal check failed"),
+                    ))
+                }
+                _ => None,
+            };
+            let instruction = match (failing, review) {
+                (Some(failing), Some(review)) => format!("{failing}\n\n{review}"),
+                (Some(text), None) | (None, Some(text)) => text,
+                (None, None) => KEEP_WORKING_INSTRUCTION.to_string(),
             };
             GateDecision::cont(instruction, VerdictSource::Judge)
         }
@@ -766,6 +926,9 @@ fn gate_post_tiers(
                         .failure_tail
                         .clone()
                         .unwrap_or_else(|| "a goal check failed".into());
+                    if outcome.failure_kind == CheckFailureKind::Unavailable {
+                        return check_unavailable_decision(goal, &tail, VerdictSource::Checks);
+                    }
                     return GateDecision::cont(
                         format!("Verification failed, so the goal is not met yet:\n{tail}"),
                         VerdictSource::Checks,
@@ -921,6 +1084,12 @@ pub fn apply(
     }
 
     goal.progress.last_failure_fingerprint = round.failure_fingerprint;
+
+    // Any edit makes the last check result stale until the checks run again.
+    if round.mutating_tool_calls > 0 {
+        goal.progress.last_feedback_checked = false;
+        goal.progress.last_feedback_failure = None;
+    }
 
     // Judge failures are counted only on completion claims, because those are
     // the rounds where a missing judge actually changes the outcome: a drift
@@ -1192,6 +1361,7 @@ mod tests {
         };
         let request = verification(&g, &claim);
         let failed = CheckOutcome {
+            failure_kind: Default::default(),
             all_passed: false,
             failure_tail: Some("check failed".into()),
             verified: Vec::new(),
@@ -1642,25 +1812,234 @@ mod tests {
         assert_eq!(g.progress.consecutive_no_progress, 0);
     }
 
-    // Row 12.
+    // Row 12. The previous decision's text is never replayed as the next
+    // instruction (mini-agent-sskdu.204).
     #[test]
-    fn an_ordinary_round_continues_with_the_previous_reason() {
+    fn an_ordinary_round_does_not_replay_the_previous_decision() {
         let mut g = goal();
-        g.last_verdict = Some(super::super::Verdict {
+        for stale in [
+            "the migration test still fails",
+            "no progress for 3 rounds",
+            "which colour?",
+            "The previous round failed: boom\nAddress the cause, then continue.",
+        ] {
+            g.last_verdict = Some(super::super::Verdict {
+                outcome: Outcome::NotYet,
+                reason: stale.into(),
+                source: VerdictSource::Checks,
+                evidence: Vec::new(),
+                at: compact_str::CompactString::new("now"),
+            });
+            assert_eq!(
+                decided(&g, &worked()).reason(),
+                KEEP_WORKING_INSTRUCTION,
+                "stale text {stale:?} must not become the instruction"
+            );
+        }
+    }
+
+    #[test]
+    fn passing_feedback_checks_do_not_resend_an_old_failure() {
+        let g = goal();
+        let round = worked();
+        let request = VerifyRequest {
+            run_verify_command: false,
+            run_checks: true,
+            run_judge: false,
+            cause: VerifyCause::RoundFeedback,
+        };
+        let passed = CheckOutcome {
+            failure_kind: Default::default(),
+            all_passed: true,
+            failure_tail: None,
+            verified: vec![VerificationKind::Checks],
+        };
+        let mut stale = g.clone();
+        stale.last_verdict = Some(super::super::Verdict {
             outcome: Outcome::NotYet,
-            reason: "the migration test still fails".into(),
+            reason: "Verification is currently failing. Fix this before continuing:\nold".into(),
             source: VerdictSource::Checks,
             evidence: Vec::new(),
             at: compact_str::CompactString::new("now"),
         });
-        let decision = decided(&g, &worked());
-        assert_eq!(decision.reason(), "the migration test still fails");
+        let decision = gate_post(&stale, &round, &request, Some(&passed), None);
+        assert_eq!(decision.reason(), KEEP_WORKING_INSTRUCTION);
+    }
 
-        let fresh = goal();
-        assert_eq!(
-            decided(&fresh, &worked()).reason(),
-            KEEP_WORKING_INSTRUCTION
+    // mini-agent-sskdu.205
+    #[test]
+    fn a_wrap_up_round_that_hits_its_cap_is_the_final_budget_stop() {
+        let mut g = goal();
+        g.progress.wrap_up_issued = true;
+        g.bounds.max_rounds = 3;
+        g.progress.rounds = 3;
+        for end in [
+            RoundEnd::from_error("Agent exhausted its maximum turn budget (4) before completing."),
+            RoundEnd::Failed("provider exploded".into()),
+        ] {
+            let round = RoundSummary { end, ..worked() };
+            match decided(&g, &round) {
+                GateDecision::Stop {
+                    status: GoalStatus::BudgetLimited,
+                    reason,
+                    ..
+                } => assert!(
+                    reason.contains("round 4 of 3") || reason.contains("budget"),
+                    "{reason}"
+                ),
+                other => panic!("expected the final budget stop, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn capped_rounds_with_work_are_counted_and_never_park_the_goal() {
+        let mut g = goal();
+        let capped = RoundSummary {
+            end: RoundEnd::from_error(
+                "Agent exhausted its cumulative token budget (10/10) before completing.",
+            ),
+            ..worked()
+        };
+        assert!(matches!(capped.end, RoundEnd::Capped(_)));
+        for _ in 0..4 {
+            let decision = decided(&g, &capped);
+            assert!(
+                matches!(decision, GateDecision::Continue { .. }),
+                "a capped round with mutations continues: {decision:?}"
+            );
+            apply(&mut g, &capped, &decision, None, None);
+        }
+        assert_eq!(g.progress.consecutive_round_failures, 0);
+        assert_eq!(g.progress.rounds, 4);
+        assert_eq!(g.status, GoalStatus::Active);
+    }
+
+    // mini-agent-sskdu.115
+    #[test]
+    fn the_post_wrap_up_stop_names_the_bound() {
+        let mut g = goal();
+        g.bounds.max_rounds = 5;
+        g.progress.rounds = 5;
+        g.progress.wrap_up_issued = true;
+        let decision = decided(&g, &worked());
+        assert!(
+            decision.reason().contains("round 6 of 5"),
+            "{}",
+            decision.reason()
         );
+        let line = super::super::driver::decision_line(&g, &decision);
+        assert!(line.contains("/goal bounds"), "{line}");
+    }
+
+    // mini-agent-sskdu.206
+    #[test]
+    fn a_drift_review_is_not_framed_as_a_rejected_claim() {
+        let mut g = goal();
+        g.judge = JudgePolicy::Session;
+        let round = worked();
+        let request = VerifyRequest {
+            run_verify_command: false,
+            run_checks: false,
+            run_judge: true,
+            cause: VerifyCause::DriftCheck,
+        };
+        let judged = JudgeOutcome::Verdict {
+            outcome: Outcome::NotYet,
+            reason: "work is on course".into(),
+        };
+        let decision = gate_post(&g, &round, &request, None, Some(&judged));
+        assert!(
+            !decision.reason().contains("claim"),
+            "{}",
+            decision.reason()
+        );
+        assert!(decision.reason().contains("periodic review"));
+    }
+
+    #[test]
+    fn a_drift_round_still_runs_the_per_round_checks() {
+        let mut g = goal();
+        g.judge = JudgePolicy::Session;
+        g.bounds.judge_every = 1;
+        g.bounds.check_every_round = true;
+        g.checks.push(GoalCheck::new("cargo test"));
+        let request = verification(&g, &worked());
+        assert_eq!(request.cause, VerifyCause::DriftCheck);
+        assert!(request.run_checks && request.run_judge);
+    }
+
+    // mini-agent-sskdu.219
+    #[test]
+    fn an_unavailable_check_is_not_reported_as_a_failure_and_parks_on_repeat() {
+        let mut g = goal();
+        let round = worked();
+        let request = met_claim_request(&g, &round);
+        let timed_out = CheckOutcome {
+            failure_kind: CheckFailureKind::Unavailable,
+            all_passed: false,
+            failure_tail: Some("`cargo test` failed:\n[validation status=timed_out]".into()),
+            verified: Vec::new(),
+        };
+        let first = gate_post(&g, &round, &request, Some(&timed_out), None);
+        assert!(matches!(first, GateDecision::Continue { .. }));
+        assert!(
+            !first.reason().contains("Verification failed"),
+            "{}",
+            first.reason()
+        );
+        note_checks(&mut g, Some(&timed_out));
+        let second = gate_post(&g, &round, &request, Some(&timed_out), None);
+        match second {
+            GateDecision::Stop {
+                status: GoalStatus::Paused,
+                paused_reason: Some(PauseReason::CheckUnavailable),
+                reason,
+                ..
+            } => assert!(reason.contains("verify_timeout_secs"), "{reason}"),
+            other => panic!("expected a check-unavailable pause, got {other:?}"),
+        }
+    }
+
+    // mini-agent-sskdu.220
+    #[test]
+    fn a_read_only_round_reuses_the_last_check_result() {
+        let mut g = goal();
+        g.bounds.check_every_round = true;
+        g.checks.push(GoalCheck::new("cargo test"));
+        let read_only = RoundSummary {
+            tool_calls: 2,
+            report: Some(report(ReportStatus::Progress)),
+            ..RoundSummary::completed()
+        };
+        // No result yet: the checks run.
+        assert_eq!(
+            verification(&g, &read_only).cause,
+            VerifyCause::RoundFeedback
+        );
+        // A recorded failure is reused, not rerun.
+        note_checks(
+            &mut g,
+            Some(&CheckOutcome {
+                failure_kind: CheckFailureKind::Exit,
+                all_passed: false,
+                failure_tail: Some("1 test failed".into()),
+                verified: Vec::new(),
+            }),
+        );
+        let reused = decided(&g, &read_only);
+        assert!(
+            reused.reason().contains("1 test failed"),
+            "{}",
+            reused.reason()
+        );
+        // An edit invalidates it.
+        let edit = RoundSummary {
+            report: Some(report(ReportStatus::Progress)),
+            ..worked()
+        };
+        apply(&mut g, &edit, &reused, None, None);
+        assert_eq!(verification(&g, &edit).cause, VerifyCause::RoundFeedback);
     }
 
     // Row 13.
@@ -1720,6 +2099,7 @@ mod tests {
         assert!(request.run_checks);
 
         let failed = CheckOutcome {
+            failure_kind: Default::default(),
             all_passed: false,
             failure_tail: Some("test goals::it_works ... FAILED".into()),
             verified: Vec::new(),
@@ -1744,6 +2124,7 @@ mod tests {
         };
         let request = verification(&g, &round);
         let passed = CheckOutcome {
+            failure_kind: Default::default(),
             all_passed: true,
             failure_tail: None,
             verified: vec![VerificationKind::Checks],
@@ -1829,6 +2210,7 @@ mod tests {
             &round,
             &request,
             Some(&CheckOutcome {
+                failure_kind: Default::default(),
                 all_passed: true,
                 failure_tail: None,
                 verified: vec![VerificationKind::Checks, VerificationKind::VerifyCommand],
@@ -1919,6 +2301,7 @@ mod tests {
             &round,
             &request,
             Some(&CheckOutcome {
+                failure_kind: Default::default(),
                 all_passed: true,
                 failure_tail: None,
                 verified: vec![VerificationKind::Checks],
@@ -2313,6 +2696,7 @@ mod tests {
             &round,
             &request,
             Some(&CheckOutcome {
+                failure_kind: Default::default(),
                 all_passed: true,
                 failure_tail: None,
                 verified: vec![VerificationKind::Checks],
@@ -2350,6 +2734,7 @@ mod tests {
         );
 
         let failed = CheckOutcome {
+            failure_kind: Default::default(),
             all_passed: false,
             failure_tail: Some("test parse::roundtrip ... FAILED".into()),
             verified: Vec::new(),
@@ -2397,6 +2782,7 @@ mod tests {
             &round,
             &request,
             Some(&CheckOutcome {
+                failure_kind: Default::default(),
                 all_passed: false,
                 failure_tail: Some("still failing".into()),
                 verified: Vec::new(),
@@ -2469,6 +2855,7 @@ mod tests {
         assert_eq!(request.cause, VerifyCause::MetClaim);
 
         let passed = CheckOutcome {
+            failure_kind: Default::default(),
             all_passed: true,
             failure_tail: None,
             verified: vec![VerificationKind::Checks],
@@ -2483,6 +2870,7 @@ mod tests {
 
         // A claim the checks reject still ends the goal: the bound is spent.
         let failed = CheckOutcome {
+            failure_kind: Default::default(),
             all_passed: false,
             failure_tail: Some("check failed".into()),
             verified: Vec::new(),

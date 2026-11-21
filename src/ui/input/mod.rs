@@ -881,6 +881,31 @@ impl InputEditor {
         self.load_text(&format!("{prefix}{query}"));
     }
 
+    /// The first character typed after `/prompt `, `/model(s) `, `/theme ` or
+    /// `/provider ` opens that command's picker and seeds its query.
+    fn auto_open_argument_picker(&mut self, c: char) {
+        if c == ' ' || self.picker.as_ref().is_some_and(|p| p.active()) {
+            return;
+        }
+        for prefix in ["/prompt ", "/model ", "/models ", "/theme ", "/provider "] {
+            if self.buffer.len() != prefix.len() + 1 || !self.buffer.starts_with(prefix) {
+                continue;
+            }
+            match prefix {
+                "/prompt " => self.start_prompt_picker(),
+                "/theme " => self.start_theme_picker(),
+                "/provider " => self.start_provider_picker(),
+                _ => self.start_models_picker(prefix),
+            }
+            match self.picker.as_mut() {
+                Some(Picker::Prefixed(picker, _)) => picker.char_input(c),
+                Some(Picker::Models(picker)) => picker.char_input(c),
+                _ => {}
+            }
+            return;
+        }
+    }
+
     /// Open argument completion for an exact or partially completed slash
     /// command even when the command picker is no longer active (for example,
     /// after paste or history recall). Returns false when Tab should keep its
@@ -896,6 +921,11 @@ impl InputEditor {
             ("/agent", "/agent ", with_default(&self.agent_names)),
             ("/theme", "/theme ", with_default(&self.theme_names)),
             ("/provider", "/provider ", self.provider_names.clone()),
+            (
+                "/subagent-models",
+                "/subagent-models ",
+                self.quick_model_names.clone(),
+            ),
             (
                 "/models-subagent",
                 "/models-subagent ",
@@ -1005,8 +1035,10 @@ impl InputEditor {
         &mut self,
         workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
         all: bool,
+        query: &str,
     ) {
         let mut picker = crate::ui::pickers::sessions::SessionsPicker::loading(workspace, all);
+        picker.paste(query);
         picker.set_monochrome(self.monochrome);
         self.picker = Some(Picker::Sessions(picker));
     }
@@ -1650,76 +1682,7 @@ impl InputEditor {
                     self.start_add_file_picker();
                 }
 
-                if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
-                    && self.buffer.starts_with("/prompt ")
-                {
-                    let after_prefix: String = self.buffer.chars().skip("/prompt ".len()).collect();
-                    if !after_prefix.is_empty() && c != ' ' {
-                        let query_len = after_prefix.len();
-                        if query_len == 1 {
-                            self.start_prompt_picker();
-                            if let Some(Picker::Prefixed(ref mut pp, _)) = self.picker {
-                                pp.char_input(c);
-                            }
-                        }
-                    }
-                }
-                for prefix in ["/model ", "/models "] {
-                    if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
-                        && self.buffer.starts_with(prefix)
-                    {
-                        let after_prefix: String = self.buffer.chars().skip(prefix.len()).collect();
-                        if !after_prefix.is_empty() && c != ' ' {
-                            let query_len = after_prefix.len();
-                            if query_len == 1 {
-                                self.start_models_picker(prefix);
-                                if let Some(Picker::Models(ref mut mp)) = self.picker {
-                                    mp.char_input(c);
-                                }
-                            }
-                        }
-                    }
-                }
-                if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
-                    && self.buffer.starts_with("/model ")
-                {
-                    let after_prefix: String = self.buffer.chars().skip("/model ".len()).collect();
-                    if !after_prefix.is_empty() && c != ' ' && after_prefix.len() == 1 {
-                        self.start_models_picker("/model ");
-                        if let Some(Picker::Models(ref mut mp)) = self.picker {
-                            mp.char_input(c);
-                        }
-                    }
-                }
-                if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
-                    && self.buffer.starts_with("/theme ")
-                {
-                    let after_prefix: String = self.buffer.chars().skip("/theme ".len()).collect();
-                    if !after_prefix.is_empty() && c != ' ' {
-                        let query_len = after_prefix.len();
-                        if query_len == 1 {
-                            self.start_theme_picker();
-                            if let Some(Picker::Prefixed(ref mut tp, _)) = self.picker {
-                                tp.char_input(c);
-                            }
-                        }
-                    }
-                }
-                if (self.picker.is_none() || !self.picker.as_ref().is_some_and(|p| p.active()))
-                    && self.buffer.starts_with("/provider ")
-                {
-                    let after_prefix: String =
-                        self.buffer.chars().skip("/provider ".len()).collect();
-                    if !after_prefix.is_empty() && c != ' ' {
-                        let query_len = after_prefix.len();
-                        if query_len == 1 {
-                            self.start_provider_picker();
-                            if let Some(Picker::Prefixed(ref mut pp, _)) = self.picker {
-                                pp.char_input(c);
-                            }
-                        }
-                    }
-                }
+                self.auto_open_argument_picker(c);
 
                 None
             }
