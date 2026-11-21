@@ -1,4 +1,5 @@
 mod accept;
+mod auth;
 mod client_fs;
 mod commands;
 pub mod config;
@@ -18,7 +19,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
-#[cfg(test)]
 use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(test)]
@@ -154,6 +154,10 @@ struct SessionHistory {
     /// A post-reply title request is running without the history lock; one at
     /// a time, so a later turn does not start a duplicate (mini-agent-nooj0).
     title_in_flight: bool,
+    /// The client's `additionalDirectories`, validated at `session/new` or
+    /// `session/load`; each turn adds them to the `--add-dir` list its
+    /// permission checker is built from (mini-agent-nvnkx.111).
+    additional_dirs: Vec<PathBuf>,
 }
 
 /// When ACP live history is summarized. Token pressure mirrors the TUI's
@@ -330,6 +334,7 @@ impl Default for SessionHistory {
             context_window: 0,
             last_title_sent: None,
             title_in_flight: false,
+            additional_dirs: Vec::new(),
         }
     }
 }
@@ -1913,6 +1918,16 @@ async fn connect_agent(
         .on_receive_request(
             {
                 let state = state.clone();
+                move |req: AuthenticateRequest, responder, _cx| {
+                    let state = state.clone();
+                    async move { handle_authenticate(req, responder, &state).await }
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let state = state.clone();
                 move |req: ListSessionsRequest, responder, _cx| {
                     let state = state.clone();
                     async move { sessions::handle_list(req, responder, &state).await }
@@ -2112,17 +2127,114 @@ async fn handle_initialize(
 ) -> Result<(), agent_client_protocol::Error> {
     let _activity = state.idle.admit()?;
     state.client_fs.record(&req.client_capabilities);
+    state.client_fs.record_auth(&req.client_capabilities);
     let caps = acp_capabilities()
         .mcp_capabilities(McpCapabilities::new().http(client_mcp_http_available(state)));
 
     let resp = InitializeResponse::new(acp_protocol_version())
         .agent_capabilities(caps)
+        .auth_methods(auth::auth_methods(state.client_fs.auth_terminal()))
         .agent_info(Implementation::new(
             crate::product::PUBLIC_NAME,
             AGENT_VERSION,
         ));
 
     responder.respond(resp)
+}
+
+/// Validates the `additionalDirectories` of `session/new` or `session/load`
+/// and returns their canonical paths. They map onto `--add-dir`, which only
+/// gives the file tools access under `add_dir_tool_access = true`; without it
+/// the request is refused naming that key, so a client never believes a root
+/// is readable when it is not.
+fn additional_directories(
+    state: &AcpState,
+    requested: &[PathBuf],
+) -> Result<Vec<PathBuf>, agent_client_protocol::Error> {
+    const MAX_ADDITIONAL_DIRECTORIES: usize = 16;
+    if requested.is_empty() {
+        return Ok(Vec::new());
+    }
+    let invalid = |message: String| agent_client_protocol::Error::new(-32602, message);
+    if !state.cfg.add_dir_tool_access.unwrap_or(false) {
+        return Err(invalid(
+            "additional ACP workspace directories need add_dir_tool_access = true in the config (the key that lets --add-dir directories be read and edited)"
+                .to_owned(),
+        ));
+    }
+    if requested.len() > MAX_ADDITIONAL_DIRECTORIES {
+        return Err(invalid(format!(
+            "at most {MAX_ADDITIONAL_DIRECTORIES} additional ACP workspace directories are accepted"
+        )));
+    }
+    let mut accepted: Vec<PathBuf> = Vec::new();
+    for dir in requested {
+        if !dir.is_absolute() {
+            return Err(invalid(
+                "additional ACP workspace directories must be absolute paths".to_owned(),
+            ));
+        }
+        let canonical = std::fs::canonicalize(dir)
+            .ok()
+            .filter(|path| path.is_dir())
+            .ok_or_else(|| {
+                invalid(persona::bounded_message(&format!(
+                    "additional ACP workspace directory is not an existing directory: {}",
+                    crate::ui::events::sanitize_output(&dir.display().to_string())
+                )))
+            })?;
+        if !accepted.contains(&canonical) {
+            accepted.push(canonical);
+        }
+    }
+    Ok(accepted)
+}
+
+/// Binds validated additional directories to an installed session.
+async fn set_additional_dirs(state: &AcpState, session_id: &SessionId, dirs: Vec<PathBuf>) {
+    if dirs.is_empty() {
+        return;
+    }
+    let history = state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|session| session.history.clone());
+    if let Some(history) = history {
+        history.lock().await.additional_dirs = dirs;
+    }
+}
+
+/// `authenticate`: the client asks mini-agent to re-check the credential
+/// (after the user set it, or after a terminal login). Succeeds when the
+/// default provider's credential resolves, otherwise `auth_required`.
+async fn handle_authenticate(
+    req: AuthenticateRequest,
+    responder: Responder<AuthenticateResponse>,
+    state: &AcpState,
+) -> Result<(), agent_client_protocol::Error> {
+    let _activity = state.idle.admit()?;
+    if !auth::is_known_method(&req.method_id.0) {
+        return Err(agent_client_protocol::Error::new(
+            -32602,
+            "unknown ACP authentication method",
+        ));
+    }
+    match auth::check_default_credential(&state.cli, &state.cfg) {
+        Ok(()) => responder.respond(AuthenticateResponse::new()),
+        Err(reason) => Err(auth::auth_required(&reason)),
+    }
+}
+
+/// A client that can show a sign-in UI gets `auth_required` instead of a
+/// failure at the first prompt.
+fn require_auth_for_session(state: &AcpState) -> Result<(), agent_client_protocol::Error> {
+    if !state.client_fs.auth_terminal() {
+        return Ok(());
+    }
+    auth::check_default_credential(&state.cli, &state.cfg)
+        .map_err(|reason| auth::auth_required(&reason))
 }
 
 async fn handle_new_session(
@@ -2132,12 +2244,8 @@ async fn handle_new_session(
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
     let _activity = state.idle.admit()?;
-    if !req.additional_directories.is_empty() {
-        return Err(agent_client_protocol::Error::new(
-            -32602,
-            "additional ACP workspace directories are not supported",
-        ));
-    }
+    require_auth_for_session(state)?;
+    let additional_dirs = additional_directories(state, &req.additional_directories)?;
 
     let workspace = Arc::new(canonical_session_workspace(&req.cwd)?);
     #[cfg(feature = "mcp")]
@@ -2169,6 +2277,7 @@ async fn handle_new_session(
         client_mcp_servers,
     )
     .await?;
+    set_additional_dirs(state, &session_id, additional_dirs).await;
 
     // Permission modes are the ACP session modes; the persona (prompt and its
     // `[prompt_to_model]` route) is the `mode` session config option.
@@ -2408,6 +2517,7 @@ async fn install_session(
                 context_window: 0,
                 last_title_sent: None,
                 title_in_flight: false,
+                additional_dirs: Vec::new(),
             })),
             workspace,
             base_context: Arc::new(base_context),
@@ -5467,7 +5577,10 @@ async fn command_checkpoint(
 ) -> anyhow::Result<()> {
     let changes_transcript_or_name = matches!(
         command,
-        commands::Command::Undo | commands::Command::Rename(_)
+        commands::Command::Undo
+            | commands::Command::Rename(_)
+            | commands::Command::Rewind(Some(_))
+            | commands::Command::Redo
     );
     if changes_transcript_or_name
         && crate::session::native_publication::is_native_bearing(&history.session)
@@ -5521,6 +5634,22 @@ async fn run_command(
                 "Removed {removed} conversation records; files and billed usage remain unchanged."
             ))
         }
+        commands::Command::Rewind(None) => Some(commands::rewind_listing(&history.session)),
+        commands::Command::Rewind(Some(n)) => {
+            let workspace = state
+                .sessions
+                .lock()
+                .await
+                .get(session_id)
+                .map(|session| session.workspace.clone());
+            match workspace {
+                Some(workspace) => {
+                    Some(commands::rewind_to_turn(&mut history.session, workspace, *n).await)
+                }
+                None => Some("The session is no longer open.".to_owned()),
+            }
+        }
+        commands::Command::Redo => Some(commands::redo_line(&mut history.session)),
         commands::Command::Rename(name) => {
             history.session.name = name.as_str().into();
             Some(format!("Session renamed to {name}."))
@@ -5606,7 +5735,10 @@ async fn run_command(
         // (mini-agent-8x75g).
         if matches!(
             command,
-            commands::Command::Undo | commands::Command::Rename(_)
+            commands::Command::Undo
+                | commands::Command::Rename(_)
+                | commands::Command::Rewind(Some(_))
+                | commands::Command::Redo
         ) {
             send_usage_update(state, history, session_id, cx);
             send_session_info(history, session_id, cx);
@@ -7623,8 +7755,16 @@ fn open_turn_gate(
     if let Some(mode) = history.policy.mode() {
         authority.mode = mode;
     }
+    // The session's additional directories ride the `--add-dir` entry point.
+    let mut turn_cli = std::borrow::Cow::Borrowed(&state.cli);
+    if !history.additional_dirs.is_empty() {
+        turn_cli
+            .to_mut()
+            .add_dir
+            .extend(history.additional_dirs.iter().cloned());
+    }
     let (permission, ask_tx, ask_rx) = crate::permission::build_interactive_permission_with_cli_at(
-        &state.cli,
+        &turn_cli,
         &state.cfg,
         authority,
         Some(turn.workspace.root().to_path_buf()),
@@ -8516,6 +8656,7 @@ impl OpenCalls {
         is_error: bool,
     ) {
         self.open.retain(|open| *open != id);
+        let shell = toolcall::recall_shell(&id);
         toolcall::forget_args(&id);
         let diff = self.diffs.remove(&id);
         toolcall::record_result(session_id.0.as_ref(), output, is_error, diff.as_ref());
@@ -8529,6 +8670,16 @@ impl OpenCalls {
             .content(content);
         if is_error {
             fields.status = Some(ToolCallStatus::Failed);
+        }
+        // Shell calls run in mini-agent's own sandbox, never in a client
+        // terminal; the result carries what a console view needs.
+        if let Some(workdir) = shell {
+            fields.raw_output = Some(serde_json::json!({
+                "kind": "shell",
+                "status": if is_error { "failed" } else { "completed" },
+                "workdir": workdir,
+                "output": output,
+            }));
         }
         let notif = SessionNotification::new(
             session_id.clone(),
@@ -10477,6 +10628,303 @@ mod protocol_tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1, "local commands cannot launch a model runner");
             Ok(())
         }).await.unwrap();
+    }
+
+    fn agent_text(updates: &[SessionNotification]) -> String {
+        updates
+            .iter()
+            .filter_map(|notice| match &notice.update {
+                SessionUpdate::AgentMessageChunk(chunk) => match &chunk.content {
+                    ContentBlock::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// mini-agent-nvnkx.107: `/rewind` restores the file bytes and the
+    /// conversation, `/redo` puts the conversation back, and a malformed
+    /// argument is a bounded -32602 error.
+    #[tokio::test]
+    async fn acp_rewind_restores_files_and_history_and_redo_restores_history() {
+        use rig::tool::Tool;
+        let state = fixture_state(Arc::new(|_, _| {
+            Box::pin(async {
+                Ok(vec![AgentEvent::Done {
+                    response: "answer".into(),
+                    interactions: vec![Message::assistant("answer")],
+                }])
+            })
+        }));
+        let inspect = state.clone();
+        let updates = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = updates.clone();
+        let workspace_dir = ProtocolTempDir::new();
+        let cwd = workspace_dir.path().to_path_buf();
+        std::fs::write(cwd.join("note.txt"), "before").unwrap();
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let id = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                cx.send_request(prompt(id.clone(), "edit the note"))
+                    .block_task()
+                    .await?;
+                // The turn "edited" note.txt: record the change through the real
+                // write tool, scoped to the session's checkpoint recorder.
+                {
+                    let sessions = inspect.sessions.lock().await;
+                    let history = sessions[&id].history.lock().await;
+                    let binding = Arc::new(crate::paths::WorkspaceBinding::capture(&cwd).unwrap());
+                    let tracker = crate::agent::tools::ReadTracker::new(true);
+                    let recorder =
+                        history
+                            .session
+                            .file_checkpoints
+                            .recorder(&history.session.id, 0, true);
+                    crate::session::file_checkpoints::scope(Some(recorder), async {
+                        crate::agent::tools::read::ReadTool::new_with_tracker(
+                            None,
+                            None,
+                            None,
+                            100,
+                            tracker.clone(),
+                        )
+                        .with_workspace(binding.root())
+                        .call(crate::agent::tools::ReadArgs {
+                            pages: None,
+                            raw_notebook: false,
+                            visual: false,
+                            full_resolution: false,
+                            character_offset: None,
+                            character_limit: None,
+                            path: "note.txt".into(),
+                            offset: None,
+                            limit: None,
+                        })
+                        .await
+                        .unwrap();
+                        crate::agent::tools::write::WriteTool::new_with_tracker(
+                            None, None, None, tracker,
+                        )
+                        .with_workspace_binding(binding.clone())
+                        .call(crate::agent::tools::WriteArgs {
+                            path: "note.txt".into(),
+                            content: "after".into(),
+                            overwrite: true,
+                        })
+                        .await
+                        .unwrap();
+                    })
+                    .await;
+                }
+                assert_eq!(
+                    std::fs::read_to_string(cwd.join("note.txt")).unwrap(),
+                    "after"
+                );
+                cx.send_request(prompt(id.clone(), "/rewind"))
+                    .block_task()
+                    .await?;
+                assert!(agent_text(&updates.lock().unwrap()).contains("1. edit the note"));
+                for bad in ["/rewind x", "/rewind 0", "/rewind 1 2", "/rewind 99999"] {
+                    let error = cx
+                        .send_request(prompt(id.clone(), bad))
+                        .block_task()
+                        .await
+                        .unwrap_err();
+                    assert_eq!(i32::from(error.code), -32602, "{bad}");
+                    assert!(error.message.len() < 200, "{bad}");
+                }
+                cx.send_request(prompt(id.clone(), "/rewind 1"))
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    std::fs::read_to_string(cwd.join("note.txt")).unwrap(),
+                    "before"
+                );
+                assert!(
+                    inspect.sessions.lock().await[&id]
+                        .history
+                        .lock()
+                        .await
+                        .session
+                        .messages
+                        .is_empty()
+                );
+                cx.send_request(prompt(id.clone(), "/redo"))
+                    .block_task()
+                    .await?;
+                assert_eq!(
+                    inspect.sessions.lock().await[&id]
+                        .history
+                        .lock()
+                        .await
+                        .session
+                        .messages
+                        .len(),
+                    2
+                );
+                assert_eq!(
+                    std::fs::read_to_string(cwd.join("note.txt")).unwrap(),
+                    "before",
+                    "redo leaves files alone"
+                );
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let names: Vec<String> = updates
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|notice| match &notice.update {
+                        SessionUpdate::AvailableCommandsUpdate(commands) => Some(
+                            commands
+                                .available_commands
+                                .iter()
+                                .map(|c| c.name.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                assert!(
+                    names.iter().any(|name| name == "rewind")
+                        && names.iter().any(|name| name == "redo")
+                );
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// mini-agent-nvnkx.109: auth methods, `authenticate` and the
+    /// `auth_required` gate for a client with a terminal login.
+    #[tokio::test]
+    async fn acp_advertises_auth_methods_and_requires_auth_without_a_credential() {
+        let _env = crate::tests::ScopedProcessEnv::set(&[("OPENROUTER_API_KEY", None)]);
+        let mut state = fixture_state(Arc::new(|_, _| Box::pin(async { Ok(vec![]) })));
+        {
+            let inner = Arc::get_mut(&mut state).unwrap();
+            inner.cli.api_key = None;
+            inner.cli.provider = Some("openrouter".into());
+        }
+        let workspace_dir = ProtocolTempDir::new();
+        let cwd = workspace_dir.path().to_path_buf();
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                let plain = cx
+                    .send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                assert_eq!(plain.auth_methods.len(), 1);
+                // A client without a sign-in UI keeps the failure at the prompt.
+                cx.send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?;
+                let capable = cx
+                    .send_request(
+                        InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                            ClientCapabilities::new().auth(AuthCapabilities::new().terminal(true)),
+                        ),
+                    )
+                    .block_task()
+                    .await?;
+                let ids: Vec<String> = capable
+                    .auth_methods
+                    .iter()
+                    .map(|method| method.id().0.to_string())
+                    .collect();
+                assert!(
+                    ids.contains(&"login-openai".to_owned())
+                        && ids.contains(&"credentials".to_owned())
+                );
+                let error = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    i32::from(error.code),
+                    i32::from(agent_client_protocol::Error::auth_required().code)
+                );
+                let error = cx
+                    .send_request(AuthenticateRequest::new("credentials"))
+                    .block_task()
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    i32::from(error.code),
+                    i32::from(agent_client_protocol::Error::auth_required().code)
+                );
+                let error = cx
+                    .send_request(AuthenticateRequest::new("bogus"))
+                    .block_task()
+                    .await
+                    .unwrap_err();
+                assert_eq!(i32::from(error.code), -32602);
+                Ok(())
+            })
+            .await
+            .unwrap();
+
+        // With a credential the same client gets a session and `authenticate` succeeds.
+        let state = fixture_state(Arc::new(|_, _| Box::pin(async { Ok(vec![]) })));
+        let workspace_dir = ProtocolTempDir::new();
+        let cwd = workspace_dir.path().to_path_buf();
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(
+                    InitializeRequest::new(ProtocolVersion::V1).client_capabilities(
+                        ClientCapabilities::new().auth(AuthCapabilities::new().terminal(true)),
+                    ),
+                )
+                .block_task()
+                .await?;
+                cx.send_request(AuthenticateRequest::new("credentials"))
+                    .block_task()
+                    .await?;
+                cx.send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    /// mini-agent-nvnkx.111: additional directories need `add_dir_tool_access`
+    /// and are canonicalised; the refusal names the key.
+    #[test]
+    fn acp_additional_directories_follow_add_dir_tool_access() {
+        let mut state = fixture_state(Arc::new(|_, _| Box::pin(async { Ok(vec![]) })));
+        let extra = ProtocolTempDir::new();
+        let dir = extra.path().to_path_buf();
+        let error = additional_directories(&state, std::slice::from_ref(&dir)).unwrap_err();
+        assert_eq!(i32::from(error.code), -32602);
+        assert!(error.message.contains("add_dir_tool_access"));
+        assert!(additional_directories(&state, &[]).unwrap().is_empty());
+        Arc::get_mut(&mut state).unwrap().cfg.add_dir_tool_access = Some(true);
+        let accepted = additional_directories(&state, &[dir.clone(), dir.clone()]).unwrap();
+        assert_eq!(accepted, vec![std::fs::canonicalize(&dir).unwrap()]);
+        assert!(additional_directories(&state, &[PathBuf::from("relative")]).is_err());
+        assert!(additional_directories(&state, &[dir.join("missing")]).is_err());
+        let many: Vec<PathBuf> = (0..17).map(|_| dir.clone()).collect();
+        assert!(additional_directories(&state, &many).is_err());
     }
 
     fn title_due_history() -> Arc<Mutex<SessionHistory>> {

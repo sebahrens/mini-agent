@@ -235,12 +235,7 @@ pub(super) async fn handle_load(
     state: &AcpState,
 ) -> Result<(), agent_client_protocol::Error> {
     let _activity = state.idle.admit()?;
-    if !req.additional_directories.is_empty() {
-        return Err(agent_client_protocol::Error::new(
-            -32602,
-            "additional ACP workspace directories are not supported",
-        ));
-    }
+    let additional_dirs = super::additional_directories(state, &req.additional_directories)?;
     // Fresh runtime lease/policy (reserved once the saved data has loaded, so
     // a failed load never evicts a live session); no permission choice,
     // waiter, hidden redo or process-local skill/MCP authority can be adopted
@@ -320,6 +315,7 @@ pub(super) async fn handle_load(
         client_mcp_servers,
     )
     .await?;
+    super::set_additional_dirs(state, &req.session_id, additional_dirs).await;
     // Replay literal saved data only. Opaque native signatures/redacted blocks
     // are never sent to the editor's display channel.
     for notification in replay {

@@ -81,6 +81,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Added: ACP answers `max_turn_requests` for a spent turn cap and `max_tokens` for a spent token budget or a final answer cut off at the output limit, instead of a JSON-RPC internal error or `end_turn`; the explanation arrives as a thought chunk (mini-agent-nvnkx.273).
 - `shell-auto-allow-sandboxed` (global-only, default off; a managed policy can force it off with `forbid_shell_auto_allow`) lets standard mode run unmatched shell commands without a prompt while an enforced `workspace`/`host-read` sandbox with network `deny`/`allowlist` contains them; deny and ask rules, destructive commands and escalation still prompt, and `/sandbox` and the status line show the state (mini-agent-nvnkx.62).
 - `--add-workspace-dir DIR` (and `--add-dir` under `add_dir_tool_access = true`) gives DIR to the file tools and the shell sandbox write roots together, and `/add-dir DIR` grants file-tool access for the running session (mini-agent-nvnkx.71).
+- stream-json control accepts the Agent SDK `initialize` handshake and `set_model` (a `[quick_models]` alias, applied at the next turn), and an allow reply may carry `updatedInput` (the ask now includes `tool_input`); the call reruns with the edited arguments after its permission check runs again; record shapes are versioned in `docs/specs/stream-json-control.md` (mini-agent-nvnkx.102).
+- ACP `/rewind [n]` lists turns or restores files and conversation to before one, and `/redo` puts the conversation back (mini-agent-nvnkx.107).
+- ACP `initialize` advertises `authMethods` (provider credentials, and terminal logins for a client with `auth.terminal`), `authenticate` re-checks the credential, and `session/new` answers `auth_required` for such a client when the default provider has no credential (mini-agent-nvnkx.109).
+- ACP shell tool results carry `rawOutput` (`kind`, `status`, `workdir`, `output`); commands still run in mini-agent's sandbox rather than a client terminal (mini-agent-nvnkx.110).
+- ACP `additionalDirectories` map onto `--add-dir` when `add_dir_tool_access = true` (otherwise the -32602 error names the key) (mini-agent-nvnkx.111).
 
 ### Fixed
 

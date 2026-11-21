@@ -20,7 +20,19 @@
 //! * `set_permission_mode`, which can only narrow the active mode, exactly
 //!   like a prompt `%%mode=` directive: it never raises privilege.
 //!
-//! Every driver request is acknowledged with a `control_response` line.
+//! * `initialize` (Agent SDK handshake): answered with the supported request
+//!   subtypes, the session id and the quick-model aliases `set_model` takes;
+//!   unknown optional fields (hooks, agents, MCP servers, prompts) are ignored;
+//! * `set_model`, which switches to a configured `[quick_models]` alias from
+//!   the next turn, with the `/model` validation (native-state sessions refuse);
+//! * an allow reply may carry `updatedInput` (the tool call's JSON arguments,
+//!   an object): the call then runs with the edited arguments, which go through
+//!   the tool's permission check again. An echo of the offered input is a plain
+//!   allow. The ask carries the arguments as `request.tool_input` (omitted when
+//!   over [`MAX_ASK_INPUT_BYTES`]).
+//!
+//! Every driver request is acknowledged with a `control_response` line. The
+//! record shapes are published in `docs/specs/stream-json-control.md`.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,7 +67,7 @@ fn ask_event(id: &str, tool: &str, input: &str) -> Result<serde_json::Value, Str
     }
     let reviewed = crate::ui::events::sanitize_for_review(input);
     let (tool_name, _) = crate::print::bounded_progress(tool, 256);
-    Ok(serde_json::json!({
+    let mut event = serde_json::json!({
         "type": "control_request",
         "request_id": id,
         "request": {
@@ -65,7 +77,16 @@ fn ask_event(id: &str, tool: &str, input: &str) -> Result<serde_json::Value, Str
             "input_bytes": input.len(),
             "truncated": false,
         },
-    }))
+    });
+    // The call's JSON arguments, which `updatedInput` may edit.
+    if let Ok(args) = CALL_ARGS.try_with(String::clone)
+        && args.len() <= MAX_ASK_INPUT_BYTES
+        && let Ok(value) = serde_json::from_str::<serde_json::Value>(&args)
+        && value.is_object()
+    {
+        event["request"]["tool_input"] = value;
+    }
+    Ok(event)
 }
 
 /// A driver's answer to a `can_use_tool` request.
@@ -75,7 +96,94 @@ pub(crate) enum Reply {
     /// An allow the driver scoped to the whole run (`"scope":"run"`). Only a
     /// `sandbox_network` ask honours it; every other ask treats it as `Allow`.
     AllowForRun,
+    /// An allow that replaces the tool call's arguments (`updatedInput`, a
+    /// JSON object text). The edited call is permission-checked again.
+    AllowWith(String),
     Deny(String),
+}
+
+/// Prefix of the tool error that asks the tool-call wrapper to run the call
+/// again with the driver's `updatedInput`.
+const REWRITE_SENTINEL: &str = "\u{1}mini-agent:updated-input\u{1}";
+/// Most edits one call accepts; each rerun is checked and asked again.
+pub(crate) const MAX_INPUT_REWRITES: usize = 3;
+
+tokio::task_local! {
+    /// The JSON arguments of the tool call whose permission ask is running.
+    static CALL_ARGS: String;
+}
+
+/// The error text that makes the call wrapper rerun with `args`.
+pub(crate) fn rewrite_error(args: &str) -> String {
+    format!("{REWRITE_SENTINEL}{args}")
+}
+
+/// The edited arguments a tool failure asks for, if it is a rewrite request.
+pub(crate) fn rewrite_request(failure: &str) -> Option<String> {
+    let (_, rest) = failure.split_once(REWRITE_SENTINEL)?;
+    let value = serde_json::Deserializer::from_str(rest)
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
+    value.is_object().then(|| value.to_string())
+}
+
+/// Runs `call` with `args`, and again with the driver's edited arguments
+/// whenever the call fails with a rewrite request (at most
+/// [`MAX_INPUT_REWRITES`] times). `extract` reads the failure text of a result.
+/// With the control channel off this is a single plain call.
+pub(crate) async fn call_with_updates<T, F, Fut>(
+    args: String,
+    extract: impl Fn(&T) -> Option<String>,
+    call: F,
+) -> T
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    run_updates(STATE.get().is_some(), args, extract, call).await
+}
+
+async fn run_updates<T, F, Fut>(
+    enabled: bool,
+    mut args: String,
+    extract: impl Fn(&T) -> Option<String>,
+    mut call: F,
+) -> T
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    if !enabled {
+        return call(args).await;
+    }
+    let mut attempts = 0;
+    loop {
+        let out = CALL_ARGS.scope(args.clone(), call(args.clone())).await;
+        match extract(&out).and_then(|text| rewrite_request(&text)) {
+            Some(next) if attempts < MAX_INPUT_REWRITES => {
+                attempts += 1;
+                args = next;
+            }
+            _ => return out,
+        }
+    }
+}
+
+/// Decides what an `updatedInput` means for the call being asked about: the
+/// edited arguments, or `None` when it equals what was offered (an echo) or is
+/// not a JSON object.
+fn edited_arguments(updated: &serde_json::Value, offered_text: &str) -> Option<String> {
+    if updated.as_str() == Some(offered_text) {
+        return None;
+    }
+    let object = updated.as_object()?;
+    let current = CALL_ARGS.try_with(String::clone).ok()?;
+    let current_value: serde_json::Value = serde_json::from_str(&current).ok()?;
+    if current_value.as_object() == Some(object) {
+        return None;
+    }
+    serde_json::to_string(updated).ok()
 }
 
 /// One recognised control line.
@@ -87,6 +195,13 @@ pub(crate) enum ControlLine {
     SetPermissionMode {
         request_id: Option<String>,
         mode: String,
+    },
+    Initialize {
+        request_id: Option<String>,
+    },
+    SetModel {
+        request_id: Option<String>,
+        model: String,
     },
     Response {
         request_id: String,
@@ -124,10 +239,19 @@ pub(crate) fn classify_line(line: &str) -> Option<ControlLine> {
                         message: "set_permission_mode needs a \"mode\"".into(),
                     },
                 },
+                Some("initialize") => ControlLine::Initialize { request_id },
+                Some("set_model") => match request.and_then(|r| text(r, "model")) {
+                    Some(model) => ControlLine::SetModel { request_id, model },
+                    None => ControlLine::Invalid {
+                        request_id,
+                        message: "set_model needs a \"model\" (a [quick_models] alias)".into(),
+                    },
+                },
                 other => ControlLine::Invalid {
                     request_id,
                     message: format!(
-                        "unsupported control request {other:?} (interrupt, set_permission_mode)"
+                        "unsupported control request {other:?} ({})",
+                        SUPPORTED_REQUESTS.join(", ")
                     ),
                 },
             })
@@ -145,9 +269,17 @@ pub(crate) fn classify_line(line: &str) -> Option<ControlLine> {
             let behavior = inner.and_then(|inner| text(inner, "behavior"));
             let reply = match (subtype.as_deref(), behavior.as_deref()) {
                 (Some("success"), Some("allow")) => {
-                    match inner.and_then(|inner| text(inner, "scope")).as_deref() {
-                        Some("run" | "session") => Reply::AllowForRun,
-                        _ => Reply::Allow,
+                    let updated = inner
+                        .and_then(|inner| inner.get("updatedInput").or(inner.get("updated_input")))
+                        .filter(|value| !value.is_null());
+                    match (
+                        updated,
+                        inner.and_then(|inner| text(inner, "scope")).as_deref(),
+                    ) {
+                        // Resolved against the call's arguments in `ask_tool`.
+                        (Some(updated), _) => Reply::AllowWith(updated.to_string()),
+                        (None, Some("run" | "session")) => Reply::AllowForRun,
+                        (None, _) => Reply::Allow,
                     }
                 }
                 (Some("success"), Some("deny")) => Reply::Deny(
@@ -175,7 +307,29 @@ pub(crate) fn classify_line(line: &str) -> Option<ControlLine> {
     }
 }
 
+/// Version of the control record shapes (`docs/specs/stream-json-control.md`).
+pub(crate) const PROTOCOL_VERSION: &str = "mini-agent-control/1";
+
+/// The request subtypes the channel answers.
+pub(crate) const SUPPORTED_REQUESTS: [&str; 4] = [
+    "initialize",
+    "interrupt",
+    "set_permission_mode",
+    "set_model",
+];
+
+/// What `initialize` reports and `set_model` validates against.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ControlInfo {
+    pub session_id: String,
+    /// Configured `[quick_models]` aliases, sorted.
+    pub models: Vec<String>,
+}
+
 pub(crate) struct ControlState {
+    info: Mutex<ControlInfo>,
+    /// A `set_model` waiting for the next turn boundary.
+    pending_model: Mutex<Option<String>>,
     pending: Mutex<HashMap<String, oneshot::Sender<Reply>>>,
     /// Set (under the `pending` lock) once stdin is exhausted; later asks are
     /// denied at once because no driver can answer them.
@@ -216,6 +370,8 @@ impl ControlState {
         timeout: Duration,
     ) -> Self {
         Self {
+            info: Mutex::new(ControlInfo::default()),
+            pending_model: Mutex::new(None),
             pending: Mutex::new(HashMap::new()),
             closed: std::sync::atomic::AtomicBool::new(false),
             next_id: AtomicU64::new(1),
@@ -231,10 +387,44 @@ impl ControlState {
     /// than an explicit allow within the timeout is a denial.
     pub(crate) async fn ask(&self, tool: &str, input: &str) -> Reply {
         match self.ask_raw(tool, input).await {
-            // A run-scoped allow means something only for network hosts.
-            Reply::AllowForRun => Reply::Allow,
+            // A run-scoped allow means something only for network hosts, and
+            // only a tool call can take edited arguments.
+            Reply::AllowForRun | Reply::AllowWith(_) => Reply::Allow,
             other => other,
         }
+    }
+
+    /// [`ControlState::ask`] for a tool call: an `updatedInput` that differs
+    /// from the offered arguments comes back as [`Reply::AllowWith`].
+    pub(crate) async fn ask_tool(&self, tool: &str, input: &str) -> Reply {
+        match self.ask_raw(tool, input).await {
+            Reply::AllowForRun => Reply::Allow,
+            Reply::AllowWith(updated) => {
+                let value = serde_json::from_str(&updated).unwrap_or(serde_json::Value::Null);
+                match edited_arguments(&value, input) {
+                    Some(args) => Reply::AllowWith(args),
+                    None => Reply::Allow,
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Records what `initialize` reports and `set_model` accepts.
+    pub(crate) fn set_info(&self, session_id: &str, mut models: Vec<String>) {
+        models.sort_unstable();
+        *self.info.lock().unwrap_or_else(|e| e.into_inner()) = ControlInfo {
+            session_id: session_id.to_owned(),
+            models,
+        };
+    }
+
+    /// The alias a driver selected with `set_model` since the last turn.
+    pub(crate) fn take_model(&self) -> Option<String> {
+        self.pending_model
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     async fn ask_raw(&self, tool: &str, input: &str) -> Reply {
@@ -309,15 +499,22 @@ impl ControlState {
 
     /// Asks the driver to let the sandbox reach one `host:port`.
     pub(crate) async fn ask_network(&self, host_port: &str) -> Reply {
-        self.ask_raw(SANDBOX_NETWORK_TOOL, host_port).await
+        match self.ask_raw(SANDBOX_NETWORK_TOOL, host_port).await {
+            Reply::AllowWith(_) => Reply::Allow,
+            other => other,
+        }
     }
 
     /// Applies one classified line and returns the acknowledgement event to
     /// emit (if any).
     pub(crate) fn handle(&self, line: ControlLine) -> Option<serde_json::Value> {
-        let ack = |request_id: Option<String>, result: Result<(), String>| {
+        let ack = |request_id: Option<String>,
+                   result: Result<Option<serde_json::Value>, String>| {
             let mut response = match &result {
-                Ok(()) => serde_json::json!({"subtype": "success"}),
+                Ok(None) => serde_json::json!({"subtype": "success"}),
+                Ok(Some(payload)) => {
+                    serde_json::json!({"subtype": "success", "response": payload})
+                }
                 Err(error) => serde_json::json!({"subtype": "error", "error": error}),
             };
             if let Some(id) = request_id {
@@ -331,11 +528,45 @@ impl ControlState {
                     return ack(request_id, Err("no turn is running or queued".into()));
                 }
                 self.interrupt.notify_one();
-                ack(request_id, Ok(()))
+                ack(request_id, Ok(None))
             }
             ControlLine::SetPermissionMode { request_id, mode } => {
-                let result = self.set_mode(&mode);
+                let result = self.set_mode(&mode).map(|()| None);
                 ack(request_id, result)
+            }
+            ControlLine::Initialize { request_id } => {
+                let info = self.info.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                ack(
+                    request_id,
+                    Ok(Some(serde_json::json!({
+                        "protocol": PROTOCOL_VERSION,
+                        "supported_requests": SUPPORTED_REQUESTS,
+                        "session_id": info.session_id,
+                        "commands": [],
+                        "models": info.models,
+                        "can_use_tool_reply": ["allow", "deny", "updatedInput"],
+                    }))),
+                )
+            }
+            ControlLine::SetModel { request_id, model } => {
+                let known = self
+                    .info
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .models
+                    .iter()
+                    .any(|alias| *alias == model);
+                if known {
+                    *self.pending_model.lock().unwrap_or_else(|e| e.into_inner()) = Some(model);
+                    ack(request_id, Ok(None))
+                } else {
+                    ack(
+                        request_id,
+                        Err(format!(
+                            "unknown model {model:?}: set_model takes a configured [quick_models] alias"
+                        )),
+                    )
+                }
             }
             ControlLine::Response { request_id, reply } => {
                 let sender = self
@@ -788,5 +1019,190 @@ mod tests {
             Reply::Deny("the control channel closed".into())
         );
         assert!(state.pending_ids().is_empty());
+    }
+
+    fn control_line(text: &str) -> ControlLine {
+        classify_line(text).expect("a control line")
+    }
+
+    #[test]
+    fn initialize_set_model_and_updated_input_are_classified() {
+        assert_eq!(
+            control_line(
+                r#"{"type":"control_request","request_id":"i","request":{"subtype":"initialize","hooks":{},"agents":[1]}}"#
+            ),
+            ControlLine::Initialize {
+                request_id: Some("i".into())
+            }
+        );
+        assert_eq!(
+            control_line(
+                r#"{"type":"control_request","request_id":"m","request":{"subtype":"set_model","model":"fast"}}"#
+            ),
+            ControlLine::SetModel {
+                request_id: Some("m".into()),
+                model: "fast".into()
+            }
+        );
+        assert!(matches!(
+            control_line(r#"{"type":"control_request","request":{"subtype":"set_model"}}"#),
+            ControlLine::Invalid { .. }
+        ));
+        let allow = r#"{"type":"control_response","response":{"subtype":"success","request_id":"perm_1","response":{"behavior":"allow","updatedInput":{"command":"ls"}}}}"#;
+        assert_eq!(
+            control_line(allow),
+            ControlLine::Response {
+                request_id: "perm_1".into(),
+                reply: Reply::AllowWith(r#"{"command":"ls"}"#.into())
+            }
+        );
+        // A null updatedInput is a plain allow.
+        let plain = r#"{"type":"control_response","response":{"subtype":"success","request_id":"perm_1","response":{"behavior":"allow","updatedInput":null}}}"#;
+        assert!(matches!(
+            control_line(plain),
+            ControlLine::Response {
+                reply: Reply::Allow,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn initialize_reports_the_protocol_session_and_models_and_set_model_validates() {
+        let state = state(Duration::from_secs(1));
+        state.set_info("sess-1", vec!["fast".into(), "deep".into()]);
+        let ack = state
+            .handle(ControlLine::Initialize {
+                request_id: Some("i".into()),
+            })
+            .unwrap();
+        let payload = &ack["response"]["response"];
+        assert_eq!(ack["response"]["subtype"], "success");
+        assert_eq!(payload["protocol"], PROTOCOL_VERSION);
+        assert_eq!(payload["session_id"], "sess-1");
+        assert_eq!(payload["models"], serde_json::json!(["deep", "fast"]));
+        assert!(
+            payload["supported_requests"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "set_model")
+        );
+        let bad = state
+            .handle(ControlLine::SetModel {
+                request_id: Some("m".into()),
+                model: "gpt-nope".into(),
+            })
+            .unwrap();
+        assert_eq!(bad["response"]["subtype"], "error");
+        assert!(state.take_model().is_none());
+        let good = state
+            .handle(ControlLine::SetModel {
+                request_id: Some("m".into()),
+                model: "fast".into(),
+            })
+            .unwrap();
+        assert_eq!(good["response"]["subtype"], "success");
+        assert_eq!(state.take_model().as_deref(), Some("fast"));
+        assert!(state.take_model().is_none(), "taken once");
+    }
+
+    #[tokio::test]
+    async fn updated_input_that_differs_is_a_rewrite_and_an_echo_is_a_plain_allow() {
+        let state = std::sync::Arc::new(state(Duration::from_secs(5)));
+        let call = r#"{"command":"ls"}"#.to_owned();
+        for (reply, expected) in [
+            (
+                r#"{"command":"ls -la"}"#,
+                Reply::AllowWith(r#"{"command":"ls -la"}"#.into()),
+            ),
+            (r#"{"command":"ls"}"#, Reply::Allow),
+            (r#""the offered text""#, Reply::Allow),
+            (r#"[1]"#, Reply::Allow),
+        ] {
+            let waiting = std::sync::Arc::clone(&state);
+            let args = call.clone();
+            let task = tokio::spawn(CALL_ARGS.scope(args, async move {
+                waiting.ask_tool("shell", "the offered text").await
+            }));
+            let id = pending_id(&state).await;
+            let line = format!(
+                r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"behavior":"allow","updatedInput":{reply}}}}}}}"#
+            );
+            state.handle(classify_line(&line).unwrap());
+            assert_eq!(task.await.unwrap(), expected, "{reply}");
+        }
+        // `ask` (escalation, network) never takes edited arguments.
+        let waiting = std::sync::Arc::clone(&state);
+        let task = tokio::spawn(async move { waiting.ask("sandbox_escalation", "x").await });
+        let id = pending_id(&state).await;
+        let line = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{id}","response":{{"behavior":"allow","updatedInput":{{"a":1}}}}}}}}"#
+        );
+        state.handle(classify_line(&line).unwrap());
+        assert_eq!(task.await.unwrap(), Reply::Allow);
+    }
+
+    #[test]
+    fn the_ask_carries_the_call_arguments_as_tool_input() {
+        let event = CALL_ARGS.sync_scope(r#"{"path":"a","content":"b"}"#.into(), || {
+            ask_event("perm_1", "write", "a").unwrap()
+        });
+        assert_eq!(event["request"]["tool_input"]["path"], "a");
+        let none = ask_event("perm_2", "write", "a").unwrap();
+        assert!(none["request"].get("tool_input").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_rewrite_request_reruns_the_call_with_the_edited_arguments_a_bounded_number_of_times()
+    {
+        assert_eq!(
+            rewrite_request(&format!("ToolCallError: {}", rewrite_error(r#"{"a":1}"#))),
+            Some(r#"{"a":1}"#.into())
+        );
+        assert_eq!(rewrite_request("Permission denied: x"), None);
+        assert_eq!(rewrite_request(&rewrite_error("[1]")), None);
+        let runs = std::sync::Mutex::new(Vec::<String>::new());
+        let result = run_updates(
+            true,
+            r#"{"v":0}"#.to_owned(),
+            |out: &String| Some(out.clone()),
+            |args| {
+                runs.lock().unwrap().push(args.clone());
+                async move {
+                    if args == r#"{"v":0}"# {
+                        rewrite_error(r#"{"v":1}"#)
+                    } else {
+                        format!("ran {args}")
+                    }
+                }
+            },
+        )
+        .await;
+        assert_eq!(result, r#"ran {"v":1}"#);
+        assert_eq!(runs.lock().unwrap().len(), 2);
+        // A driver that keeps editing is cut off after MAX_INPUT_REWRITES.
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let result = run_updates(
+            true,
+            "{}".to_owned(),
+            |out: &String| Some(out.clone()),
+            |_| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                async { rewrite_error(r#"{"again":true}"#) }
+            },
+        )
+        .await;
+        assert!(rewrite_request(&result).is_some());
+        assert_eq!(runs.load(Ordering::SeqCst), MAX_INPUT_REWRITES + 1);
+        // With the channel off, nothing is rerun.
+        let off = run_updates(
+            false,
+            "{}".to_owned(),
+            |out: &String| Some(out.clone()),
+            |_| async { rewrite_error(r#"{"x":1}"#) },
+        )
+        .await;
+        assert!(rewrite_request(&off).is_some());
     }
 }
