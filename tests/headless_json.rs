@@ -5316,14 +5316,9 @@ fn output_schema_local_provider_positive_repair_and_exhaustion_keep_accounting_a
             .iter()
             .filter(|message| message["role"] == "user")
             .count();
-        assert_eq!(
-            prompts,
-            if outcome.starts_with("schema_effect_") {
-                2
-            } else {
-                expected_calls as usize
-            }
-        );
+        // Repair attempts persist as System notes (mini-agent-sskdu.193), so
+        // only the original prompt is a user row.
+        assert_eq!(prompts, 1);
         assert_eq!(
             root.0.join("effect.txt").exists(),
             outcome.starts_with("schema_effect_")

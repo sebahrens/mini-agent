@@ -53,17 +53,34 @@ fn nested_command(root: &Path, args: &[&str]) -> Command {
 }
 
 fn bounded_output(mut command: Command) -> Output {
+    use std::io::Read;
     let mut child = command.spawn().expect("spawn nested mini-agent");
+    // Drain both pipes while waiting: a child whose output exceeds the OS pipe buffer
+    // (16 KiB on macOS) blocks in write(2) until someone reads.
+    fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = pipe.read_to_end(&mut buffer);
+            buffer
+        })
+    }
+    let stdout = drain(child.stdout.take().expect("piped stdout"));
+    let stderr = drain(child.stderr.take().expect("piped stderr"));
     let deadline = Instant::now() + Duration::from_secs(120);
-    loop {
-        if child.try_wait().expect("poll nested mini-agent").is_some() {
-            return child.wait_with_output().expect("collect nested mini-agent");
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("poll nested mini-agent") {
+            break status;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             panic!("nested mini-agent did not exit within the deadline");
         }
         std::thread::sleep(Duration::from_millis(20));
+    };
+    Output {
+        status,
+        stdout: stdout.join().expect("stdout reader"),
+        stderr: stderr.join().expect("stderr reader"),
     }
 }
 
