@@ -149,9 +149,11 @@ fn recent_session_lookup_is_scoped_to_the_captured_workspace() {
 
     let mut first_session = Session::new("openai", "gpt-4", 128_000, "first");
     first_session.working_dir = first.to_string_lossy().into_owned().into();
+    first_session.add_message(crate::session::MessageRole::User, "hello");
     save_session(&first_session).unwrap();
     let mut second_session = Session::new("openai", "gpt-4", 128_000, "second");
     second_session.working_dir = second.to_string_lossy().into_owned().into();
+    second_session.add_message(crate::session::MessageRole::User, "hello");
     save_session(&second_session).unwrap();
 
     let found = find_recent_sessions_for_workspace(1, &first).unwrap();
@@ -167,6 +169,7 @@ fn recent_workspace_lookup_reports_the_skipped_newer_file() {
     let here = std::fs::canonicalize(&env.dir).unwrap();
     let mut older = Session::new("openai", "gpt-4", 128_000, "older");
     older.working_dir = here.to_string_lossy().into_owned().into();
+    older.add_message(crate::session::MessageRole::User, "hello");
     save_session(&older).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
     let bad = serde_json::json!({
@@ -205,10 +208,12 @@ fn recent_workspace_lookup_only_decodes_matching_sessions() {
 
     let mut older = Session::new("openai", "gpt-4", 128_000, "older");
     older.working_dir = here.to_string_lossy().into_owned().into();
+    older.add_message(crate::session::MessageRole::User, "hello");
     save_session(&older).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
     let mut newer = Session::new("openai", "gpt-4", 128_000, "newer");
     newer.working_dir = here.to_string_lossy().into_owned().into();
+    newer.add_message(crate::session::MessageRole::User, "hello");
     save_session(&newer).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
     // Newest of all, for another workspace, and not a decodable Session.
@@ -366,7 +371,61 @@ fn delete_session_removes_file() {
     delete_session(&s.id).unwrap();
     let found = find_sessions_by_prefix(&s.id[..8]).unwrap();
     assert!(found.is_empty());
+    // No snapshot, sidecar or lock file is left behind (mini-agent-nvnkx.54).
+    let leftovers: Vec<_> = std::fs::read_dir(env.dir.join("sessions"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(&*s.id))
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(leftovers.is_empty(), "left behind: {leftovers:?}");
     drop(env);
+}
+
+#[test]
+fn session_format_round_trip_keeps_unknown_fields_and_refuses_newer_builds() {
+    // mini-agent-nvnkx.214
+    let _env = setup_test_env();
+    let s = Session::new("openai", "gpt-4", 128000, "");
+    let mut value: serde_json::Value = serde_json::to_value(&s).unwrap();
+    assert_eq!(value["session_format"], crate::session::SESSION_FORMAT);
+    assert!(
+        value["written_by"]
+            .as_str()
+            .unwrap()
+            .starts_with("mini-agent ")
+    );
+    value["future_field"] = serde_json::json!({"keep": [1, 2, 3]});
+    let decoded = crate::session::storage::decode_session_json(&value.to_string()).unwrap();
+    save_session(&decoded).unwrap();
+    let again: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(crate::session::storage::session_path(&decoded.id).unwrap()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        again["future_field"],
+        serde_json::json!({"keep": [1, 2, 3]})
+    );
+    assert_eq!(again["id"], value["id"]);
+
+    value["session_format"] = (crate::session::SESSION_FORMAT + 1).into();
+    let error = crate::session::storage::decode_session_json(&value.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("newer than this build"), "{error}");
+    // A newer file whose other fields this build cannot decode reads as newer,
+    // not as corruption.
+    value["messages"] = serde_json::json!([{"role": "a-role-from-the-future"}]);
+    let error = crate::session::storage::decode_session_json(&value.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("newer than this build"), "{error}");
+    // The same damage without a newer format stays a plain decode failure.
+    value["session_format"] = crate::session::SESSION_FORMAT.into();
+    let error = crate::session::storage::decode_session_json(&value.to_string())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("invalid persisted session JSON"), "{error}");
 }
 
 #[test]
@@ -2046,4 +2105,23 @@ fn orphan_tool_output_sweep_removes_only_idle_unowned_directories() {
         b"do not delete"
     );
     drop(env);
+}
+
+// mini-agent-nvnkx.210: a session that never received a prompt is not what
+// `--continue` resumes.
+#[test]
+fn recent_workspace_lookup_skips_sessions_without_a_prompt() {
+    let env = setup_test_env();
+    let here = std::fs::canonicalize(&env.dir).unwrap();
+    let mut real = Session::new("openai", "gpt-4", 128_000, "real");
+    real.working_dir = here.to_string_lossy().into_owned().into();
+    real.add_message(crate::session::MessageRole::User, "an actual prompt");
+    save_session(&real).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut empty = Session::new("openai", "gpt-4", 128_000, "empty");
+    empty.working_dir = here.to_string_lossy().into_owned().into();
+    save_session(&empty).unwrap();
+    let found = find_recent_sessions_for_workspace(1, &here).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, real.id);
 }

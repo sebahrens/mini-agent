@@ -64,6 +64,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 - JS `list_dir`, `glob` and `grep` accept `{include_ignored}` and return an `ignored` count; `list_dir` lists symlinks as `kind: 'symlink'` (mini-agent-nvnkx.324).
 - JS `spawn(program, args, {cwd, env, stdin, timeout_ms})` runs in a workspace subdirectory, with validated extra environment variables and bounded stdin, and reports `signal` (mini-agent-nvnkx.328).
 - JS `csv_parse` takes `{delimiter}` and rejects unknown options; `console.info`/`console.debug` are logged as `[console.log]` records (mini-agent-nvnkx.330, mini-agent-nvnkx.325).
+- Saved sessions carry `session_format` and `written_by`; a build refuses a file written by a newer format with a "saved by a newer mini-agent" message (not as corruption), and top-level fields it does not know are written back unchanged (mini-agent-nvnkx.214).
+- Native refusal messages name a way out: `/fork` (or `--continue --fork-session`) continues from the visible transcript, and a fork of any recoverable refused or in-flight native session starts a fresh chain over its rows (mini-agent-nvnkx.271).
 
 ### Fixed
 
@@ -269,6 +271,11 @@ Notable changes to mini-agent are documented in this file. The format follows
 - A JS script that ends without a value now returns a fixed note instead of an empty result (mini-agent-nvnkx.326).
 - JS `fetch` returns a redirect as its status plus `location` instead of failing as `denied`, truncates bodies over 1 MiB (`truncated`), decodes other charsets (`lossy`) and reports DNS failure as `dns_failed` (mini-agent-nvnkx.319, mini-agent-nvnkx.327).
 - `yaml_stringify` keeps the document order of integer-like keys from `yaml_parse`, and `xml_build` keeps text and child order of mixed content from `xml_parse` (mini-agent-nvnkx.332, mini-agent-nvnkx.331).
+- An Anthropic TUI session no longer stops saving after its first turn: the idle title, `/rename`, permission and schedule changes, usage charges and `/undo`, `/redo`, `/clear` and `/new` are republished as new revisions under the same retired owner (kept across them), so the next save and prompt succeed instead of failing with "native context snapshot changed before publication" or exiting with "unattributed or replaced shared observation state" (mini-agent-nvnkx.262, .263).
+- A native session left in flight by a dead writer (SIGKILL, crash, or a quit before the first prompt) resumes: the new process that claims its lock restarts the thinking chain from the transcript with a one-line notice instead of refusing startup, `--fork-session` and `/sessions`. The TUI now retires its idle startup ticket to a healthy checkpoint, and a brand-new interactive session writes no file before its first prompt; `--continue` skips sessions that never received a prompt (mini-agent-nvnkx.209, .210).
+- A failed native checkpoint write no longer ends the conversation for the process: the same writer restarts a new epoch from the transcript on the next save or prompt (mini-agent-nvnkx.266). A native session continued on a non-Anthropic model (`/model`, `--resume-provider`) keeps saving (mini-agent-nvnkx.264). ACP restarts a refused chain (cancelled or failed turn, bounds) before the next prompt as the TUI does (mini-agent-nvnkx.265).
+- TUI `/fork` of an Anthropic session publishes the copy through its own owner, and switching sessions rebinds the idle owner, startup ticket and blocked state to the entered session, so prompts, restarts and exit work after `/fork` and `/sessions` (mini-agent-nvnkx.267, .268).
+- Session saves keep working on filesystems without advisory locks (legacy sessions are replaced atomically, the degraded state is reported once, a native-bearing file is never replaced) (mini-agent-nvnkx.211). Deleting a session from `/sessions` also removes its lock file (mini-agent-nvnkx.54).
 
 ### Added
 

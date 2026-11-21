@@ -7244,7 +7244,7 @@ async fn prepare_segment(
     // `/compact` runs no model: it republishes the compacted transcript itself
     // instead of opening a model turn's ticket (see the prompt's save step).
     if native && !compact_only {
-        *native_owner = Some(open_native_owner(state, history, &gate, &scope).await?);
+        *native_owner = Some(open_native_owner(state, turn, history, &gate, &scope).await?);
     }
     // Goal calibration uses the compaction's usage too. Financial receipts
     // belong to this ACP logical session and survive prompt cancellation.
@@ -7636,6 +7636,7 @@ fn open_turn_scope(turn: &PromptTurn, gate: &TurnGate) -> TurnScope {
 /// one) for a model turn on a native-bearing session.
 async fn open_native_owner(
     state: &AcpState,
+    turn: &PromptTurn,
     history: &mut SessionHistory,
     gate: &TurnGate,
     scope: &TurnScope,
@@ -7647,14 +7648,26 @@ async fn open_native_owner(
     )
     .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?
     {
-        Some(
-            crate::session::native_publication::begin_owned(
-                &mut history.session,
-                &scope.work_scope,
-            )
-            .await
-            .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?,
+        // The same rule as the TUI and headless frontends: a chain that cannot
+        // be replayed (a cancelled or failed earlier turn, a near-bound chain,
+        // a different model, a transcript edit, a dead writer's in-flight
+        // file, a failed write) restarts as a new epoch instead of refusing
+        // every later prompt (mini-agent-nvnkx.265).
+        let (ticket, cause) = crate::session::native_publication::begin_owned_reconciled(
+            &mut history.session,
+            &scope.work_scope,
         )
+        .await
+        .map_err(|error| agent_client_protocol::Error::new(-32603, error.to_string()))?;
+        if let Some(cause) = cause {
+            let _ = turn.cx.send_notification(SessionNotification::new(
+                turn.session_id.clone(),
+                SessionUpdate::AgentThoughtChunk(ContentChunk::new(ContentBlock::Text(
+                    TextContent::new(cause.notice().to_owned()),
+                ))),
+            ));
+        }
+        Some(ticket)
     } else {
         None
     };

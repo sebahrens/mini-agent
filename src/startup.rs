@@ -2194,15 +2194,24 @@ impl Startup {
             editor_session
                 || adopted_native_frontend
                 || !crate::session::native_publication::is_native_bearing(&session),
-            "this saved native context requires the headless print frontend or interactive frontend; automatic-round replay is not available yet"
+            "this saved native context requires the headless print frontend or interactive frontend; automatic-round replay is not available yet: drop --loop (use -p or the interactive UI) to continue it"
         );
+        // A brand-new interactive session has no chain, transcript or file to
+        // protect before its first prompt. Its first publication happens when
+        // that prompt is admitted, so a launch closed without typing leaves no
+        // zero-message file for `--continue` to pick (mini-agent-nvnkx.210).
+        let fresh_idle_interactive = !cli.print
+            && session.messages.is_empty()
+            && !crate::session::native_publication::is_native_bearing(&session);
         let mut native_startup = if !editor_session
             && adopted_native_frontend
             && crate::session::native_publication::startup_requires_publication(
                 &session,
                 matches!(&client, AnyClient::Anthropic(_)),
                 cli.no_session,
-            )? {
+            )?
+            && !fresh_idle_interactive
+        {
             Some(
                 crate::session::native_publication::NativeStartupPublication::begin(&mut session)
                     .await?,
@@ -3743,7 +3752,7 @@ impl Startup {
             result?;
         } else {
             anyhow::bail!(
-                "unfinished native context requires recovery before it can restart; start a fresh context to continue"
+                "unfinished native context requires recovery before it can restart; run `/fork` (or restart with `--continue --fork-session`) to continue from the visible transcript"
             );
         }
         eprintln!("{}", cause.notice());
@@ -4592,6 +4601,21 @@ async fn run_bound_headless_segment(
     let native = agent.history_protocol() == HistoryProtocol::AnthropicMessages
         || session.native_history_snapshot().is_some();
     if !native {
+        // A non-native model (for example --resume-provider) continues a
+        // native-bearing session on the plain transcript path. The idle startup
+        // ticket has no model work to guard, so it is retired back to a healthy
+        // checkpoint first; the turn-end save then republishes under the same
+        // owner instead of leaving the file in flight (mini-agent-nvnkx.264).
+        if !cli.no_session
+            && let Some(ticket) = native_ticket.take()
+            && let Err(error) =
+                crate::session::native_publication::retire_idle_startup(session, ticket).await
+        {
+            return (
+                crate::agent::runner::HeadlessTurn::failed_before_start(error),
+                false,
+            );
+        }
         let turn = heap_future(|| {
             let agent = agent.clone();
             #[cfg(feature = "agent-skills")]
@@ -9210,6 +9234,171 @@ mod native_publication_startup_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod native_resume_startup_tests {
+    use super::*;
+
+    fn roots(
+        name: &str,
+    ) -> (
+        crate::tests::OwnedTestDirectory,
+        crate::tests::ScopedProcessEnv,
+    ) {
+        let root = crate::tests::OwnedTestDirectory::new(name);
+        let environment = crate::tests::ScopedProcessEnv::set(&[
+            (
+                "MINI_AGENT_CONFIG_DIR",
+                Some(root.path().join("config").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_DATA_DIR",
+                Some(root.path().join("data").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_STATE_DIR",
+                Some(root.path().join("state").into_os_string()),
+            ),
+            (
+                "MINI_AGENT_CACHE_DIR",
+                Some(root.path().join("cache").into_os_string()),
+            ),
+        ]);
+        (root, environment)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    /// mini-agent-nvnkx.209: a session left in flight by a writer that is gone
+    /// (killed mid-turn, or quit before its first prompt) resumes as a new
+    /// epoch from its transcript instead of aborting startup.
+    #[test]
+    fn in_flight_native_session_resumes_from_its_transcript() {
+        let (root, _environment) = roots("native-resume-in-flight");
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let paths = crate::paths::process_paths_ref().unwrap();
+        let mut saved = Session::new("anthropic", "claude-fixture", 32_000, "stranded");
+        saved.working_dir = workspace.root().to_string_lossy().into();
+        saved.add_message(crate::session::MessageRole::User, "kept transcript row");
+        saved.add_message(crate::session::MessageRole::Assistant, "kept answer");
+        crate::session::storage::save_session(&saved).unwrap();
+        let cli = Cli {
+            api_key: Some("unused-native-key".into()),
+            print: true,
+            message: vec!["continue".into()],
+            session: Some(saved.id.to_string()),
+            no_context_files: true,
+            no_tools: true,
+            no_sandbox: true,
+            ..Default::default()
+        };
+        runtime().block_on(async {
+            // The first process opens startup ownership and dies before any
+            // model work: its file stays in flight.
+            let first = Startup::init(
+                cli.clone(),
+                Config::default(),
+                paths.clone(),
+                workspace.clone(),
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+            drop(first);
+            tokio::task::yield_now().await;
+            let stranded = crate::session::storage::load_session_exact(&saved.id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stranded.native_frontier.refusal(),
+                Some(crate::session::native_replay::RestartReason::InFlight)
+            );
+            crate::session::lock::release_session(&saved.id);
+            // The next process resumes it.
+            let second = Startup::init(
+                cli.clone(),
+                Config::default(),
+                paths.clone(),
+                workspace.clone(),
+                false,
+                false,
+                false,
+            )
+            .await
+            .expect("an in-flight file of a dead writer must resume");
+            assert!(second.native_startup.is_some());
+            assert!(second.session.native_frontier.ready());
+            assert_eq!(second.session.messages.len(), 2);
+            assert_eq!(second.session.messages[0].content, "kept transcript row");
+            drop(second);
+            tokio::task::yield_now().await;
+            crate::session::lock::release_session(&saved.id);
+        });
+    }
+
+    /// mini-agent-nvnkx.210: a brand-new interactive Anthropic session writes
+    /// nothing before its first prompt, and `--continue` keeps finding the
+    /// last real conversation.
+    #[test]
+    fn fresh_interactive_native_session_writes_nothing_before_a_prompt() {
+        let (root, _environment) = roots("native-fresh-interactive");
+        let workspace =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+        let paths = crate::paths::process_paths_ref().unwrap();
+        let mut previous = Session::new("anthropic", "claude-fixture", 32_000, "previous");
+        previous.working_dir = workspace.root().to_string_lossy().into();
+        previous.add_message(crate::session::MessageRole::User, "an earlier conversation");
+        crate::session::storage::save_session(&previous).unwrap();
+        crate::session::lock::release_session(&previous.id);
+        let sessions = crate::session::storage::session_path(&previous.id)
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let count = |sessions: &std::path::Path| std::fs::read_dir(sessions).unwrap().count();
+        let before = count(&sessions);
+        runtime().block_on(async {
+            let cli = Cli {
+                api_key: Some("unused-native-key".into()),
+                provider: Some("anthropic".into()),
+                no_context_files: true,
+                no_tools: true,
+                no_sandbox: true,
+                ..Default::default()
+            };
+            let startup = Startup::init(
+                cli,
+                Config::default(),
+                paths.clone(),
+                workspace.clone(),
+                false,
+                false,
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(&startup.client, AnyClient::Anthropic(_)));
+            assert!(startup.native_startup.is_none());
+            assert!(startup.native_ticket.is_none());
+            drop(startup);
+            tokio::task::yield_now().await;
+        });
+        assert_eq!(count(&sessions), before, "launch wrote a session file");
+        let found =
+            crate::session::storage::find_recent_sessions_for_workspace(1, workspace.root())
+                .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].id, previous.id);
     }
 }
 

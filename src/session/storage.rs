@@ -73,6 +73,98 @@ fn decode_failure(error: serde_json::Error) -> anyhow::Error {
     )
 }
 
+fn newer_format_error(format: u32, written_by: &str) -> anyhow::Error {
+    let by = if written_by.is_empty() {
+        "a newer mini-agent".to_owned()
+    } else {
+        format!(
+            "{} (a newer build)",
+            written_by.chars().take(120).collect::<String>()
+        )
+    };
+    anyhow::anyhow!(
+        "session saved by {by}, newer than this build (session format {format}, this build reads up to {}); upgrade mini-agent to open it",
+        super::SESSION_FORMAT
+    )
+}
+
+/// When `json` declares a format this build does not know, the typed error.
+fn newer_format(json: &str) -> Option<anyhow::Error> {
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        #[serde(default)]
+        session_format: u32,
+        #[serde(default)]
+        written_by: String,
+    }
+    let probe: Probe = serde_json::from_str(json).ok()?;
+    (probe.session_format > super::SESSION_FORMAT)
+        .then(|| newer_format_error(probe.session_format, &probe.written_by))
+}
+
+/// The field names `Session`'s own `Deserialize` declares, captured from its
+/// derived `deserialize_struct` call so they cannot drift from the struct.
+fn session_field_names() -> &'static [&'static str] {
+    #[derive(Debug)]
+    struct Captured(&'static [&'static str]);
+    impl std::fmt::Display for Captured {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("captured session fields")
+        }
+    }
+    impl std::error::Error for Captured {}
+    impl serde::de::Error for Captured {
+        fn custom<T: std::fmt::Display>(_: T) -> Self {
+            Captured(&[])
+        }
+    }
+    struct Capture;
+    impl<'de> serde::Deserializer<'de> for Capture {
+        type Error = Captured;
+        fn deserialize_any<V: serde::de::Visitor<'de>>(self, _: V) -> Result<V::Value, Captured> {
+            Err(Captured(&[]))
+        }
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Captured> {
+            Err(Captured(fields))
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+    static FIELDS: std::sync::OnceLock<&'static [&'static str]> = std::sync::OnceLock::new();
+    FIELDS.get_or_init(
+        || match <Session as serde::Deserialize>::deserialize(Capture) {
+            Err(Captured(fields)) => fields,
+            Ok(_) => &[],
+        },
+    )
+}
+
+/// Top-level keys of a saved session that this build's `Session` does not
+/// declare, with their raw values (borrowed while scanning, then owned).
+fn unknown_top_level_fields(json: &str) -> Vec<(String, Box<serde_json::value::RawValue>)> {
+    let known = session_field_names();
+    if known.is_empty() {
+        return Vec::new();
+    }
+    let Ok(top) = serde_json::from_str::<
+        std::collections::BTreeMap<String, &serde_json::value::RawValue>,
+    >(json) else {
+        return Vec::new();
+    };
+    top.into_iter()
+        .filter(|(key, _)| !known.contains(&key.as_str()))
+        .map(|(key, value)| (key, value.to_owned()))
+        .collect()
+}
+
 /// Decode only bounded data. Provider/workspace compatibility and fresh runtime
 /// grants belong to the host's import controller, never saved labels.
 pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
@@ -80,7 +172,19 @@ pub(crate) fn decode_session_json(json: &str) -> anyhow::Result<Session> {
         json.len() <= MAX_SESSION_BYTES,
         "persisted session exceeds the byte limit"
     );
-    let session: Session = serde_json::from_str(json).map_err(decode_failure)?;
+    let mut session: Session = match serde_json::from_str(json) {
+        Ok(session) => session,
+        // A file written by a newer build may use a variant this one cannot
+        // decode; say so instead of reporting corruption.
+        Err(error) => return Err(newer_format(json).unwrap_or_else(|| decode_failure(error))),
+    };
+    if session.session_format > super::SESSION_FORMAT {
+        return Err(newer_format_error(
+            session.session_format,
+            &session.written_by,
+        ));
+    }
+    session.unknown_fields = unknown_top_level_fields(json);
     anyhow::ensure!(
         session.messages.len() <= MAX_SESSION_MESSAGES,
         "persisted session exceeds the message limit"
@@ -156,6 +260,25 @@ pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<Str
         encoded_bytes: 0,
     };
     serde_json::to_writer(&mut json, session)?;
+    if !session.unknown_fields.is_empty() {
+        // Re-emit fields a newer or differently featured build wrote, so a
+        // round trip through this build does not erase them.
+        use std::io::Write as _;
+        let retained = json.encoded_bytes <= MAX_SESSION_BYTES;
+        if retained && json.bytes.last() == Some(&b'}') {
+            json.bytes.pop();
+            json.encoded_bytes -= 1;
+        }
+        for (key, value) in &session.unknown_fields {
+            write!(
+                json,
+                ",{}:{}",
+                serde_json::to_string(key).unwrap_or_default(),
+                value.get()
+            )?;
+        }
+        json.write_all(b"}")?;
+    }
     if json.encoded_bytes > MAX_SESSION_BYTES {
         return Err(SessionSizeError {
             encoded_bytes: json.encoded_bytes,
@@ -485,6 +608,27 @@ fn prepare_save_recovering_with(
 ) -> anyhow::Result<PreparedSave> {
     report_pending_save_notices(session, &mut notice);
     flush_precompact(session, &mut notice);
+    // An idle native session whose metadata changed after its last publication
+    // (title, name, permissions, schedules, usage charges) or whose failed
+    // publication left no live actor is republished as a new revision under
+    // its own owner. The strict digest check below would otherwise refuse
+    // every later save and turn until a restart (mini-agent-nvnkx.262/.266).
+    if super::native_publication::idle_republish_needed_with(session, measure_native) {
+        deferred::supersede(&session.id);
+        match super::native_publication::republish_idle_sync(session) {
+            Ok(cause) => {
+                if let Some(cause) = cause {
+                    notice(cause.notice());
+                }
+                report_pending_save_notices(session, &mut notice);
+                return Ok(PreparedSave::Published);
+            }
+            Err(error) => {
+                report_save_failure(session, &error, notice);
+                return Err(error);
+            }
+        }
+    }
     let native = super::native_publication::is_native_bearing(session);
     let last_native_size = session.save_notice_state.encoded_bytes;
     let prepare = |session: &Session| -> anyhow::Result<(PreparedSave, Option<usize>)> {
@@ -501,7 +645,7 @@ fn prepare_save_recovering_with(
         let size = match &prepared {
             PreparedSave::Legacy { json, .. } => Some(json.len()),
             PreparedSave::Native(_) => native_size,
-            PreparedSave::Disabled { .. } => None,
+            PreparedSave::Disabled { .. } | PreparedSave::Published => None,
         };
         Ok((prepared, size))
     };
@@ -578,7 +722,7 @@ pub(crate) fn save_session_deferred_recovering(
                 deferred::Snapshot::Native(snapshot),
             )
         }
-        disabled @ PreparedSave::Disabled { .. } => disabled.commit(),
+        done @ (PreparedSave::Disabled { .. } | PreparedSave::Published) => done.commit(),
     };
     result?;
     report_save_success(session, notice);
@@ -591,8 +735,15 @@ pub(crate) fn save_session_deferred_recovering(
 /// `Session`, so it keeps an owned clone (mini-agent-twon3).
 pub(crate) enum PreparedSave {
     Native(Box<Session>),
-    Legacy { id: String, json: String },
-    Disabled { id: String },
+    Legacy {
+        id: String,
+        json: String,
+    },
+    Disabled {
+        id: String,
+    },
+    /// An idle republish already wrote the session; nothing is left to commit.
+    Published,
 }
 
 /// Validate and capture `session` without the optional-state recovery in
@@ -634,6 +785,7 @@ impl PreparedSave {
                 deferred::supersede(&id);
                 Ok(())
             }
+            Self::Published => Ok(()),
         }
     }
 }
@@ -803,7 +955,19 @@ fn write_legacy_snapshot(session_id: &str, json: &[u8]) -> anyhow::Result<()> {
             let root = crate::paths::WorkspaceBinding::capture(&dir)?;
             root.validate_private_root()?;
             let parent = crate::fs::checked_file_metadata(&root.try_clone_directory_file()?)?;
-            crate::fs::private_atomic_create_checked_sync(&path, json, &parent)?;
+            // An existing snapshot is never replaced without ownership: it may
+            // be (or become) a native checkpoint that only its lock-backed
+            // owner may write. Say why, so the user can fix the cause
+            // (mini-agent-nvnkx.211) instead of seeing a bare "exists".
+            crate::fs::private_atomic_create_checked_sync(&path, json, &parent).map_err(
+                |error| match error.kind() {
+                    std::io::ErrorKind::AlreadyExists => anyhow::anyhow!(
+                        "{}: later turns cannot replace the first snapshot",
+                        super::lock::LOCK_UNAVAILABLE_NOTICE
+                    ),
+                    _ => error.into(),
+                },
+            )?;
             root.validate_private_root()?;
             Ok(())
         }
@@ -1045,7 +1209,10 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
         }
     }
     let result = delete_session_files(id);
-    if !already_owned {
+    // The snapshot is gone, so this process has nothing left to own; releasing
+    // also unlinks the now-pointless lock file (mini-agent-nvnkx.54). A failed
+    // delete keeps an ownership this process already had.
+    if result.is_ok() || !already_owned {
         super::lock::release_session(id);
     }
     result
@@ -1753,6 +1920,16 @@ pub fn find_recent_sessions_for_workspace_reporting(
         };
         match decode_session_json(&json) {
             Ok(session) => {
+                // `--continue` resumes the last conversation: a session that
+                // never received a prompt (a launch closed at once) is not one
+                // (mini-agent-nvnkx.210).
+                if !session
+                    .messages
+                    .iter()
+                    .any(|message| message.role == super::MessageRole::User)
+                {
+                    continue;
+                }
                 if path.file_stem().and_then(|stem| stem.to_str()) == Some(session.id.as_str()) {
                     session.file_checkpoints.trust_owned_load();
                 }

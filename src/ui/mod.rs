@@ -7,7 +7,7 @@ pub(crate) use app::drive_native_stale_session_end_fixture;
 #[cfg(test)]
 pub(crate) use app::{
     drive_native_effort_fixture, drive_native_fixture_turn, drive_native_fixture_turns,
-    drive_native_script, drive_native_steer_fixture,
+    drive_native_script, drive_native_steer_fixture, drive_native_title_fixture,
 };
 mod app;
 #[cfg(feature = "multimodal")]
@@ -1493,10 +1493,14 @@ pub(crate) async fn start_main_run_with_directive(
         let ticket = if ui.cli.no_session {
             None
         } else {
-            Some(match ui.native_ticket.take() {
+            let ticket = match ui.native_ticket.take() {
                 Some(ticket) => ticket,
                 None => crate::session::native_publication::begin_owned(ui.session, &scope).await?,
-            })
+            };
+            // The previous turn's permit is superseded by this actor; the next
+            // retirement mints its successor.
+            run.native_session_end = None;
+            Some(ticket)
         };
         Some(crate::provider::NativeRunOwner::with_scope(ticket, scope))
     } else {
@@ -1734,8 +1738,9 @@ pub(crate) async fn reconcile_native_chain(
     if run.is_running || run.native_owner.is_some() {
         return Ok(None);
     }
+    let rebound = rebind_native_session(run, ui).await?;
     let Some(cause) = ui.session.native_restart_cause() else {
-        return Ok(None);
+        return Ok(rebound);
     };
     if ui.cli.no_session {
         // Ephemeral: nothing is published, the in-memory chain simply goes.
@@ -1752,11 +1757,81 @@ pub(crate) async fn reconcile_native_chain(
         result?;
     } else {
         anyhow::bail!(
-            "unfinished native context requires recovery before it can restart; start a fresh context to continue"
+            "unfinished native context requires recovery before it can restart; run `/fork` (or restart with `--continue --fork-session`) to continue from the visible transcript"
         );
     }
     run.native_blocked = None;
     Ok(Some(cause.notice()))
+}
+
+/// Keep the idle native owner bound to the session that is actually open.
+///
+/// Every idle session is held by a retired publication and a
+/// [`NativeSessionEndOwner`](crate::provider::NativeSessionEndOwner). A session
+/// switch (`/sessions`, `/fork`) replaces the `Session` but not the UI's owner:
+/// an owner or startup ticket that belongs to the session that was left is
+/// dropped (the file it left on disk is already a healthy checkpoint), and a
+/// native-bearing session entered without an owner is opened and published
+/// healthy. A publication a failed write left unfinished, or metadata that
+/// changed while idle, is republished from the transcript. Returns the one-line
+/// notice when a native chain was restarted.
+pub(crate) async fn rebind_native_session(
+    run: &mut AgentRunState,
+    ui: &mut UiContext<'_>,
+) -> anyhow::Result<Option<&'static str>> {
+    if ui.cli.no_session
+        || run.is_running
+        || run.native_owner.is_some()
+        || ui.native_startup.is_some()
+    {
+        return Ok(None);
+    }
+    let mut stale = false;
+    if run
+        .native_session_end
+        .as_ref()
+        .is_some_and(|owner| !owner.belongs_to(ui.session))
+    {
+        run.native_session_end = None;
+        stale = true;
+    }
+    if ui
+        .native_ticket
+        .as_ref()
+        .is_some_and(|ticket| !ticket.belongs_to(ui.session))
+    {
+        ui.native_ticket = None;
+        stale = true;
+    }
+    if stale {
+        run.native_blocked = None;
+        run.native_checkpointed = false;
+    }
+    if !crate::session::native_publication::is_native_bearing(ui.session) {
+        return Ok(None);
+    }
+    let (republished, mut cause) = crate::session::native_publication::recover_idle(ui.session)
+        .inspect_err(|_| {
+            if run.native_blocked.is_none() {
+                run.native_blocked = Some(crate::session::native_replay::RestartReason::InFlight);
+            }
+        })?;
+    if republished {
+        run.native_blocked = None;
+    }
+    if run.native_session_end.is_none() && ui.native_ticket.is_none() {
+        if ui.session.native_publication.is_none() {
+            cause = cause
+                .or(crate::session::native_publication::publish_new_session(ui.session).await?);
+        }
+        // A publication another path left active (a leaked ticket) cannot mint
+        // a permit; the strict paths report it.
+        if let Ok(permit) = crate::session::native_publication::idle_permit(ui.session) {
+            run.native_session_end =
+                Some(crate::provider::NativeSessionEndOwner::from_idle(permit));
+        }
+    }
+    Ok(cause.map(|cause| cause.notice()))
 }
 
 /// Attaches only the completed capture of the exact retired foreground actor.

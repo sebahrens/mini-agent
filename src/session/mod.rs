@@ -978,6 +978,46 @@ pub(crate) struct AcpSelection {
     pub(crate) persona: Option<String>,
 }
 
+/// The saved-session format this build reads and writes.
+pub(crate) const SESSION_FORMAT: u32 = 1;
+
+fn default_session_format() -> u32 {
+    SESSION_FORMAT
+}
+
+/// `mini-agent <version> (<optional features>)` of the running build.
+pub(crate) fn written_by_current() -> &'static str {
+    static BUILD: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        let features: Vec<&str> = [
+            (cfg!(feature = "goal"), "goal"),
+            (cfg!(feature = "subagents"), "subagents"),
+            (cfg!(feature = "hooks"), "hooks"),
+            (cfg!(feature = "js"), "js"),
+            (cfg!(feature = "acp"), "acp"),
+            (cfg!(feature = "mcp"), "mcp"),
+            (cfg!(feature = "multimodal"), "multimodal"),
+            (cfg!(feature = "memory"), "memory"),
+            (cfg!(feature = "agent-skills"), "agent-skills"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect();
+        format!(
+            "mini-agent {} ({})",
+            env!("CARGO_PKG_VERSION"),
+            features.join(",")
+        )
+    });
+    &BUILD
+}
+
+fn serialize_written_by<S: serde::Serializer>(
+    _stored: &CompactString,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(written_by_current())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: CompactString,
@@ -986,6 +1026,22 @@ pub struct Session {
     /// peeks it without reading or parsing foreign sessions (mini-agent-vb5vw.58).
     /// Deserialization is order-independent, so older files still load.
     pub working_dir: CompactString,
+    /// Saved-file format. A build refuses a file written with a higher number
+    /// ("saved by a newer mini-agent") instead of reading it as corrupt and
+    /// writing it back without the fields it does not know. Bump it only for
+    /// incompatible changes (mini-agent-nvnkx.214). Files that predate the
+    /// field are format 1.
+    #[serde(default = "default_session_format")]
+    pub session_format: u32,
+    /// The build that last wrote this file (version and feature set). Read back
+    /// for the newer-build message; every write records the writing build.
+    #[serde(default, serialize_with = "serialize_written_by")]
+    pub written_by: CompactString,
+    /// Top-level fields this build does not know (a newer or differently
+    /// featured build wrote them). Re-emitted verbatim on save so an older or
+    /// smaller-feature round trip does not erase them.
+    #[serde(skip)]
+    pub(crate) unknown_fields: Vec<(String, Box<serde_json::value::RawValue>)>,
     /// A title the configured `session_title_model` generated after the first
     /// exchange. Shown in session lists when the session has no name; absent
     /// unless that opt-in setting is on (mini-agent-3wsib).
@@ -1458,6 +1514,27 @@ impl Session {
         Ok(())
     }
 
+    /// The restart cause for a freshly loaded session whose file still carries
+    /// the `InFlight` denial of a writer that is gone (nothing in this process
+    /// owns it: no publication and an unclaimed cell). `None` otherwise.
+    pub(crate) fn native_unfinished_cause(&self) -> Option<native_replay::NativeRestartCause> {
+        (self.native_publication.is_none()
+            && self.native_frontier.refusal() == Some(native_replay::RestartReason::InFlight)
+            && !self.native_frontier.publication_cell().is_claimed())
+        .then_some(native_replay::NativeRestartCause::Unfinished)
+    }
+
+    /// [`restart_native_chain`](Self::restart_native_chain) for the cause
+    /// [`native_unfinished_cause`](Self::native_unfinished_cause) reports.
+    pub(crate) fn restart_unfinished_native_chain(
+        &mut self,
+    ) -> Result<(), native_replay::RestartReason> {
+        self.native_frontier.restart_unfinished()?;
+        self.native_history = None;
+        self.retired_native_history.clear();
+        Ok(())
+    }
+
     pub(crate) fn validate_native_persistence(&self) -> Result<(), native_replay::RestartReason> {
         if let Some(history) = &self.native_history {
             history.validate_saved()?;
@@ -1619,6 +1696,9 @@ impl Session {
         Session {
             id: CompactString::new(Uuid::new_v4().to_string()),
             name: CompactString::new(name),
+            session_format: SESSION_FORMAT,
+            written_by: CompactString::new(written_by_current()),
+            unknown_fields: Vec::new(),
             generated_title: None,
             first_prompt: None,
             title_attempts: 0,
