@@ -336,7 +336,7 @@ pub(crate) fn help_lines(
     );
     emit(
         false,
-        "  /review [msg]          review code (auto message if omitted)",
+        "  /review [target] [msg] review code: --base <ref>, --commit <sha>, --uncommitted, --pr <n>, --post, --security",
     );
     for (command, description) in [
         ("/diff [path|turn]", "show a contained Git diff"),

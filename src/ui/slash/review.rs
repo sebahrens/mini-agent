@@ -97,7 +97,7 @@ pub(crate) fn parse_args(args: &[&str]) -> Result<ReviewRequest, String> {
             Some((name, value)) => (name, Some(value)),
             None => (arg, None),
         };
-        let mut value = |index: &mut usize| -> Result<String, String> {
+        let value = |index: &mut usize| -> Result<String, String> {
             if let Some(inline) = inline {
                 return Ok(inline.to_owned());
             }
