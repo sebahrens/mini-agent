@@ -36,7 +36,11 @@ Selecting “Answer in a new user message” parks the turn with its bounded que
 and any preceding answers. The next ordinary user message begins after that old
 turn and reply retire; it is not an invented free-text response extension. ACP
 retains pending data with its existing in-memory session history. ACP clients may
-automatically select options according to their settings; the
+automatically select options according to their settings (a client with an
+"always allow" setting picks the first allow-kind option unseen), so the only
+allow-kind option, listed first, is that neutral "answer in a new user message"
+parking option; the substantive answers are reject-kind options and the question
+and its numbered choices are shown in the call's content. The
 agent decodes only an exact advertised ID as task data. See
 [the ACP v1 permission request contract](https://agentclientprotocol.com/protocol/v1/tool-calls#requesting-permission).
 

@@ -3010,10 +3010,22 @@ impl Startup {
             )
         });
         loop {
+            // Held for the whole line: an interrupt control request is only
+            // accepted (and kept for the turn) while a line is outstanding.
+            let mut _line_guard = None;
             let prompt = match pending.take() {
-                Some(prompt) => prompt,
+                Some(prompt) => {
+                    _line_guard = crate::headless_control::begin_line();
+                    prompt
+                }
                 None => match match &mut queued {
-                    Some(queue) => Ok(queue.recv().await),
+                    Some(queue) => {
+                        let line = queue.recv().await;
+                        if line.is_some() {
+                            _line_guard = crate::headless_control::claim_line();
+                        }
+                        Ok(line)
+                    }
                     None => crate::print::read_stream_input_line().await,
                 }? {
                     None => break,

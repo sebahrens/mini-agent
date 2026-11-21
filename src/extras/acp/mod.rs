@@ -4,6 +4,7 @@ mod commands;
 pub mod config;
 mod cron;
 mod idle;
+mod liveness;
 mod model_options;
 mod persona;
 mod policy;
@@ -787,6 +788,31 @@ struct SessionState {
     /// session (close or replacement) clears them and releases their idle
     /// lease.
     cron: cron::CronOwner,
+    /// [`SessionLeases::next_tick`] of the last install or admitted prompt.
+    last_used: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl SessionState {
+    /// A session that must not be evicted or replaced: it has an active
+    /// turn, a `/cron` schedule, a pending question or a background task, or
+    /// its history is held by a running job.
+    fn is_busy(&self) -> bool {
+        if !lock_unpoisoned(&self.turns).queue.is_empty() || self.cron.has_schedules() {
+            return true;
+        }
+        #[cfg(feature = "subagents")]
+        if self
+            .spend
+            .background_pool()
+            .is_some_and(|pool| pool.active_count() > 0)
+        {
+            return true;
+        }
+        match self.history.try_lock() {
+            Ok(history) => history.pending_question.is_some() || history.title_in_flight,
+            Err(_) => true,
+        }
+    }
 }
 
 struct PromptSessionSnapshot {
@@ -1128,6 +1154,10 @@ struct SessionLeases {
     ids: StdMutex<HashSet<SessionId>>,
     /// `acp_max_sessions`; `None` means [`MAX_ACP_SESSIONS`].
     max_sessions: Option<usize>,
+    /// Monotonic use counter; a session's `last_used` is the tick of its last
+    /// install or admitted prompt, so the least recently used idle session is
+    /// evicted first when the cap is reached.
+    use_tick: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     storage_scope_for_test: StdMutex<Option<Arc<crate::agent::runner::AgentWorkScope>>>,
 }
@@ -1139,6 +1169,18 @@ struct SessionLease {
 }
 
 impl SessionLeases {
+    fn next_tick(&self) -> u64 {
+        self.use_tick.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn is_owned(&self, id: &SessionId) -> bool {
+        lock_unpoisoned(&self.ids).contains(id)
+    }
+
+    fn is_full(&self) -> bool {
+        lock_unpoisoned(&self.ids).len() >= self.max_sessions.unwrap_or(MAX_ACP_SESSIONS).max(1)
+    }
+
     fn reserve(
         self: &Arc<Self>,
         id: SessionId,
@@ -1254,7 +1296,10 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for BoundedStdioTransport {
         let stdin = blocking::Unblock::new(std::io::stdin());
         let stdout = blocking::Unblock::new(std::io::stdout());
         ConnectTo::<Counterpart>::connect_to(
-            ByteStreams::new(stdout, BoundedLineReader::new(stdin, MAX_ACP_FRAME_BYTES)),
+            ByteStreams::new(
+                liveness::StallGuard::new(stdout, liveness::WRITE_STALL_TIMEOUT),
+                BoundedLineReader::new(stdin, MAX_ACP_FRAME_BYTES),
+            ),
             client,
         )
         .await
@@ -1268,13 +1313,18 @@ fn tls_frame_reader<R>(read_half: tls::FuturesIo<R>) -> BoundedLineReader<tls::F
     BoundedLineReader::new(read_half, MAX_ACP_FRAME_BYTES)
 }
 
+/// One accept-and-serve round of the TCP listener. The listener outlives it:
+/// each round owns a duplicate of the bound socket, so a peer that drops (an
+/// editor reload, a sleeping laptop) is followed by the next authenticated one.
 struct TcpTransport {
-    host: String,
-    port: u16,
+    listener: TcpListener,
     api_key: String,
     tls: Option<Arc<tls::AcpTlsConfig>>,
     idle: Arc<idle::Idle>,
     accept_timeout: Option<std::time::Duration>,
+    /// Set once a peer authenticated, to tell "the peer ended" from "nobody
+    /// ever connected".
+    connected: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Default seconds to wait for the first authenticated ACP TCP peer.
@@ -1306,18 +1356,8 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         self,
         client: impl ConnectTo<Counterpart::Counterpart>,
     ) -> Result<(), agent_client_protocol::Error> {
-        let listener = TcpListener::bind((self.host.as_str(), self.port)).map_err(|e| {
-            agent_client_protocol::util::internal_error(format!(
-                "TCP bind {}:{}: {}",
-                self.host, self.port, e
-            ))
-        })?;
-        let local_addr = listener.local_addr().map_err(|e| {
-            agent_client_protocol::util::internal_error(format!("TCP local address: {}", e))
-        })?;
-
+        let listener = self.listener;
         if let Some(tls) = self.tls {
-            tracing::info!("ACP TCP listening on {} (TLS)", local_addr);
             let (stream, peer_addr) = within_accept_deadline(
                 self.accept_timeout,
                 tls::accept_tls_peer_with_idle(
@@ -1332,11 +1372,15 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
             .map_err(|e| {
                 agent_client_protocol::util::internal_error(format!("TCP accept: {}", e))
             })?;
+            self.connected.store(true, Ordering::Release);
             tracing::info!("Authenticated ACP TLS client connected from {}", peer_addr);
             let (read_half, write_half) = tokio::io::split(stream);
             return ConnectTo::<Counterpart>::connect_to(
                 ByteStreams::new(
-                    tls::FuturesIo(write_half),
+                    liveness::StallGuard::new(
+                        tls::FuturesIo(write_half),
+                        liveness::WRITE_STALL_TIMEOUT,
+                    ),
                     tls_frame_reader(tls::FuturesIo(read_half)),
                 ),
                 client,
@@ -1344,7 +1388,6 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
             .await;
         }
 
-        tracing::info!("ACP TCP listening on {}", local_addr);
         let accept_error =
             |e| agent_client_protocol::util::internal_error(format!("TCP accept: {}", e));
         let listener = accept::tokio_listener(listener).map_err(accept_error)?;
@@ -1359,6 +1402,7 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         )
         .await
         .map_err(accept_error)?;
+        self.connected.store(true, Ordering::Release);
         tracing::info!("Authenticated ACP client connected from {}", peer_addr);
 
         let read_half = stream.try_clone().map_err(|e| {
@@ -1371,7 +1415,7 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
 
         ConnectTo::<Counterpart>::connect_to(
             ByteStreams::new(
-                write_unblock,
+                liveness::StallGuard::new(write_unblock, liveness::WRITE_STALL_TIMEOUT),
                 BoundedLineReader::new(read_unblock, MAX_ACP_FRAME_BYTES),
             ),
             client,
@@ -1442,6 +1486,8 @@ async fn accept_authenticated_peer_with_idle<S: accept::AcceptSource>(
             tracing::warn!("ACP TCP peer rejected because authentication capacity is full");
             continue;
         }
+        // A peer that vanishes without a FIN is noticed by the kernel.
+        liveness::enable_keepalive(&tcp);
         // The challenge-response uses bounded blocking reads on the blocking
         // pool, and the session afterwards is driven through a blocking
         // adapter, so the peer leaves the reactor in blocking mode.
@@ -1781,20 +1827,23 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
 
     // Choose transport: TCP if an endpoint is configured, otherwise stdio.
     if let Some(settings) = tcp_settings {
-        let idle = state.idle.clone();
-        connect_agent(
-            state,
-            TcpTransport {
-                host: settings.host,
-                port: settings.port,
-                api_key: settings.api_key,
-                tls: settings.tls,
-                idle,
-                accept_timeout: settings.accept_timeout,
-            },
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("ACP TCP server error: {}", e))?;
+        let listener = TcpListener::bind((settings.host.as_str(), settings.port)).map_err(|e| {
+            anyhow::anyhow!(
+                "ACP TCP server error: TCP bind {}:{}: {}",
+                settings.host,
+                settings.port,
+                e
+            )
+        })?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| anyhow::anyhow!("ACP TCP server error: TCP local address: {e}"))?;
+        tracing::info!(
+            "ACP TCP listening on {}{}",
+            local_addr,
+            if settings.tls.is_some() { " (TLS)" } else { "" }
+        );
+        serve_tcp_peers(state, listener, settings).await?;
     } else {
         connect_agent(state, BoundedStdioTransport)
             .await
@@ -1802,6 +1851,46 @@ pub async fn serve(cli: Cli, mut cfg: Config, context: ContextFiles) -> anyhow::
     }
 
     Ok(())
+}
+
+/// Serves one authenticated peer after another on the same listener and
+/// state. A peer that disconnects leaves its sessions dormant (reload them with
+/// `session/load`); the process ends only when nobody ever connected within
+/// the first-peer deadline, the listener fails, or `--idle-exit-secs` elapses.
+async fn serve_tcp_peers(
+    state: Arc<AcpState>,
+    listener: TcpListener,
+    settings: TcpServerSettings,
+) -> anyhow::Result<()> {
+    let mut first = true;
+    loop {
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transport = TcpTransport {
+            listener: listener
+                .try_clone()
+                .map_err(|e| anyhow::anyhow!("ACP TCP server error: TCP clone: {e}"))?,
+            api_key: settings.api_key.clone(),
+            tls: settings.tls.clone(),
+            idle: state.idle.clone(),
+            // Later rounds wait as long as the idle timeout allows.
+            accept_timeout: if first { settings.accept_timeout } else { None },
+            connected: connected.clone(),
+        };
+        let result = connect_agent(state.clone(), transport).await;
+        if state.idle.is_retiring() || !connected.load(Ordering::Acquire) {
+            return result.map_err(|e| anyhow::anyhow!("ACP TCP server error: {}", e));
+        }
+        match result {
+            Ok(()) => tracing::info!("ACP peer disconnected; waiting for the next one"),
+            Err(error) => {
+                tracing::warn!("ACP peer connection ended: {error}; waiting for the next one")
+            }
+        }
+        first = false;
+        // The old connection's sessions are dormant: they must not keep the
+        // idle timer from running out while nobody is connected.
+        state.idle.sessions_changed(0);
+    }
 }
 
 async fn connect_agent(
@@ -2055,7 +2144,7 @@ async fn handle_new_session(
     #[cfg(not(feature = "mcp"))]
     client_mcp_servers(state, &req.mcp_servers)?;
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string());
-    let lease = state.leases.reserve(session_id.clone())?;
+    let lease = reserve_lease(state, &session_id).await?;
     let (provider, model) = acp_provider_and_model(&state.cli, &state.cfg);
     let canonical = crate::session::Session::new(
         &provider,
@@ -2266,6 +2355,7 @@ async fn install_session(
     );
     canonical.permission_allowlist.clear();
     canonical.rewind_undo = None;
+    toolcall::adopt_session(&canonical);
     if !state.cli.no_session {
         claim_writer(lease.clone()).await?;
     }
@@ -2340,6 +2430,7 @@ async fn install_session(
             #[cfg(feature = "mcp")]
             client_mcp_servers: Arc::new(client_mcp_servers),
             cron: cron::CronOwner::new(turns_wake),
+            last_used: Arc::new(std::sync::atomic::AtomicU64::new(state.leases.next_tick())),
         },
     );
     lock_unpoisoned(&state.cancel_routes).insert(session_id, turns);
@@ -2836,6 +2927,199 @@ async fn handle_set_session_mode(
     responder.respond(SetSessionModeResponse::new())
 }
 
+/// Re-applies the model, effort and persona a saved session ran on, each
+/// re-validated like a live selection. What cannot be restored is left on the
+/// current route and named in the returned notices, so the user is never
+/// switched to another model silently.
+async fn restore_session_selection(
+    state: &AcpState,
+    session_id: &SessionId,
+    saved: &crate::session::AcpSelection,
+    native: bool,
+) -> Vec<String> {
+    let mut notices = Vec::new();
+    let Some((base, mut context, mut overrides)) =
+        state.sessions.lock().await.get(session_id).map(|session| {
+            (
+                session.base_context.clone(),
+                (*session.context).clone(),
+                session.model_overrides.clone(),
+            )
+        })
+    else {
+        return notices;
+    };
+    let startup = |context: &ContextFiles| {
+        persona::resolve_route(&state.cli, &state.cfg, context)
+            .map(|route| format!("{}/{}", route.provider, route.model))
+            .unwrap_or_else(|_| "the startup model".to_owned())
+    };
+    if let Some(persona_id) = saved.persona.as_deref()
+        && persona_id != persona::current_mode_id(&context)
+    {
+        let restored = persona::activate(&base, persona::selection_for(persona_id))
+            .map_err(|error| error.to_string())
+            .and_then(|candidate| {
+                let route = persona::resolve_route(&state.cli, &state.cfg, &candidate)?;
+                persona::check_route(&state.cli, &state.cfg, &route)?;
+                Ok(candidate)
+            });
+        match restored {
+            Ok(candidate) => context = candidate,
+            Err(_) => notices.push(persona::bounded_message(&format!(
+                "The saved persona '{persona_id}' is unavailable; continuing as '{}'.",
+                persona::current_mode_id(&context)
+            ))),
+        }
+    }
+    if let Some(alias) = saved.model.as_deref() {
+        if native {
+            notices.push(persona::bounded_message(&format!(
+                "The saved model '{alias}' is not restored: this session continues a provider-native history, which a model switch cannot follow. Continuing on {}.",
+                startup(&context)
+            )));
+        } else {
+            let usable = model_options::route_for(&state.cfg, alias)
+                .and_then(|route| persona::check_route(&state.cli, &state.cfg, &route));
+            match usable {
+                Ok(()) => overrides.model = Some(alias.to_owned()),
+                Err(_) => notices.push(persona::bounded_message(&format!(
+                    "The saved model '{alias}' is no longer available; continuing on {}.",
+                    startup(&context)
+                ))),
+            }
+        }
+    }
+    if let Some(effort) = saved.effort.as_deref() {
+        match model_options::parse_effort(effort) {
+            Ok(effort) => overrides.effort = effort,
+            Err(_) => notices.push(persona::bounded_message(&format!(
+                "The saved reasoning effort '{effort}' is unknown; using the default."
+            ))),
+        }
+    }
+    if let Some(session) = state.sessions.lock().await.get_mut(session_id) {
+        session.context = Arc::new(context);
+        session.model_overrides = overrides;
+    }
+    notices
+}
+
+/// Sends the restored plan, context meter and title of a loaded session, so
+/// the editor shows them before the next prompt.
+async fn announce_loaded_state(
+    state: &AcpState,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+) {
+    let Some((history, todo_store)) = state
+        .sessions
+        .lock()
+        .await
+        .get(session_id)
+        .map(|session| (session.history.clone(), session.todo_store.clone()))
+    else {
+        return;
+    };
+    let mut previous = Vec::new();
+    relay_plan_if_changed(session_id, cx, &todo_store, &mut previous);
+    let Ok(mut history) = history.try_lock() else {
+        return;
+    };
+    if history.context_window == 0 {
+        history.context_window = state.cfg.resolve_context_window(
+            &history.session.provider,
+            &history.session.model,
+            crate::config::quick_models_map(&state.cfg),
+        );
+    }
+    send_usage_update(state, &history, session_id, cx);
+    send_session_info(&mut history, session_id, cx);
+}
+
+/// Tears down a session already removed from the catalogue: its background
+/// pool, MCP and language servers, and per-session bookkeeping. An idle
+/// session is torn down before this returns; one whose cancelled turn is still
+/// settling is torn down by a task that waits for that turn (the turn itself
+/// closes whatever it was holding).
+async fn retire_session(
+    state: &AcpState,
+    session_id: &SessionId,
+    removed: Option<SessionState>,
+) -> Result<(), agent_client_protocol::Error> {
+    lock_unpoisoned(&state.cancel_routes).remove(session_id);
+    toolcall::forget_session(session_id.0.as_ref());
+    #[cfg(feature = "subagents")]
+    if let Some(pool) = removed
+        .as_ref()
+        .and_then(|session| session.spend.background_pool())
+    {
+        pool.close().await;
+    }
+    if let Some(removed) = removed {
+        let history = removed.history.clone();
+        drop(removed);
+        match history.clone().try_lock_owned() {
+            Ok(mut idle_history) => idle_history.reuse.shutdown().await,
+            Err(_) => {
+                let activity = state.idle.admit()?;
+                tokio::spawn(activity.track(async move {
+                    history.lock().await.reuse.shutdown().await;
+                }));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reserves the identity of `session_id`, making room when needed. An id this
+/// process still holds with nothing running is dropped and reinstalled from
+/// its checkpoint (the editor reopened a thread it never closed); at the
+/// session cap the least recently used idle session is evicted. A session with
+/// an active turn, schedule, pending question or background task is never
+/// touched, so the original refusal stands when everything is busy.
+async fn reserve_lease(
+    state: &AcpState,
+    session_id: &SessionId,
+) -> Result<Arc<SessionLease>, agent_client_protocol::Error> {
+    let refusal = match state.leases.reserve(session_id.clone()) {
+        Ok(lease) => return Ok(lease),
+        Err(error) => error,
+    };
+    if state.leases.is_owned(session_id) {
+        let removed = {
+            let mut sessions = state.sessions.lock().await;
+            if sessions.get(session_id).is_none_or(SessionState::is_busy) {
+                return Err(refusal);
+            }
+            let removed = sessions.remove(session_id);
+            state.idle.sessions_changed(sessions.len());
+            removed
+        };
+        retire_session(state, session_id, removed).await?;
+    } else if state.leases.is_full() {
+        let evicted = {
+            let mut sessions = state.sessions.lock().await;
+            let oldest = sessions
+                .iter()
+                .filter(|(_, session)| !session.is_busy())
+                .min_by_key(|(_, session)| session.last_used.load(Ordering::Relaxed))
+                .map(|(id, _)| id.clone());
+            let Some(oldest) = oldest else {
+                return Err(refusal);
+            };
+            let removed = sessions.remove(&oldest);
+            state.idle.sessions_changed(sessions.len());
+            (oldest, removed)
+        };
+        tracing::info!("ACP evicted idle session {} at the session cap", evicted.0);
+        retire_session(state, &evicted.0, evicted.1).await?;
+    } else {
+        return Err(refusal);
+    }
+    state.leases.reserve(session_id.clone())
+}
+
 async fn handle_close_session(
     req: CloseSessionRequest,
     responder: Responder<CloseSessionResponse>,
@@ -2863,30 +3147,7 @@ async fn handle_close_session(
         state.idle.sessions_changed(sessions.len());
         removed
     };
-    #[cfg(feature = "subagents")]
-    if let Some(pool) = removed
-        .as_ref()
-        .and_then(|session| session.spend.background_pool())
-    {
-        pool.close().await;
-    }
-    // Stop the session's MCP and language servers. An idle session is torn
-    // down before the response; a session whose cancelled turn is still
-    // settling is torn down by a task that waits for that turn (the turn
-    // itself closes whatever it was holding).
-    if let Some(removed) = removed {
-        let history = removed.history.clone();
-        drop(removed);
-        match history.clone().try_lock_owned() {
-            Ok(mut idle_history) => idle_history.reuse.shutdown().await,
-            Err(_) => {
-                let activity = state.idle.admit()?;
-                tokio::spawn(activity.track(async move {
-                    history.lock().await.reuse.shutdown().await;
-                }));
-            }
-        }
-    }
+    retire_session(state, session_id, removed).await?;
 
     responder.respond(CloseSessionResponse::new())
 }
@@ -3129,7 +3390,7 @@ async fn handle_prompt(
         prompt_input,
         command,
         session_id,
-        PromptReply::Client(responder),
+        PromptReply::client(responder),
         Some(request_cancellation_bridge),
         activity,
     )
@@ -3144,6 +3405,8 @@ fn admit_turn(
 ) -> Result<PromptSessionSnapshot, agent_client_protocol::Error> {
     let control = Arc::new(TurnControl::new());
     let hook_lease;
+    sess.last_used
+        .store(state.leases.next_tick(), Ordering::Relaxed);
     let generation = {
         let mut turns = lock_unpoisoned(&sess.turns);
         if !turns.queue.is_empty() {
@@ -3223,6 +3486,7 @@ fn spawn_turn(
     } = snapshot;
     // Closed unless the operator opted in and the client advertised it.
     let read_tracker = read_tracker.with_client_fs(state.client_fs.handle(&cx, &session_id));
+    let panic_slot = reply.panic_slot();
 
     control.attach_sandbox(sandbox.clone());
 
@@ -3235,7 +3499,7 @@ fn spawn_turn(
             // cancellation while the turn remains alive just long enough to
             // kill/reap hooks and finish tracked blocking work.
             let _cancel_on_connection_drop = CancelTurnOnDrop(teardown_control);
-            tokio::spawn(activity.track(async move {
+            match tokio::spawn(activity.track(async move {
                 // Held until the turn, its hooks and its tracked work settle.
                 let _hook_lease = hook_lease;
                 let registration = registration;
@@ -3293,14 +3557,43 @@ fn spawn_turn(
                 result
             }))
             .await
-            .map_err(|error| {
-                agent_client_protocol::Error::new(
-                    -32603,
-                    format!("ACP prompt task failed: {error}"),
-                )
-            })?
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    // A panic (or runtime cancellation) in this one turn must
+                    // not end the connection and every other session: answer
+                    // this prompt and return Ok so the SDK keeps running. The
+                    // unwind already dropped the registration (settling the
+                    // turn) and cancelled its control.
+                    let detail = if error.is_panic() {
+                        let payload = error.into_panic();
+                        panic_message(&*payload)
+                    } else {
+                        error.to_string()
+                    };
+                    tracing::error!(target: "acp", "ACP prompt task failed: {detail}");
+                    let responder = panic_slot.and_then(|slot| lock_unpoisoned(&slot).take());
+                    if let Some(responder) = responder {
+                        let _ = responder.respond_with_error(agent_client_protocol::Error::new(
+                            -32603,
+                            format!("ACP prompt task failed: {detail}"),
+                        ));
+                    }
+                    Ok(())
+                }
+            }
         }
     })
+}
+
+/// Best-effort text of a panic payload for the log and the prompt error.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .map(|text| crate::ui::events::sanitize_output(&text).to_string())
+        .unwrap_or_else(|| "panic with a non-text payload".into())
 }
 
 /// Images for a model the catalog lists as text-only are refused up front with
@@ -3904,7 +4197,7 @@ fn question_selection(
     selected: &str,
 ) -> Option<QuestionSelection> {
     let prefix = format!("{id}:{index}");
-    if item.allow_free_text && selected == format!("{prefix}:new-message") {
+    if selected == format!("{prefix}:new-message") {
         return Some(QuestionSelection::NewMessage);
     }
     (0..item.options.len())
@@ -3949,10 +4242,11 @@ mod question_selection_tests {
         ] {
             assert_eq!(question_selection(&id, 0, &item, &stale), None);
         }
+        // The neutral parking option is always offered, with or without free text.
         item.allow_free_text = false;
         assert_eq!(
             question_selection(&id, 0, &item, &format!("{id}:0:new-message")),
-            None
+            Some(QuestionSelection::NewMessage)
         );
         assert_eq!(
             question_selection(&id, 0, &item, &format!("{id}:0:choice:0")),
@@ -4198,6 +4492,7 @@ mod tool_presentation_tests {
     #[test]
     fn permission_title_keeps_the_announced_title() {
         toolcall::remember_args(
+            "s",
             "perm-title",
             "shell",
             &json!({"command": "cargo test --all"}),
@@ -4332,26 +4627,24 @@ async fn drive_question_request(
     let mut waiting = false;
     for (index, item) in question.questions.0.iter().enumerate() {
         let prefix = format!("{}:{index}", question.id);
-        let mut options = item
-            .options
-            .iter()
-            .enumerate()
-            .map(|(choice, option)| {
-                PermissionOption::new(
-                    format!("{prefix}:choice:{choice}"),
-                    crate::ui::events::sanitize_output(&option.label),
-                    PermissionOptionKind::AllowOnce,
-                )
-            })
-            .collect::<Vec<_>>();
+        // Clients with an "always allow" setting resolve a permission request
+        // by picking the first allow-kind option without showing it. Only a
+        // neutral option that parks the turn may be allow-kind (and first);
+        // the substantive answers are reject-kind so an auto-approver can
+        // never answer the model's question unseen (mini-agent-nvnkx.283).
         let other_id = format!("{prefix}:new-message");
-        if item.allow_free_text {
-            options.push(PermissionOption::new(
-                other_id.clone(),
-                "Answer in a new user message (park this turn)",
-                PermissionOptionKind::AllowOnce,
-            ));
-        }
+        let mut options = vec![PermissionOption::new(
+            other_id.clone(),
+            "Answer in a new user message (park this turn)",
+            PermissionOptionKind::AllowOnce,
+        )];
+        options.extend(item.options.iter().enumerate().map(|(choice, option)| {
+            PermissionOption::new(
+                format!("{prefix}:choice:{choice}"),
+                crate::ui::events::sanitize_output(&option.label),
+                PermissionOptionKind::RejectOnce,
+            )
+        }));
         options.push(PermissionOption::new(
             format!("{prefix}:cancel"),
             "Cancel clarification",
@@ -4413,6 +4706,17 @@ async fn drive_question_request(
             }
             Some(QuestionSelection::Choice(choice)) => answers.push(Answer::Option(choice)),
             None => {
+                if synthetic {
+                    let fields = ToolCallUpdateFields::new()
+                        .status(ToolCallStatus::Failed)
+                        .content(vec![ToolCallContent::from(ContentBlock::Text(
+                            TextContent::new("Clarification cancelled"),
+                        ))]);
+                    let _ = cx.send_notification(SessionNotification::new(
+                        session_id.clone(),
+                        SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(call_id, fields)),
+                    ));
+                }
                 let _ = question.reply.send(QuestionAnswer::Cancelled);
                 return;
             }
@@ -4707,14 +5011,33 @@ async fn drive_permission_bridge(
 /// response, or, for a `/cron` fire that no client request started, a
 /// host-labelled `session/update` in that session.
 enum PromptReply {
-    Client(Responder<PromptResponse>),
+    /// The responder sits in a shared slot so [`spawn_turn`] can still answer
+    /// the prompt when the turn task panics and drops this value in the unwind.
+    Client(ClientResponder),
     Scheduled(cron::ScheduledReply),
 }
 
+type ClientResponder = Arc<StdMutex<Option<Responder<PromptResponse>>>>;
+
 impl PromptReply {
+    fn client(responder: Responder<PromptResponse>) -> Self {
+        Self::Client(Arc::new(StdMutex::new(Some(responder))))
+    }
+
+    /// The slot a panicking turn's prompt is answered through.
+    fn panic_slot(&self) -> Option<ClientResponder> {
+        match self {
+            Self::Client(slot) => Some(slot.clone()),
+            Self::Scheduled(_) => None,
+        }
+    }
+
     fn respond(self, response: PromptResponse) -> Result<(), agent_client_protocol::Error> {
         match self {
-            Self::Client(responder) => responder.respond(response),
+            Self::Client(slot) => match lock_unpoisoned(&slot).take() {
+                Some(responder) => responder.respond(response),
+                None => Ok(()),
+            },
             Self::Scheduled(reply) => reply.finished(response),
         }
     }
@@ -4724,7 +5047,10 @@ impl PromptReply {
         error: agent_client_protocol::Error,
     ) -> Result<(), agent_client_protocol::Error> {
         match self {
-            Self::Client(responder) => responder.respond_with_error(error),
+            Self::Client(slot) => match lock_unpoisoned(&slot).take() {
+                Some(responder) => responder.respond_with_error(error),
+                None => Ok(()),
+            },
             Self::Scheduled(reply) => reply.failed(error),
         }
     }
@@ -6486,6 +6812,15 @@ async fn select_turn_route(
     if let Err(error) = persona::check_route(&state.cli, &state.cfg, &route) {
         return Err(PromptOutcome::failed(error));
     }
+    // The choices this turn runs on are saved with the session so a reload
+    // resumes on them (re-validated at load).
+    history.session.acp_selection = Some(crate::session::AcpSelection {
+        model: overrides.model.clone(),
+        effort: overrides
+            .effort
+            .map(|effort| effort.as_wire_str().to_owned()),
+        persona: Some(persona::current_mode_id(context).to_owned()),
+    });
     history.context_window = state.cfg.resolve_context_window(
         &route.provider,
         &route.model,
@@ -7757,6 +8092,7 @@ async fn relay_paused_runner(
             &cx,
             &plan_store,
             &mut last_plan,
+            &mut OpenCalls::default(),
         )
         .await
     } else {
@@ -8019,6 +8355,84 @@ impl TaskActivity {
     }
 }
 
+/// Tool calls announced to the client in this turn and not yet settled, plus
+/// the bounded diffs of finished edits waiting for their result update.
+#[derive(Default)]
+struct OpenCalls {
+    open: Vec<String>,
+    diffs: HashMap<String, ToolCallContent>,
+}
+
+impl OpenCalls {
+    const MAX_DIFFS: usize = 64;
+
+    fn announced(&mut self, id: &str) {
+        if !self.open.iter().any(|open| open == id) {
+            self.open.push(id.to_owned());
+        }
+    }
+
+    fn diff(&mut self, id: String, content: ToolCallContent) {
+        if self.diffs.len() >= Self::MAX_DIFFS {
+            self.diffs.clear();
+        }
+        self.diffs.insert(id, content);
+    }
+
+    /// Sends the terminal update of a call whose result arrived.
+    fn result(
+        &mut self,
+        session_id: &SessionId,
+        cx: &ConnectionTo<Client>,
+        id: String,
+        output: &str,
+        is_error: bool,
+    ) {
+        self.open.retain(|open| *open != id);
+        toolcall::forget_args(&id);
+        let diff = self.diffs.remove(&id);
+        toolcall::record_result(session_id.0.as_ref(), output, is_error, diff.as_ref());
+        let mut content = Vec::new();
+        content.extend(diff);
+        content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
+            output.to_owned(),
+        ))));
+        let mut fields = ToolCallUpdateFields::new()
+            .status(ToolCallStatus::Completed)
+            .content(content);
+        if is_error {
+            fields.status = Some(ToolCallStatus::Failed);
+        }
+        let notif = SessionNotification::new(
+            session_id.clone(),
+            SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(ToolCallId::new(id), fields)),
+        );
+        if let Err(e) = cx.send_notification(notif) {
+            tracing::warn!("ACP failed to send tool result notification: {}", e);
+        }
+    }
+
+    /// Settles every call that never got a result (stream failure, turn
+    /// error, cancellation) as failed so a client does not keep a spinner on
+    /// it, and forgets its pending arguments.
+    fn close_unfinished(&mut self, session_id: &SessionId, cx: &ConnectionTo<Client>) {
+        for id in std::mem::take(&mut self.open) {
+            toolcall::forget_args(&id);
+            let fields = ToolCallUpdateFields::new()
+                .status(ToolCallStatus::Failed)
+                .content(vec![ToolCallContent::from(ContentBlock::Text(
+                    TextContent::new("interrupted before a result was recorded"),
+                ))]);
+            send_tool_update(
+                session_id,
+                cx,
+                ToolCallUpdate::new(ToolCallId::new(id), fields),
+            );
+        }
+        self.diffs.clear();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn relay_prompt_events(
     session_id: SessionId,
@@ -8042,7 +8456,7 @@ async fn relay_prompt_events(
     #[cfg(feature = "goal")]
     let mut usage = rig::completion::Usage::default();
     let mut pending_text = PendingText::default();
-    let mut mutation_diffs: HashMap<String, ToolCallContent> = HashMap::new();
+    let mut calls = OpenCalls::default();
     #[cfg(feature = "subagents")]
     let mut task_activity = TaskActivity::default();
     loop {
@@ -8051,7 +8465,7 @@ async fn relay_prompt_events(
             _ = control.cancelled() => {
                 pending_text.flush(&session_id, &cx);
                 let outcome = cancelled_after_runner_with_plan(
-                    &mut rx, &session_id, &cx, &plan_store, &mut last_plan,
+                    &mut rx, &session_id, &cx, &plan_store, &mut last_plan, &mut calls,
                 ).await;
                 // What the cancelled segment already spent still counts toward
                 // a goal's token bound (mini-agent-51okt).
@@ -8071,6 +8485,7 @@ async fn relay_prompt_events(
             pending_text.flush(&session_id, &cx);
         }
         let Some(event) = event else {
+            calls.close_unfinished(&session_id, &cx);
             return PromptOutcome {
                 reason: StopReason::Refusal,
                 question: None,
@@ -8090,11 +8505,19 @@ async fn relay_prompt_events(
             }
             AgentEvent::ToolCall { id, name, args } => {
                 let tool_call = announce_tool_call(&id, &name, &args, &workspace_root);
-                toolcall::remember_args(&id, &name, &args, &tool_call.title, Some(&workspace_root));
+                toolcall::remember_args(
+                    session_id.0.as_ref(),
+                    &id,
+                    &name,
+                    &args,
+                    &tool_call.title,
+                    Some(&workspace_root),
+                );
                 #[cfg(feature = "subagents")]
                 if name == "task" {
                     task_activity.call_started(&id);
                 }
+                calls.announced(id.as_ref());
                 let id = ToolCallId::new(id.to_string());
                 let notif = SessionNotification::new(
                     session_id.clone(),
@@ -8148,10 +8571,7 @@ async fn relay_prompt_events(
                 // Carried as ACP diff content on the tool result update; it
                 // is a historical preview, never current filesystem contents.
                 if let Some(content) = toolcall::mutation_diff_content(&diff) {
-                    if mutation_diffs.len() >= 64 {
-                        mutation_diffs.clear();
-                    }
-                    mutation_diffs.insert(id.to_string(), content);
+                    calls.diff(id.to_string(), content);
                 }
             }
             AgentEvent::ToolResult {
@@ -8161,31 +8581,9 @@ async fn relay_prompt_events(
                 ..
             } => {
                 let id = id.to_string();
-                toolcall::forget_args(&id);
-                if is_error {
-                    toolcall::record_failed_result(session_id.0.as_ref(), &output);
-                }
                 #[cfg(feature = "subagents")]
                 task_activity.call_finished(&id);
-                let mut content = Vec::new();
-                content.extend(mutation_diffs.remove(&id));
-                content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
-                    output.to_string(),
-                ))));
-                let mut fields = ToolCallUpdateFields::new()
-                    .status(ToolCallStatus::Completed)
-                    .content(content);
-                if is_error {
-                    fields.status = Some(ToolCallStatus::Failed);
-                }
-                let update = ToolCallUpdate::new(ToolCallId::new(id), fields);
-                let notif = SessionNotification::new(
-                    session_id.clone(),
-                    SessionUpdate::ToolCallUpdate(update),
-                );
-                if let Err(e) = cx.send_notification(notif) {
-                    tracing::warn!("ACP failed to send tool result notification: {}", e);
-                }
+                calls.result(&session_id, &cx, id, &output, is_error);
                 relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
             }
             AgentEvent::ToolLoop { name, message } => {
@@ -8281,6 +8679,7 @@ async fn relay_prompt_events(
                 // `interactions`; nothing was aborted. The driver persists
                 // them, compacts and continues.
                 while rx.recv().await.is_some() {}
+                calls.close_unfinished(&session_id, &cx);
                 relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
                     reason: StopReason::EndTurn,
@@ -8303,6 +8702,7 @@ async fn relay_prompt_events(
                     &cx,
                     &plan_store,
                     &mut last_plan,
+                    &mut calls,
                 )
                 .await;
             }
@@ -8313,6 +8713,7 @@ async fn relay_prompt_events(
                 // Closing this receiver waits for the exact run and its owned
                 // effects. A future ordinary user prompt gets a fresh slot.
                 while rx.recv().await.is_some() {}
+                calls.close_unfinished(&session_id, &cx);
                 relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
                     reason: StopReason::EndTurn,
@@ -8326,6 +8727,7 @@ async fn relay_prompt_events(
             }
             AgentEvent::Done { interactions, .. } => {
                 while rx.recv().await.is_some() {}
+                calls.close_unfinished(&session_id, &cx);
                 relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
                     reason: StopReason::EndTurn,
@@ -8342,6 +8744,7 @@ async fn relay_prompt_events(
                 interactions,
             } => {
                 while rx.recv().await.is_some() {}
+                calls.close_unfinished(&session_id, &cx);
                 relay_plan_if_changed(&session_id, &cx, &plan_store, &mut last_plan);
                 return PromptOutcome {
                     reason: StopReason::Refusal,
@@ -8365,18 +8768,37 @@ async fn cancelled_after_runner_with_plan(
     cx: &ConnectionTo<Client>,
     store: &crate::agent::tools::TodoStore,
     previous: &mut Vec<crate::agent::tools::todo::TodoItem>,
+    calls: &mut OpenCalls,
 ) -> PromptOutcome {
-    let outcome = cancelled_after_runner(rx).await;
+    let outcome = cancelled_after_runner(rx, session_id, cx, calls).await;
     relay_plan_if_changed(session_id, cx, store, previous);
     outcome
 }
 
-async fn cancelled_after_runner(rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>) -> PromptOutcome {
+async fn cancelled_after_runner(
+    rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>,
+    session_id: &SessionId,
+    cx: &ConnectionTo<Client>,
+    calls: &mut OpenCalls,
+) -> PromptOutcome {
     // Channel closure follows the model/tool future and all owned work. Retain
     // any terminal progress that beat cancellation so effects aren't repeated.
+    // Results that beat cancellation are still relayed, and calls that never
+    // got one are closed as failed once the runner is gone.
     let mut progress = None;
     while let Some(event) = rx.recv().await {
         match event {
+            AgentEvent::FileMutation { id, diff, .. } => {
+                if let Some(content) = toolcall::mutation_diff_content(&diff) {
+                    calls.diff(id.to_string(), content);
+                }
+            }
+            AgentEvent::ToolResult {
+                id,
+                output,
+                is_error,
+                ..
+            } => calls.result(session_id, cx, id.to_string(), &output, is_error),
             AgentEvent::Done { interactions, .. }
             | AgentEvent::Error { interactions, .. }
             | AgentEvent::AwaitingUser { interactions, .. }
@@ -8387,6 +8809,7 @@ async fn cancelled_after_runner(rx: &mut tokio::sync::mpsc::Receiver<AgentEvent>
             _ => {}
         }
     }
+    calls.close_unfinished(session_id, cx);
     PromptOutcome::cancelled(progress)
 }
 
@@ -11460,9 +11883,11 @@ mod protocol_tests {
             assert_eq!(response.await?.stop_reason, StopReason::Cancelled);
             // The terminal response fences its prior queued final Plan update.
             let updates = updates.lock().unwrap();
-            assert_eq!(updates.len(), 1, "{updates:?}");
+            // The result that beat the cancellation is relayed too (mini-agent-nvnkx.281).
+            assert_eq!(updates.len(), 2, "{updates:?}");
             assert_eq!(updates[0].session_id, session);
-            let SessionUpdate::Plan(plan) = &updates[0].update else { panic!("expected final plan") };
+            assert!(matches!(&updates[0].update, SessionUpdate::ToolCallUpdate(_)));
+            let SessionUpdate::Plan(plan) = &updates[1].update else { panic!("expected final plan") };
             assert_eq!(plan.entries.len(), 1);
             assert_eq!(plan.entries[0].content, store.snapshot()[0].content);
             assert_eq!(plan.entries[0].status, PlanEntryStatus::InProgress);
@@ -15053,7 +15478,7 @@ mod protocol_tests {
     }
 
     #[tokio::test]
-    async fn in_memory_protocol_rejects_capacity_without_evicting_live_sessions() {
+    async fn in_memory_protocol_evicts_only_the_least_recently_used_idle_session_at_capacity() {
         let fixture: PromptFixture = Arc::new(|prompt, _history| {
             Box::pin(async move {
                 Ok(vec![done(
@@ -15086,14 +15511,24 @@ mod protocol_tests {
                             .session_id,
                     );
                 }
+                // Every session is idle, so the 65th makes room by evicting the
+                // least recently used one (the first); the cap itself still holds.
+                let newest = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
                 assert!(
-                    cx.send_request(NewSessionRequest::new(cwd))
+                    cx.send_request(prompt(ids[0].clone(), "evicted"))
                         .block_task()
                         .await
                         .is_err(),
-                    "the 65th session must be rejected"
+                    "the evicted session is gone"
                 );
-                cx.send_request(prompt(ids[0].clone(), "still-live"))
+                cx.send_request(prompt(ids[1].clone(), "still-live"))
+                    .block_task()
+                    .await?;
+                cx.send_request(prompt(newest, "new-live"))
                     .block_task()
                     .await?;
                 Ok(())
@@ -16251,6 +16686,694 @@ brainstorm = "no-such-quick-model"
             .await
             .unwrap();
         assert_eq!(turns.load(Ordering::Acquire), 0);
+    }
+
+    // --- Harness review 2026-11-21 (mini-agent-nvnkx) ---
+
+    /// Runs `body` on the agent side of a fresh in-memory connection, so a
+    /// test can call agent helpers that need the agent's `ConnectionTo<Client>`,
+    /// and returns every session update the client received.
+    async fn collect_updates_from_agent_side<F, Fut>(body: F) -> Vec<SessionNotification>
+    where
+        F: FnOnce(ConnectionTo<Client>) -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let body = Arc::new(StdMutex::new(Some(body)));
+        let updates = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = updates.clone();
+        let agent = Agent.builder().on_receive_request(
+            async move |_: InitializeRequest, responder, cx: ConnectionTo<Client>| {
+                // Run on its own task: awaiting a client reply inside a
+                // handler would block this connection's dispatch loop.
+                let body = body.lock().unwrap().take();
+                let task_cx = cx.clone();
+                cx.spawn(async move {
+                    if let Some(body) = body {
+                        body(task_cx).await;
+                    }
+                    responder.respond(InitializeResponse::new(ProtocolVersion::V1))
+                })
+            },
+            on_receive_request!(),
+        );
+        Client
+            .builder()
+            .on_receive_request(
+                async move |_: RequestPermissionRequest, responder, _cx| {
+                    responder.respond(RequestPermissionResponse::new(
+                        RequestPermissionOutcome::Cancelled,
+                    ))
+                },
+                on_receive_request!(),
+            )
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(agent, async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        updates.lock().unwrap().clone()
+    }
+
+    fn tool_update_status(update: &SessionNotification, id: &str) -> Option<ToolCallStatus> {
+        match &update.update {
+            SessionUpdate::ToolCallUpdate(call) if call.tool_call_id.0.as_ref() == id => {
+                call.fields.status
+            }
+            _ => None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_errors_closes_the_calls_it_announced_before_the_outcome() {
+        let fixture: PromptFixture = Arc::new(|_, _| {
+            Box::pin(async move {
+                Ok(vec![
+                    AgentEvent::ToolCall {
+                        id: "open-a".into(),
+                        name: "shell".into(),
+                        args: serde_json::json!({"command": "true"}),
+                    },
+                    AgentEvent::ToolCall {
+                        id: "open-b".into(),
+                        name: "shell".into(),
+                        args: serde_json::json!({"command": "sleep 9"}),
+                    },
+                    AgentEvent::ToolResult {
+                        id: "open-a".into(),
+                        name: "shell".into(),
+                        output: "ok".into(),
+                        images: Vec::new(),
+                        is_error: false,
+                    },
+                    AgentEvent::Error {
+                        message: "the provider stream dropped".into(),
+                        interactions: Vec::new(),
+                    },
+                ])
+            })
+        });
+        let state = persona_state(PERSONA_CONFIG, fixture);
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let updates = Arc::new(StdMutex::new(Vec::<SessionNotification>::new()));
+        let sink = updates.clone();
+        Client
+            .builder()
+            .on_receive_notification(
+                async move |notification: SessionNotification, _cx| {
+                    sink.lock().unwrap().push(notification);
+                    Ok(())
+                },
+                agent_client_protocol::on_receive_notification!(),
+            )
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let session = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let _ = cx.send_request(prompt(session, "go")).block_task().await;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let updates = updates.lock().unwrap();
+        let statuses = |id: &str| {
+            updates
+                .iter()
+                .filter_map(|update| tool_update_status(update, id))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            statuses("open-a"),
+            [ToolCallStatus::InProgress, ToolCallStatus::Completed]
+        );
+        assert_eq!(
+            statuses("open-b"),
+            [ToolCallStatus::InProgress, ToolCallStatus::Failed],
+            "the call without a result is settled as failed"
+        );
+        toolcall::forget_session("never-installed");
+    }
+
+    #[tokio::test]
+    async fn cancellation_relays_results_that_beat_it_and_closes_the_rest() {
+        let updates = collect_updates_from_agent_side(|cx| async move {
+            let session_id = SessionId::new("cancel-closes");
+            let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+            tx.send(AgentEvent::ToolResult {
+                id: "done".into(),
+                name: "shell".into(),
+                output: "finished".into(),
+                images: Vec::new(),
+                is_error: false,
+            })
+            .await
+            .unwrap();
+            drop(tx);
+            let mut calls = OpenCalls::default();
+            calls.announced("done");
+            calls.announced("lost");
+            let outcome = cancelled_after_runner(&mut rx, &session_id, &cx, &mut calls).await;
+            assert_eq!(outcome.reason, StopReason::Cancelled);
+            assert!(calls.open.is_empty());
+        })
+        .await;
+        let status = |id: &str| {
+            updates
+                .iter()
+                .filter_map(|update| tool_update_status(update, id))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(status("done"), [ToolCallStatus::Completed]);
+        assert_eq!(status("lost"), [ToolCallStatus::Failed]);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_turn_fails_only_its_own_prompt() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let fixture: PromptFixture = {
+            let release = release.clone();
+            let started = started.clone();
+            Arc::new(move |prompt, _| {
+                let release = release.clone();
+                let started = started.clone();
+                Box::pin(async move {
+                    if prompt == "boom" {
+                        panic!("fixture panic in session A");
+                    }
+                    if prompt == "block" {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(vec![done(
+                        &prompt,
+                        vec![Message::assistant(prompt.clone())],
+                    )])
+                })
+            })
+        };
+        let state = persona_state(PERSONA_CONFIG, fixture);
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let a = cx
+                    .send_request(NewSessionRequest::new(cwd.clone()))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let b = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                let blocked = {
+                    let cx = cx.clone();
+                    let b = b.clone();
+                    tokio::spawn(
+                        async move { cx.send_request(prompt(b, "block")).block_task().await },
+                    )
+                };
+                tokio::time::timeout(Duration::from_secs(5), started.notified())
+                    .await
+                    .expect("session B's turn starts");
+                let error = cx
+                    .send_request(prompt(a.clone(), "boom"))
+                    .block_task()
+                    .await
+                    .expect_err("the panicking prompt gets an error response");
+                assert_eq!(i32::from(error.code), -32603);
+                assert!(error.message.contains("prompt task failed"), "{error:?}");
+                // The connection survived: B finishes normally, and A takes a new prompt.
+                release.notify_one();
+                let finished = tokio::time::timeout(Duration::from_secs(5), blocked)
+                    .await
+                    .expect("session B completes")
+                    .unwrap()?;
+                assert_eq!(finished.stop_reason, StopReason::EndTurn);
+                let again = cx.send_request(prompt(a, "ok")).block_task().await?;
+                assert_eq!(again.stop_reason, StopReason::EndTurn);
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_owned_idle_session_id_is_reclaimed_and_a_busy_one_is_refused() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let fixture: PromptFixture = {
+            let release = release.clone();
+            let started = started.clone();
+            Arc::new(move |prompt, _| {
+                let release = release.clone();
+                let started = started.clone();
+                Box::pin(async move {
+                    if prompt == "block" {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(vec![done(
+                        &prompt,
+                        vec![Message::assistant(prompt.clone())],
+                    )])
+                })
+            })
+        };
+        let state = persona_state(PERSONA_CONFIG, fixture);
+        let inspect = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let id = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                // Running turn: the identity is not reclaimed.
+                let running = {
+                    let cx = cx.clone();
+                    let id = id.clone();
+                    tokio::spawn(
+                        async move { cx.send_request(prompt(id, "block")).block_task().await },
+                    )
+                };
+                tokio::time::timeout(Duration::from_secs(5), started.notified())
+                    .await
+                    .expect("the turn starts");
+                assert!(reserve_lease(&inspect, &id).await.is_err());
+                assert!(inspect.sessions.lock().await.contains_key(&id));
+                release.notify_one();
+                running.await.unwrap()?;
+                // Idle: the identity is released and reserved again, one session left.
+                let lease = reserve_lease(&inspect, &id).await.unwrap();
+                assert!(!inspect.sessions.lock().await.contains_key(&id));
+                assert!(inspect.leases.is_owned(&id));
+                drop(lease);
+                assert!(!inspect.leases.is_owned(&id));
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn at_the_session_cap_the_least_recently_used_idle_session_makes_room() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let fixture: PromptFixture = {
+            let release = release.clone();
+            let started = started.clone();
+            Arc::new(move |prompt, _| {
+                let release = release.clone();
+                let started = started.clone();
+                Box::pin(async move {
+                    if prompt == "block" {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    Ok(vec![done(
+                        &prompt,
+                        vec![Message::assistant(prompt.clone())],
+                    )])
+                })
+            })
+        };
+        let mut state = persona_state(PERSONA_CONFIG, fixture);
+        Arc::get_mut(&mut state).unwrap().leases = Arc::new(SessionLeases {
+            max_sessions: Some(2),
+            ..Default::default()
+        });
+        let inspect = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let new = |cx: &ConnectionTo<Agent>| {
+                    cx.send_request(NewSessionRequest::new(cwd.clone()))
+                        .block_task()
+                };
+                let first = new(&cx).await?.session_id;
+                let second = new(&cx).await?.session_id;
+                // `first` is the least recently used idle session: it makes room.
+                let third = new(&cx).await?.session_id;
+                {
+                    let sessions = inspect.sessions.lock().await;
+                    assert!(!sessions.contains_key(&first));
+                    assert!(sessions.contains_key(&second) && sessions.contains_key(&third));
+                }
+                // With both remaining sessions running turns, a new one is refused.
+                let mut running = Vec::new();
+                for id in [second.clone(), third.clone()] {
+                    let cx = cx.clone();
+                    running.push(tokio::spawn(async move {
+                        cx.send_request(prompt(id, "block")).block_task().await
+                    }));
+                    tokio::time::timeout(Duration::from_secs(5), started.notified())
+                        .await
+                        .expect("the turn starts");
+                }
+                assert!(new(&cx).await.is_err(), "every session is busy");
+                release.notify_waiters();
+                for turn in running {
+                    turn.await.unwrap()?;
+                }
+                assert!(new(&cx).await.is_ok(), "idle again: room is made");
+                Ok(())
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_saved_selection_is_restored_or_named_when_unavailable() {
+        let cfg = format!(
+            "{PERSONA_CONFIG}\n[quick_models.fast]\nprovider = \"acme\"\nmodel = \"acme-fast\"\n"
+        );
+        let state = persona_state(&cfg, counting_fixture(Arc::new(AtomicUsize::new(0))));
+        let inspect = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let id = Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                let id = cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id;
+                cx.send_request(SetSessionConfigOptionRequest::new(
+                    id.clone(),
+                    "model",
+                    "fast",
+                ))
+                .block_task()
+                .await?;
+                cx.send_request(SetSessionConfigOptionRequest::new(
+                    id.clone(),
+                    "effort",
+                    "high",
+                ))
+                .block_task()
+                .await?;
+                cx.send_request(prompt(id.clone(), "hello"))
+                    .block_task()
+                    .await?;
+                Ok(id)
+            })
+            .await
+            .unwrap();
+        // The turn recorded the choices with the session.
+        let saved = {
+            let sessions = inspect.sessions.lock().await;
+            let history = sessions[&id].history.lock().await;
+            history
+                .session
+                .acp_selection
+                .clone()
+                .expect("selection saved")
+        };
+        assert_eq!(saved.model.as_deref(), Some("fast"));
+        assert_eq!(saved.effort.as_deref(), Some("high"));
+        // A reload starts from the startup route; restoring puts the choices back.
+        {
+            let mut sessions = inspect.sessions.lock().await;
+            sessions.get_mut(&id).unwrap().model_overrides = Default::default();
+        }
+        let notices = restore_session_selection(&inspect, &id, &saved, false).await;
+        assert!(notices.is_empty(), "{notices:?}");
+        {
+            let sessions = inspect.sessions.lock().await;
+            let overrides = &sessions[&id].model_overrides;
+            assert_eq!(overrides.model.as_deref(), Some("fast"));
+            assert_eq!(
+                overrides.effort,
+                Some(crate::config::types::ReasoningEffort::High)
+            );
+        }
+        let options = persona_config_options(&inspect, &id).await;
+        assert_eq!(option_json(&options, "model")["currentValue"], "fast");
+        // A model that is gone is named and the session stays on its route.
+        {
+            let mut sessions = inspect.sessions.lock().await;
+            sessions.get_mut(&id).unwrap().model_overrides = Default::default();
+        }
+        let gone = crate::session::AcpSelection {
+            model: Some("removed-alias".into()),
+            ..saved.clone()
+        };
+        let notices = restore_session_selection(&inspect, &id, &gone, false).await;
+        assert_eq!(notices.len(), 1);
+        assert!(
+            notices[0].contains("removed-alias") && notices[0].contains("acme/acme"),
+            "{notices:?}"
+        );
+        assert!(
+            inspect.sessions.lock().await[&id]
+                .model_overrides
+                .model
+                .is_none()
+        );
+        // A native-bearing session never follows a model switch.
+        let notices = restore_session_selection(&inspect, &id, &saved, true).await;
+        assert!(notices[0].contains("provider-native"), "{notices:?}");
+        assert!(
+            inspect.sessions.lock().await[&id]
+                .model_overrides
+                .model
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn loading_a_session_announces_its_plan_usage_and_title() {
+        let state = persona_state(
+            PERSONA_CONFIG,
+            counting_fixture(Arc::new(AtomicUsize::new(0))),
+        );
+        let inspect = state.clone();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let id = Client
+            .builder()
+            .connect_with(InMemoryAgent(state), async move |cx| {
+                cx.send_request(InitializeRequest::new(ProtocolVersion::V1))
+                    .block_task()
+                    .await?;
+                Ok(cx
+                    .send_request(NewSessionRequest::new(cwd))
+                    .block_task()
+                    .await?
+                    .session_id)
+            })
+            .await
+            .unwrap();
+        {
+            let sessions = inspect.sessions.lock().await;
+            let session = &sessions[&id];
+            session.todo_store.replace(vec![
+                crate::agent::tools::todo::TodoItem {
+                    content: "first".into(),
+                    status: "completed".into(),
+                    priority: "high".into(),
+                },
+                crate::agent::tools::todo::TodoItem {
+                    content: "second".into(),
+                    status: "pending".into(),
+                    priority: "medium".into(),
+                },
+            ]);
+            session.history.lock().await.session.name = "my thread".into();
+        }
+        let announced = inspect.clone();
+        let announced_id = id.clone();
+        let updates = collect_updates_from_agent_side(move |cx| async move {
+            announce_loaded_state(&announced, &announced_id, &cx).await;
+        })
+        .await;
+        let plan = updates
+            .iter()
+            .find_map(|update| match &update.update {
+                SessionUpdate::Plan(plan) => Some(plan.entries.len()),
+                _ => None,
+            })
+            .expect("a plan update");
+        assert_eq!(plan, 2);
+        assert!(
+            updates
+                .iter()
+                .any(|update| matches!(update.update, SessionUpdate::UsageUpdate(_))),
+            "{updates:?}"
+        );
+        assert!(updates.iter().any(|update| matches!(
+            &update.update,
+            SessionUpdate::SessionInfoUpdate(info) if format!("{info:?}").contains("my thread")
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_synthetic_clarification_is_settled() {
+        let updates = collect_updates_from_agent_side(|cx| async move {
+            // The client side of this connection is the test's Client, which
+            // answers permission requests below; here only the cancel path runs.
+            let (reply, answer) = tokio::sync::oneshot::channel();
+            let id = uuid::Uuid::new_v4().to_string();
+            let request = crate::permission::ask::QuestionRequest {
+                id: id.clone(),
+                questions: crate::question::QuestionBatch(vec![crate::question::Question {
+                    question: "Which?".into(),
+                    options: vec![crate::question::QuestionOption {
+                        label: "one".into(),
+                        description: String::new(),
+                    }],
+                    allow_free_text: false,
+                }]),
+                tool_call_id: None,
+                reply,
+            };
+            let control = Arc::new(TurnControl::new());
+            // A client that declines every request cancels the clarification.
+            drive_question_request(
+                &cx,
+                &SessionId::new("clarify"),
+                request,
+                &control,
+                #[cfg(feature = "goal")]
+                &Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            )
+            .await;
+            assert!(matches!(
+                answer.await.unwrap(),
+                crate::question::QuestionAnswer::Cancelled
+            ));
+        })
+        .await;
+        let announced = updates
+            .iter()
+            .any(|update| matches!(&update.update, SessionUpdate::ToolCall(_)));
+        assert!(announced, "the synthetic call is announced");
+        let closing = updates
+            .iter()
+            .find_map(|update| match &update.update {
+                SessionUpdate::ToolCallUpdate(call) => call.fields.status,
+                _ => None,
+            })
+            .expect("a terminal update follows");
+        assert_eq!(closing, ToolCallStatus::Failed);
+    }
+
+    /// One authenticated plaintext peer: initialize, then session/new, and
+    /// returns the new session id after dropping the socket.
+    fn one_peer_creates_a_session(address: SocketAddr, cwd: &Path) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let mut peer = TcpStream::connect(address).unwrap();
+        let nonce = crate::acp_auth::read_challenge(&mut peer).unwrap();
+        crate::acp_auth::send_response(&mut peer, &nonce, "reaccept-key").unwrap();
+        let mut reader = BufReader::new(peer.try_clone().unwrap());
+        let mut call = |id: u32, method: &str, params: serde_json::Value| {
+            let request =
+                serde_json::json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
+            writeln!(peer, "{request}").unwrap();
+            peer.flush().unwrap();
+            // Skip session updates until the response to this request.
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let value = serde_json::from_str::<serde_json::Value>(&line).unwrap();
+                if value["id"] == id {
+                    return value;
+                }
+            }
+        };
+        call(1, "initialize", serde_json::json!({"protocolVersion": 1}));
+        let created = call(
+            2,
+            "session/new",
+            serde_json::json!({"cwd": cwd, "mcpServers": []}),
+        );
+        created["result"]["sessionId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("session/new failed: {created}"))
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn the_tcp_listener_serves_the_next_peer_after_the_first_disconnects() {
+        let state = persona_state(
+            PERSONA_CONFIG,
+            counting_fixture(Arc::new(AtomicUsize::new(0))),
+        );
+        let inspect = state.clone();
+        let listener = TcpListener::bind((DEFAULT_TCP_HOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let workspace = ProtocolTempDir::new();
+        let cwd = workspace.path().to_path_buf();
+        let server = tokio::spawn(serve_tcp_peers(
+            state,
+            listener,
+            TcpServerSettings {
+                host: DEFAULT_TCP_HOST.to_owned(),
+                port: address.port(),
+                api_key: "reaccept-key".to_owned(),
+                tls: None,
+                accept_timeout: Some(Duration::from_secs(30)),
+            },
+        ));
+        let first_cwd = cwd.clone();
+        let first =
+            tokio::task::spawn_blocking(move || one_peer_creates_a_session(address, &first_cwd))
+                .await
+                .unwrap();
+        // The first peer is gone, yet the process keeps listening.
+        let second = tokio::time::timeout(
+            Duration::from_secs(20),
+            tokio::task::spawn_blocking(move || one_peer_creates_a_session(address, &cwd)),
+        )
+        .await
+        .expect("a second peer is accepted after the first disconnected")
+        .unwrap();
+        assert_ne!(first, second);
+        assert!(!server.is_finished(), "the server must still be running");
+        assert!(
+            inspect
+                .sessions
+                .lock()
+                .await
+                .contains_key(&SessionId::new(first))
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -18200,6 +19323,10 @@ mod question_transport_tests {
                 assert_eq!(request.tool_call.tool_call_id.0.as_ref(),"exact-question-sdk-call");
                 assert_eq!(request.options.len(),3);
                 assert!(request.options.iter().all(|option|option.kind!=PermissionOptionKind::AllowAlways));
+                // An auto-approver picks the first allow-kind option: it must park, not answer.
+                let first_allow=request.options.iter().find(|option|option.kind==PermissionOptionKind::AllowOnce).unwrap();
+                assert!(first_allow.option_id.0.as_ref().ends_with(":new-message"));
+                assert_eq!(request.options.iter().filter(|option|option.kind==PermissionOptionKind::AllowOnce).count(),1);
                 let selected=match case {
                     "choice"=>format!("{id}:0:choice:0"),
                     "new-message"=>format!("{id}:0:new-message"),

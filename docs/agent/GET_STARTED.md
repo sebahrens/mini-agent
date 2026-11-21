@@ -491,8 +491,9 @@ With `--stream-json-control`, stdin is read while a turn runs and these lines ac
 (every one is acknowledged with `{"type":"control_response","response":{"subtype":"success"|"error","request_id":...}}`):
 
 - `{"type":"control_request","request_id":"x","request":{"subtype":"interrupt"}}` cancels the running
-  turn like the first SIGINT (the turn still emits its failed `result`; nothing is remembered when no
-  turn is running).
+  turn like the first SIGINT (the turn still emits its failed `result`). An interrupt sent right behind
+  its user message is kept until that turn listens; with no turn running or queued it is answered with
+  an `error` response and nothing is remembered.
 - `{"type":"control_request","request_id":"x","request":{"subtype":"set_permission_mode","mode":"readonly"}}`
   switches the mode but can only narrow it, like a prompt `%%mode=` directive; raising privilege is refused.
 - A tool `Ask` emits `{"type":"control_request","request_id":"perm_N","request":{"subtype":"can_use_tool","tool_name":...,"input":...,"truncated":bool}}`

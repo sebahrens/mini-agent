@@ -302,8 +302,9 @@ pub(crate) fn model_max_output_any_provider(model: &str) -> Option<u64> {
         .map(|&tokens| u64::from(tokens))
 }
 
-/// Provider names present in the catalog (tests iterate every listed model).
-#[cfg(test)]
+/// Provider names present in the catalog (tests iterate every listed model;
+/// the ACP model picker lists the baked models of usable providers).
+#[cfg(any(test, feature = "acp"))]
 pub(crate) fn catalog_provider_names() -> Vec<&'static str> {
     CATALOG.entries.keys().map(String::as_str).collect()
 }

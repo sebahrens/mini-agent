@@ -187,7 +187,11 @@ The default port when only `--acp-host` is given is `7243`.
 The server waits up to 300 seconds for the first authenticated peer by default;
 use `--acp-accept-timeout-secs` (or `acp_accept_timeout_secs`) to select a different
 deadline, or `0` to wait indefinitely. When it expires the server exits with an error;
-`--idle-exit` separately bounds a server that has served a peer.
+`--idle-exit` separately bounds a server that has served a peer. After an
+authenticated peer disconnects the listener keeps accepting the next one; the old
+peer's sessions stay dormant and `session/load` brings a thread back. Accepted
+connections enable TCP keepalive, and a write that makes no progress for 120 s
+closes the connection (a client that stopped reading cannot hold turns open).
 
 ### 5. Point your client at the agent
 
@@ -200,14 +204,14 @@ traffic, so a client without the key is rejected immediately.
 | Capability | Supported |
 |---|---|
 | `session/new`, `session/prompt`, `session/cancel`, `session/close` | Yes |
-| `session/load` (`loadSession`) | Yes — replays the saved transcript with the same titles, kinds and file locations as live updates |
+| `session/load` (`loadSession`) | Yes — replays the saved transcript with the same titles, kinds, file locations and edit diffs as live updates, restores the session's model, effort and persona (an unavailable one is named in a message), then sends the plan, usage and title. Reloading an id the process still holds with nothing running replaces it |
 | `session/list` (`sessionCapabilities.list`) | Yes — paged, 20 per page |
-| `session/set_mode` | Yes — the permission mode |
-| `session/set_config_option` | Yes — `model`, `effort` and persona |
+| `session/set_mode` | Yes — the permission mode (modes the managed policy forbids are not listed and are refused) |
+| `session/set_config_option` | Yes — `model` (quick models and catalogue models of providers with a credential), `effort` and persona |
 | Prompt content | Text, resource links, embedded text context and images (PNG, JPEG, GIF, WebP) |
 | `session/request_permission` | Yes — prompts appear in the editor UI |
 | Updates | Message and thought chunks, tool calls with live output previews, plan, available commands, usage and session info |
-| Max concurrent sessions | 64 |
+| Max concurrent sessions | 64 (`acp_max_sessions`); at the cap the least recently used idle session is evicted, and only a cap full of busy sessions refuses a new one |
 
 An image above 2 MiB is re-encoded to fit, like `/add` in the terminal UI; an
 image for a model the catalog lists as text-only is refused with a message
@@ -216,7 +220,8 @@ naming the model.
 Slash commands sent as the sole text block of a prompt (announced through
 `available_commands_update`): `/compact`, `/undo`, `/rename <name>`, `/cost`,
 `/model [alias|default]`, `/effort [level|default]`, `/cron …`, `/tasks`
-(`/tasks result <id>`, `/tasks cancel <id>`) and, with the goal feature,
+(`/tasks result <id>`, `/tasks cancel <id>`; each row shows the task's label and
+persona, and an unambiguous id prefix is enough) and, with the goal feature,
 `/goal`. `/compact`, `/undo`, `/rename` and `/goal <objective>` are refused on
 a session that holds provider-native conversation state (Anthropic with session
 persistence, after its first turn); the message names the command and says to

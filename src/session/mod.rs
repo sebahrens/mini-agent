@@ -555,6 +555,11 @@ pub enum PersistedToolMessage {
         /// guesses from the text).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_error: bool,
+        /// The bounded ACP diff content a finished edit/write published, so an
+        /// editor can replay the change after a reload. Display data only
+        /// (set by the ACP checkpoint; absent otherwise).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<serde_json::Value>,
     },
 }
 
@@ -958,6 +963,21 @@ pub(crate) enum MemoryPlacement {
     Messages,
 }
 
+/// See [`Session::acp_selection`].
+#[cfg(feature = "acp")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AcpSelection {
+    /// A `[quick_models]` alias.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) model: Option<String>,
+    /// A reasoning-effort wire name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) effort: Option<String>,
+    /// The persona (session mode) id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) persona: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: CompactString,
@@ -987,6 +1007,12 @@ pub struct Session {
         skip_serializing_if = "crate::provider::effort::SessionReasoning::is_default"
     )]
     pub(crate) reasoning_controls: crate::provider::effort::SessionReasoning,
+    /// An ACP session's own choices (model alias, effort, persona), kept so a
+    /// reload resumes on them. User selections only, never authority: the
+    /// loader re-validates every one against the current configuration.
+    #[cfg(feature = "acp")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) acp_selection: Option<AcpSelection>,
     #[serde(default)]
     pub(crate) memory_placement: MemoryPlacement,
     /// Bounded clarification data only: imported records never recreate a
@@ -1597,6 +1623,8 @@ impl Session {
             first_prompt: None,
             title_attempts: 0,
             reasoning_controls: Default::default(),
+            #[cfg(feature = "acp")]
+            acp_selection: None,
             memory_placement: MemoryPlacement::Messages,
             native_history: None,
             retired_native_history: Vec::new(),
@@ -2091,26 +2119,10 @@ impl Session {
                 images,
                 artifact_path,
                 is_error,
+                diff: None,
             }),
         );
         (content, artifact)
-    }
-
-    /// Flag stored tool results whose output `failed` recognises, so a replay
-    /// can show them as failed. Already-flagged rows are left alone.
-    #[cfg(feature = "acp")]
-    pub(crate) fn mark_failed_tool_results(&mut self, mut failed: impl FnMut(&str) -> bool) {
-        for message in &mut self.messages {
-            if let Some(PersistedToolMessage::Result {
-                output,
-                is_error: is_error @ false,
-                ..
-            }) = &mut message.tool
-                && failed(output)
-            {
-                *is_error = true;
-            }
-        }
     }
 
     /// Evidence that an imported/legacy transcript may contain prior model

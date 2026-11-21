@@ -224,6 +224,7 @@ async fn interactive_terminal_events_preserve_provider_replay_without_duplicate_
                     images: Vec::new(),
                     artifact_path: None,
                     is_error: false,
+                    diff: None,
                 })
             );
             assert!(session.messages[2].content.starts_with("read:\n"));
@@ -366,6 +367,7 @@ fn headless_turn_persists_tool_records_before_assistant_message() {
             images: Vec::new(),
             artifact_path: None,
             is_error: false,
+            diff: None,
         })
     );
 }

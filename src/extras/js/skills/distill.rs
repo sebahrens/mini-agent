@@ -1078,6 +1078,7 @@ mod tests {
                     images: Vec::new(),
                     artifact_path: None,
                     is_error: false,
+                    diff: None,
                 }),
             ),
         ]
@@ -1175,6 +1176,7 @@ mod tests {
                 images: Vec::new(),
                 artifact_path: None,
                 is_error: false,
+                diff: None,
             }),
         )];
         assert_eq!(

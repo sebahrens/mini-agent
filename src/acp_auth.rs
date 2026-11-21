@@ -13,6 +13,11 @@ const RESPONSE_DIGEST_LEN: usize = 64;
 const SHA256_BLOCK_LEN: usize = 64;
 const MAX_RESPONSE_BYTES: usize = 128;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Write timeout of an authenticated session socket. The session is driven
+/// through blocking writes; without a bound, a peer that stopped reading
+/// (asleep or gone without a FIN) would pin the writer thread, and the socket,
+/// forever. Reads stay unbounded: an idle editor is not a dead one.
+const SESSION_WRITE_TIMEOUT: Duration = Duration::from_secs(180);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AuthError {
@@ -66,7 +71,9 @@ fn authenticate_peer_with_timeout(
     }
 
     stream.set_read_timeout(None).map_err(|_| AuthError::Io)?;
-    stream.set_write_timeout(None).map_err(|_| AuthError::Io)?;
+    stream
+        .set_write_timeout(Some(SESSION_WRITE_TIMEOUT))
+        .map_err(|_| AuthError::Io)?;
     Ok(())
 }
 
