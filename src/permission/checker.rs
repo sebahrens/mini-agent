@@ -1646,9 +1646,17 @@ impl PermissionChecker {
             .unwrap_or_else(|| normalize_path(Path::new(&unresolved_abs_path)))
             .to_string_lossy()
             .into_owned();
-        let normalized_input = normalize_path(Path::new(&expanded))
-            .to_string_lossy()
-            .into_owned();
+        // A relative spelling that still climbs above its base (`../docs/x`)
+        // names no workspace-relative location, so it must not be matched
+        // against workspace-relative rules; the resolved path stands in.
+        let normalized_input = {
+            let lexical = normalize_path(Path::new(&expanded));
+            if lexical.components().next() == Some(std::path::Component::ParentDir) {
+                abs_path.clone()
+            } else {
+                lexical.to_string_lossy().into_owned()
+            }
+        };
         // Resolve `..` only after following existing symlink components. A
         // lexical rewrite of `link/../target` can otherwise change the path's
         // real subject before the external-workspace decision.
@@ -3294,19 +3302,7 @@ fn deny_rule_denial(rule: &str) -> CheckResult {
 pub(crate) const SESSION_SHELL_PREFIX_TOOL: &str = "shell_prefix";
 
 fn normalize_path(path: &Path) -> PathBuf {
-    let mut result = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::ParentDir => {
-                result.pop();
-            }
-            std::path::Component::CurDir => {}
-            other => {
-                result.push(other);
-            }
-        }
-    }
-    result
+    crate::fs::lexical_normalize(path)
 }
 
 /// Resolve symlinks in the existing portion of a path while permitting a

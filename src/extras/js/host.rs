@@ -1302,26 +1302,7 @@ struct ResolvedWriteTarget {
 }
 
 fn absolute_lexical(base: &Path, path: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let source = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        base.join(path)
-    };
-    let mut normalized = PathBuf::new();
-    for component in source.components() {
-        match component {
-            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
-            Component::RootDir => normalized.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            Component::Normal(part) => normalized.push(part),
-        }
-    }
-    normalized
+    crate::fs::absolute_lexical_from_base(base, path)
 }
 
 fn file_path_error(error: std::io::Error) -> EffectServiceError {
