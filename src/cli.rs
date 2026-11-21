@@ -1429,12 +1429,12 @@ pub struct Cli {
     pub status_socket: Option<String>,
 
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::SetTrue,
-          help = "Enable full logging (trace level) to a timestamped log file under the data directory")]
+          help = "Enable full logging (trace level) to a timestamped log file under the data directory; the 20 newest such logs and crash reports (none older than 14 days) are kept")]
     pub verbose: bool,
 
     #[arg(
         long = "log-file",
-        help = "Write logs to this file (overrides verbose default path)"
+        help = "Append logs to this file (overrides verbose default path); each run adds a start marker and an existing file is never truncated"
     )]
     pub log_file: Option<std::path::PathBuf>,
 

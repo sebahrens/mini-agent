@@ -66,8 +66,8 @@ fn inline_code_styled() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        joined.contains("`code`"),
-        "inline code should have backticks: {joined}"
+        joined.contains("Hello code world") && !joined.contains('`'),
+        "inline code is a span without backticks: {joined}"
     );
     assert!(
         joined.contains("Hello"),
@@ -113,8 +113,8 @@ fn inline_code_in_blockquote() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(
-        joined.contains('`'),
-        "inline code backticks should appear in blockquote: {joined}"
+        joined.contains("Some code here") && !joined.contains('`'),
+        "inline code is a span in a blockquote: {joined}"
     );
     assert!(
         joined.contains("Some"),
@@ -571,11 +571,143 @@ fn heading_levels_differ_by_attribute() {
 fn layout_marks_have_no_width_and_model_text_cannot_forge_them() {
     assert_eq!(
         display_width(
-            "\u{2061}\u{2062}\u{2063}\u{2064}\u{206A}\u{206B}\u{206C}\u{206D}\u{206E}\u{206F}"
+            "\u{2060}\u{2065}\u{2061}\u{2062}\u{2063}\u{2064}\u{206A}\u{206B}\u{206C}\u{206D}\u{206E}\u{206F}"
         ),
         0
     );
     let rows = markdown_to_styled("x\u{2061}y", 80);
     assert_eq!(rows[0].text, "xy");
     assert!(rows[0].syntax_spans.is_none());
+}
+
+fn rows80(text: &str) -> Vec<String> {
+    markdown_to_styled(text, 80)
+        .iter()
+        .map(|row| row.text.to_string())
+        .collect()
+}
+
+#[test]
+fn paragraphs_are_separated_by_one_blank_row() {
+    assert_eq!(rows80("one\n\ntwo"), ["one", "", "two"]);
+    assert_eq!(rows80("one\n\ntwo\n"), ["one", "", "two"]);
+    assert_eq!(
+        rows80("one\n\ntwo\n\nthree\n"),
+        ["one", "", "two", "", "three"]
+    );
+}
+
+#[test]
+fn soft_breaks_and_tight_lists_gain_no_blank_rows() {
+    assert_eq!(rows80("one\ntwo\n"), ["one", "two"]);
+    let rows = rows80("- a\n- b\n");
+    assert!(rows.iter().take(2).all(|row| !row.is_empty()), "{rows:?}");
+}
+
+#[test]
+fn paragraphs_inside_a_quote_and_a_loose_item_are_separated() {
+    let rows = rows80("> one\n>\n> two\n");
+    assert_eq!(&rows[..3], ["│ one", "", "│ two"], "{rows:?}");
+    let rows = rows80("- one\n\n  two\n\n- three\n");
+    let one = rows.iter().position(|r| r.ends_with("one")).unwrap();
+    assert_eq!(rows[one + 1], "", "{rows:?}");
+    assert!(rows[one + 2].ends_with("two"), "{rows:?}");
+}
+
+#[test]
+fn nested_quotes_keep_their_bars_after_the_inner_quote_ends() {
+    let rows = rows80("> a\n> > b\n>\n> c");
+    let b = rows.iter().find(|r| r.ends_with('b')).unwrap();
+    let c = rows.iter().find(|r| r.ends_with('c')).unwrap();
+    assert!(b.starts_with("│ │ "), "{rows:?}");
+    assert!(c.starts_with("│ ") && !c.starts_with("│ │"), "{rows:?}");
+    let color = |needle: char| {
+        markdown_to_styled("> a\n> > b\n>\n> c", 80)
+            .into_iter()
+            .find(|r| r.text.ends_with(needle))
+            .unwrap()
+            .color
+    };
+    assert_eq!(color('c'), Color::DarkGrey);
+}
+
+#[test]
+fn inline_code_is_a_colour_span_without_backticks() {
+    let rows = markdown_to_styled("Hello `code` world", 80);
+    assert_eq!(rows[0].text, "Hello code world");
+    let spans = rows[0].syntax_spans.as_ref().expect("code span");
+    assert_eq!(spans.len(), 1);
+    assert_eq!(&rows[0].text[spans[0].range.clone()], "code");
+    assert_eq!(
+        spans[0].color,
+        crate::ui::feed::ForegroundPalette::default().code
+    );
+}
+
+#[test]
+fn inline_code_keeps_backticks_in_monochrome_and_tables() {
+    let mono = crate::ui::markdown::markdown_with_code_state(
+        "Hello `code` world",
+        80,
+        crate::ui::feed::ForegroundPalette::default(),
+        false,
+        None,
+        None,
+        0,
+    );
+    assert_eq!(mono.lines[0].text, "Hello `code` world");
+    let table = rows80("| a |\n|---|\n| `x` |\n");
+    assert!(table.iter().any(|row| row.contains("`x`")), "{table:?}");
+}
+
+#[test]
+fn highlight_covers_common_languages_and_unknown_ones_stay_plain() {
+    for (lang, code) in [
+        ("yaml", "name: demo # note\n"),
+        ("yml", "key: 'v'\n"),
+        ("sql", "SELECT id FROM users WHERE id = 1 -- c\n"),
+        ("html", "<div class=\"a\">x</div>\n"),
+        ("css", "a { color: red; }\n"),
+        ("ruby", "def foo\n  puts 1\nend\n"),
+        ("php", "function f() { return 1; }\n"),
+        ("kotlin", "fun main() { val x = 1 }\n"),
+        ("swift", "func f() { let x = 1 }\n"),
+        ("cs", "public class A { }\n"),
+        ("lua", "local x = 1 -- c\n"),
+        ("dockerfile", "FROM rust:1\nRUN ls\n"),
+        ("go", "func main() { go f() }\n"),
+        ("java", "public class A { }\n"),
+        ("console", "$ echo hi\n"),
+    ] {
+        let rows = markdown_to_styled(&format!("```{lang}\n{code}```\n"), 80);
+        assert!(
+            rows.iter().any(|r| r.syntax_spans.is_some()),
+            "{lang} should highlight"
+        );
+    }
+    let rows = markdown_to_styled("```brainfuck\n+++\n```\n", 80);
+    assert!(rows.iter().all(|r| r.syntax_spans.is_none()));
+}
+
+#[test]
+fn sql_keywords_match_in_any_case_and_go_has_its_own_set() {
+    use crate::ui::feed::ForegroundPalette;
+    let palette = ForegroundPalette::default();
+    let mut sql = crate::ui::highlight::CodeState::new("sql").unwrap();
+    let spans = sql.line("select 1", palette).unwrap();
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.color == palette.link && s.range == (0..6))
+    );
+    let mut go = crate::ui::highlight::CodeState::new("go").unwrap();
+    let spans = go.line("defer f()", palette).unwrap();
+    assert!(
+        spans
+            .iter()
+            .any(|s| s.color == palette.link && s.range == (0..5))
+    );
+    let mut c = crate::ui::highlight::CodeState::new("c").unwrap();
+    let spans = c.line("defer f()", palette).unwrap();
+    assert!(spans.iter().all(|s| s.color != palette.link));
 }

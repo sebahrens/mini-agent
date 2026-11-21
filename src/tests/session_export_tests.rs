@@ -45,14 +45,19 @@ fn markdown75_preserves_transcript_order_and_structured_tool_arguments() {
         last = position;
     }
     let blocks = markdown75_blocks(&markdown);
-    assert_eq!(blocks.len(), 6);
-    assert_eq!(blocks[1], "hello there\n");
-    assert_eq!(blocks[2], "hi! **how** can I help?\n");
-    let call: serde_json::Value = serde_json::from_str(&blocks[3]).unwrap();
+    // Conversation text is Markdown; only metadata, the call and its result
+    // stay fenced.
+    assert_eq!(blocks.len(), 4);
+    assert!(markdown.contains("\nhello there\n"), "{markdown}");
+    assert!(
+        markdown.contains("\nhi! **how** can I help?\n"),
+        "{markdown}"
+    );
+    let call: serde_json::Value = serde_json::from_str(&blocks[1]).unwrap();
     assert_eq!(call["name"], "bash");
     assert_eq!(call["arguments"], serde_json::json!({"command": "ls -la"}));
     assert_eq!(call["call_id"], "call-export");
-    assert_eq!(blocks[5], "total 0\n");
+    assert_eq!(blocks[3], "total 0\n");
     assert!(!markdown.contains("stale display projection"));
 
     let private_session = compacted_session_with_provider_reasoning();
@@ -72,9 +77,11 @@ fn markdown75_nested_fences_and_authored_metadata_remain_literal() {
     session.add_message(MessageRole::Assistant, body);
     let markdown = session_to_markdown(&session);
     let blocks = markdown75_blocks(&markdown);
-    assert_eq!(blocks.len(), 3);
-    assert_eq!(blocks[1], body);
-    assert_eq!(blocks[2], body);
+    // The unterminated outer fence is closed, so it cannot swallow what follows.
+    assert_eq!(blocks.len(), 3, "{markdown}");
+    let inner = "<script>alert(1)</script>\n```\n![image](https://example.invalid)\n";
+    assert_eq!(blocks[1], inner);
+    assert_eq!(blocks[2], inner);
     let mut headings = 0;
     for event in pulldown_cmark::Parser::new_ext(&markdown, Options::ENABLE_STRIKETHROUGH) {
         match event {
@@ -1009,4 +1016,57 @@ fn exports_mark_an_unpriced_cost_instead_of_printing_zero_dollars() {
         markdown.contains("\"cost_incomplete\":true")
             || markdown.contains("\"cost_incomplete\": true")
     );
+}
+
+#[test]
+fn markdown56_conversation_text_exports_as_markdown_with_html_neutralised() {
+    let mut session = Session::new("p", "m", 1000, "");
+    session.add_message(MessageRole::User, "<script>alert(1)</script> please");
+    session.add_message(
+        MessageRole::Assistant,
+        "# Plan\n\n- one\n- two `<b>kept</b>`\n\n```rust\nlet a = 1 < 2;\n```\n\n[bad](javascript:alert(1)) and [ok](https://example.com)\n\n<img src=x onerror=alert(1)>\n",
+    );
+    let markdown = session_to_markdown(&session);
+    assert!(
+        markdown.contains("\n# Plan\n\n- one\n- two `<b>kept</b>`\n"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("```rust\nlet a = 1 < 2;\n```"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("&lt;script&gt;alert(1)&lt;/script&gt; please"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("\\[bad](javascript:alert(1))"),
+        "{markdown}"
+    );
+    assert!(markdown.contains("[ok](https://example.com)"), "{markdown}");
+    use pulldown_cmark::{Event, Tag};
+    for event in pulldown_cmark::Parser::new(&markdown) {
+        match event {
+            Event::Html(_) | Event::InlineHtml(_) => panic!("active HTML: {markdown}"),
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                assert!(!dest_url.starts_with("javascript"), "{markdown}")
+            }
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn markdown56_compactions_are_noted_with_their_sidecar() {
+    let session = compacted_session_with_provider_reasoning();
+    let markdown = session_to_markdown(&session);
+    assert!(
+        markdown.contains("2 messages were summarised by compaction 1"),
+        "{markdown}"
+    );
+    assert!(markdown.contains(".precompact-1.jsonl"), "{markdown}");
 }

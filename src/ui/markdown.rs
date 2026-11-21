@@ -34,23 +34,56 @@ pub(crate) fn word_wrap_flagged(
     lines
 }
 
-fn word_wrap_each(text: &str, max_width: usize, mut emit: impl FnMut(CompactString, Cont)) {
+/// `word_wrap_flagged` whose first row is `first_indent` columns narrower, for
+/// text whose first row is shifted right by a prefix added later.
+pub(crate) fn word_wrap_flagged_first(
+    text: &str,
+    max_width: usize,
+    first_indent: usize,
+) -> SmallVec<[(CompactString, Cont); 4]> {
+    let mut lines: SmallVec<[(CompactString, Cont); 4]> = SmallVec::new();
+    let first_width = if max_width > first_indent + 1 {
+        max_width - first_indent
+    } else {
+        max_width
+    };
+    word_wrap_each_first(text, first_width, max_width, |chunk, cont| {
+        lines.push((chunk, cont))
+    });
+    lines
+}
+
+fn word_wrap_each(text: &str, max_width: usize, emit: impl FnMut(CompactString, Cont)) {
+    word_wrap_each_first(text, max_width, max_width, emit);
+}
+
+/// Wrap `text` with the first row limited to `first_width` columns and the
+/// following rows to `max_width`.
+fn word_wrap_each_first(
+    text: &str,
+    first_width: usize,
+    max_width: usize,
+    mut emit: impl FnMut(CompactString, Cont),
+) {
     // Display width never exceeds the byte length, so short text fits without
     // being measured.
-    if text.is_empty() || max_width == 0 || text.len() <= max_width {
+    if text.is_empty() || max_width == 0 || text.len() <= first_width {
         emit(CompactString::from(text), Cont::None);
         return;
     }
-    if display_width(text) <= max_width {
+    if display_width(text) <= first_width {
         emit(CompactString::from(text), Cont::None);
         return;
     }
+    // The limit of the row being filled: `first_width` until a row is emitted.
+    let limit = std::cell::Cell::new(first_width);
 
     let emitted = std::cell::Cell::new(false);
     let mut start_cont = Cont::None;
     let mut push = |chunk: CompactString, next: Cont, start_cont: &mut Cont| {
         emit(chunk, *start_cont);
         emitted.set(true);
+        limit.set(max_width);
         *start_cont = next;
     };
     let mut line = String::new();
@@ -59,7 +92,7 @@ fn word_wrap_each(text: &str, max_width: usize, mut emit: impl FnMut(CompactStri
     // Keep a line's own indentation on its first row (a line that fits keeps
     // it through the fast path above); cap it so the text still gets room.
     let body = text.trim_start_matches(' ');
-    let indent = (text.len() - body.len()).min(max_width / 2);
+    let indent = (text.len() - body.len()).min(limit.get() / 2);
     if indent > 0 && !body.is_empty() {
         line.push_str(&text[..indent]);
         line_width = indent;
@@ -78,17 +111,17 @@ fn word_wrap_each(text: &str, max_width: usize, mut emit: impl FnMut(CompactStri
         let word_w = trimmed_w + display_width(&word[word_trimmed.len()..]);
 
         if word_trimmed.is_empty() {
-            if line_width > 0 && line_width < max_width {
+            if line_width > 0 && line_width < limit.get() {
                 line.push(' ');
                 line_width += 1;
             }
             continue;
         }
 
-        if line_width + word_w <= max_width {
+        if line_width + word_w <= limit.get() {
             line.push_str(word);
             line_width += word_w;
-        } else if !line.is_empty() && line_width + 1 + trimmed_w <= max_width {
+        } else if !line.is_empty() && line_width + 1 + trimmed_w <= limit.get() {
             line.push(' ');
             line.push_str(word_trimmed);
             line_width += 1 + trimmed_w;
@@ -107,10 +140,10 @@ fn word_wrap_each(text: &str, max_width: usize, mut emit: impl FnMut(CompactStri
             line.clear();
             line_width = 0;
 
-            if trimmed_w > max_width {
+            if trimmed_w > limit.get() {
                 for ch in word_trimmed.chars() {
                     let cw = super::utils::char_display_width(ch);
-                    if cw > max_width {
+                    if cw > limit.get() {
                         if !line.is_empty() {
                             push(CompactString::from(&line), Cont::Split, &mut start_cont);
                             line.clear();
@@ -123,7 +156,7 @@ fn word_wrap_each(text: &str, max_width: usize, mut emit: impl FnMut(CompactStri
                         );
                         continue;
                     }
-                    if line_width + cw > max_width && !line.is_empty() {
+                    if line_width + cw > limit.get() && !line.is_empty() {
                         push(CompactString::from(&line), Cont::Split, &mut start_cont);
                         line.clear();
                         line_width = 0;
@@ -163,16 +196,24 @@ fn blank_row(color: Color) -> LineEntry {
     }
 }
 
-fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>) {
+fn flush_acc(
+    acc: &str,
+    color: Color,
+    max_width: usize,
+    first_indent: usize,
+    out: &mut Vec<LineEntry>,
+) {
     if acc.is_empty() {
         return;
     }
+    // Only the very first row of the layout leaves room for the caller's prefix.
+    let mut first_indent = if out.is_empty() { first_indent } else { 0 };
     for line in acc.split('\n') {
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
             out.push(blank_row(color));
         } else {
-            for (chunk, cont) in word_wrap_flagged(trimmed, max_width) {
+            for (chunk, cont) in word_wrap_flagged_first(trimmed, max_width, first_indent) {
                 out.push(LineEntry {
                     syntax_spans: None,
                     text: chunk,
@@ -182,14 +223,17 @@ fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>
                     lead: 0,
                 });
             }
+            first_indent = 0;
         }
     }
 }
 
 /// Flush `acc` as quoted paragraph text: every wrapped row carries the `│ `
 /// bar (its two columns are `lead`, so copying skips them).
-fn flush_quote(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>) {
-    let width = max_width.saturating_sub(2).max(1);
+fn flush_quote(acc: &str, color: Color, max_width: usize, depth: usize, out: &mut Vec<LineEntry>) {
+    let bar = "│ ".repeat(depth.max(1));
+    let bar_width = 2 * depth.max(1);
+    let width = max_width.saturating_sub(bar_width).max(1);
     for line in acc.split('\n') {
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
@@ -199,11 +243,11 @@ fn flush_quote(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntr
         for (chunk, cont) in word_wrap_flagged(trimmed, width) {
             out.push(LineEntry {
                 syntax_spans: None,
-                text: CompactString::from(format!("│ {chunk}")),
+                text: CompactString::from(format!("{bar}{chunk}")),
                 color,
                 theme_accent: false,
                 cont,
-                lead: "│ ".len() as u8,
+                lead: bar.len().min(u8::MAX as usize) as u8,
             });
         }
     }
@@ -260,6 +304,9 @@ struct ListCtx {
     frames: Vec<ListFrame>,
     marker: Option<String>,
     indent: usize,
+    /// Columns the caller reserves on the layout's very first row (a prefix it
+    /// adds afterwards), so that row wraps early instead of being re-wrapped.
+    first_indent: usize,
 }
 
 impl ListCtx {
@@ -295,7 +342,7 @@ fn flush_text(
         return;
     }
     if lists.frames.is_empty() {
-        flush_acc(acc, color, max_width, out);
+        flush_acc(acc, color, max_width, lists.first_indent, out);
         return;
     }
     let indent = lists.indent;
@@ -320,7 +367,7 @@ fn flush_links(links: &mut Vec<String>, max_width: usize, out: &mut Vec<LineEntr
 
 /// Hard-wrap one code row at `max_width` display columns (no whitespace
 /// collapsing), splitting its syntax spans at the cuts.
-fn push_code_rows(
+pub(crate) fn push_code_rows(
     out: &mut Vec<LineEntry>,
     text: &str,
     spans: Option<std::sync::Arc<[super::highlight::TokenSpan]>>,
@@ -399,6 +446,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
         super::highlight::within_budget(text),
         None,
         None,
+        0,
     )
     .lines
 }
@@ -419,6 +467,7 @@ pub(crate) fn markdown_with_code_state(
     highlighting: bool,
     mut entry_code_state: Option<super::highlight::CodeState>,
     token_cache: Option<&std::cell::RefCell<super::highlight::TokenCache>>,
+    first_indent: usize,
 ) -> StyledMarkdown {
     if text.is_empty() {
         return StyledMarkdown {
@@ -445,7 +494,10 @@ pub(crate) fn markdown_with_code_state(
     let mut in_heading = false;
     let mut in_code_block = false;
     let mut in_blockquote = false;
-    let mut lists = ListCtx::default();
+    let mut lists = ListCtx {
+        first_indent,
+        ..ListCtx::default()
+    };
     let mut pending_links: Vec<String> = Vec::new();
     // Byte range of the link text in `acc`, to colour a paragraph that is one link.
     // Whether the current paragraph holds link text and text outside a link,
@@ -461,9 +513,24 @@ pub(crate) fn markdown_with_code_state(
     let mut link_url = String::new();
     let mut in_table_cell = false;
 
-    for event in parser {
+    // Blockquote nesting depth; `in_blockquote` mirrors `quote_depth > 0`.
+    let mut quote_depth: usize = 0;
+    // Whether the previous block in the open quote or list item was a
+    // paragraph, so the next paragraph is separated from it by a blank row.
+    let mut prev_para_in_container = false;
+
+    for (event, range) in parser.into_offset_iter() {
         match event {
             Event::Start(tag) => match tag {
+                Tag::Paragraph
+                    if prev_para_in_container && (in_blockquote || !lists.frames.is_empty()) =>
+                {
+                    result.push(blank_row(if in_blockquote {
+                        Color::DarkGrey
+                    } else {
+                        Color::White
+                    }));
+                }
                 Tag::Paragraph => {}
                 Tag::Heading { level, .. } => {
                     flush_text(&acc, Color::White, max_width, &mut lists, &mut result);
@@ -502,7 +569,9 @@ pub(crate) fn markdown_with_code_state(
                 Tag::BlockQuote(_) => {
                     flush_text(&acc, Color::White, max_width, &mut lists, &mut result);
                     acc.clear();
+                    quote_depth += 1;
                     in_blockquote = true;
+                    prev_para_in_container = false;
                 }
                 Tag::List(start) => {
                     let color = if in_blockquote {
@@ -512,6 +581,7 @@ pub(crate) fn markdown_with_code_state(
                     };
                     flush_text(&acc, color, max_width, &mut lists, &mut result);
                     acc.clear();
+                    prev_para_in_container = false;
                     lists.frames.push(ListFrame {
                         ordered: start.is_some(),
                         next: start.unwrap_or(1),
@@ -526,6 +596,7 @@ pub(crate) fn markdown_with_code_state(
                     };
                     flush_text(&acc, color, max_width, &mut lists, &mut result);
                     acc.clear();
+                    prev_para_in_container = false;
                     lists.start_item(color);
                 }
                 Tag::FootnoteDefinition(_) => {}
@@ -574,12 +645,20 @@ pub(crate) fn markdown_with_code_state(
                     para_link = false;
                     para_other = false;
                     if in_blockquote && lists.frames.is_empty() {
-                        flush_quote(&acc, color, max_width, &mut result);
+                        flush_quote(&acc, color, max_width, quote_depth, &mut result);
                     } else {
                         flush_text(&acc, color, max_width, &mut lists, &mut result);
                     }
                     acc.clear();
                     flush_links(&mut pending_links, max_width, &mut result);
+                    if in_blockquote || !lists.frames.is_empty() {
+                        prev_para_in_container = true;
+                    } else if paragraph_has_successor(text, range.end) {
+                        // The separator is part of the paragraph's own region
+                        // so a streamed region and a whole-text parse agree;
+                        // the last paragraph of the text gets none.
+                        result.push(blank_row(Color::White));
+                    }
                 }
                 TagEnd::Heading(_) => {
                     match heading_level.take() {
@@ -590,7 +669,13 @@ pub(crate) fn markdown_with_code_state(
                         Some(pulldown_cmark::HeadingLevel::H2) => acc.push(BOLD_OFF),
                         _ => acc.push(ITAL_OFF),
                     }
-                    flush_acc(&acc, Color::Cyan, max_width, &mut result);
+                    flush_acc(
+                        &acc,
+                        Color::Cyan,
+                        max_width,
+                        lists.first_indent,
+                        &mut result,
+                    );
                     acc.clear();
                     para_link = false;
                     para_other = false;
@@ -657,7 +742,9 @@ pub(crate) fn markdown_with_code_state(
                             });
                         } else {
                             prefixed.clear();
-                            prefixed.push_str("│ ");
+                            for _ in 0..quote_depth.max(1) {
+                                prefixed.push_str("│ ");
+                            }
                             prefixed.push_str(trimmed);
                             for chunk in word_wrap(&prefixed, max_width) {
                                 quoted.push(LineEntry {
@@ -673,15 +760,12 @@ pub(crate) fn markdown_with_code_state(
                     }
                     result.extend(quoted);
                     acc.clear();
-                    in_blockquote = false;
-                    result.push(LineEntry {
-                        syntax_spans: None,
-                        text: CompactString::new(""),
-                        color: Color::White,
-                        theme_accent: false,
-                        cont: Cont::None,
-                        lead: 0,
-                    });
+                    quote_depth = quote_depth.saturating_sub(1);
+                    in_blockquote = quote_depth > 0;
+                    prev_para_in_container = false;
+                    if quote_depth == 0 {
+                        result.push(blank_row(Color::White));
+                    }
                 }
                 TagEnd::Item => {
                     let color = if in_blockquote {
@@ -777,14 +861,30 @@ pub(crate) fn markdown_with_code_state(
                 if !in_link {
                     para_other = true;
                 }
+                // Styled as a colour span without the backticks; the literal
+                // backticks stay where colour cannot carry the distinction
+                // (monochrome, table cells).
+                let styled = highlighting && !in_table_cell;
                 let target = if in_table_cell {
                     &mut table_cell
                 } else {
                     &mut acc
                 };
-                target.push('`');
-                target.push_str(&t);
-                target.push('`');
+                if styled {
+                    target.push(CODE_ON);
+                } else {
+                    target.push('`');
+                }
+                if !styled || !t.chars().any(is_mark) {
+                    target.push_str(&t);
+                } else {
+                    target.extend(t.chars().filter(|c| !is_mark(*c)));
+                }
+                if styled {
+                    target.push(CODE_OFF);
+                } else {
+                    target.push('`');
+                }
             }
             Event::SoftBreak | Event::HardBreak => {
                 if in_table_cell {
@@ -794,7 +894,7 @@ pub(crate) fn markdown_with_code_state(
                 }
             }
             Event::Rule => {
-                flush_acc(&acc, Color::White, max_width, &mut result);
+                flush_acc(&acc, Color::White, max_width, 0, &mut result);
                 acc.clear();
                 let rule: String = "\u{2500}".repeat(max_width.min(40));
                 result.push(LineEntry {
@@ -852,7 +952,7 @@ pub(crate) fn markdown_with_code_state(
         } else {
             Color::White
         };
-        flush_acc(&acc, color, max_width, &mut result);
+        flush_acc(&acc, color, max_width, lists.first_indent, &mut result);
     }
 
     apply_marks(&mut result, palette);
@@ -875,9 +975,18 @@ const LINK_ON: char = '\u{206C}';
 const LINK_OFF: char = '\u{206D}';
 const UNDER_ON: char = '\u{206E}';
 const UNDER_OFF: char = '\u{206F}';
+const CODE_ON: char = '\u{2060}';
+const CODE_OFF: char = '\u{2065}';
+
+/// Whether a paragraph ending at byte `end` of `text` is followed by anything
+/// (a blank line or another block), so it needs a separator row after it.
+fn paragraph_has_successor(text: &str, end: usize) -> bool {
+    let rest = &text[end.min(text.len())..];
+    !rest.is_empty()
+}
 
 fn is_mark(c: char) -> bool {
-    matches!(c, '\u{2061}'..='\u{2064}' | '\u{206A}'..='\u{206F}')
+    matches!(c, '\u{2060}'..='\u{2065}' | '\u{206A}'..='\u{206F}')
 }
 
 /// Replace layout marks in `rows` with attribute spans (bold, italic,
@@ -885,14 +994,14 @@ fn is_mark(c: char) -> bool {
 /// wrapped rows.
 fn apply_marks(rows: &mut [LineEntry], palette: super::feed::ForegroundPalette) {
     use super::highlight::{ATTR_BOLD, ATTR_ITALIC, ATTR_STRIKE, ATTR_UNDERLINE, TokenSpan};
-    // bold, italic, strike, underline, link
-    let mut open = [0i32; 5];
+    // bold, italic, strike, underline, link, code
+    let mut open = [0i32; 6];
     for row in rows {
         let active = open.iter().any(|count| *count > 0);
         if !active && (!row.text.bytes().any(|b| b == 0xE2) || !row.text.chars().any(is_mark)) {
             continue;
         }
-        let state = |open: &[i32; 5]| {
+        let state = |open: &[i32; 6]| {
             let mut attrs = 0u8;
             for (count, bit) in
                 open[..4]
@@ -903,21 +1012,28 @@ fn apply_marks(rows: &mut [LineEntry], palette: super::feed::ForegroundPalette) 
                     attrs |= bit;
                 }
             }
-            (attrs, open[4] > 0)
+            (attrs, open[4] > 0, open[5] > 0)
         };
         let mut clean = String::with_capacity(row.text.len());
         let mut spans: Vec<TokenSpan> = Vec::new();
         let mut seg_start = 0;
         let mut current = state(&open);
-        let close = |spans: &mut Vec<TokenSpan>, start: usize, end: usize, cur: (u8, bool)| {
-            if (cur.0 != 0 || cur.1) && end > start {
-                spans.push(TokenSpan {
-                    range: start..end,
-                    color: if cur.1 { palette.link } else { Color::Reset },
-                    attrs: cur.0,
-                });
-            }
-        };
+        let close =
+            |spans: &mut Vec<TokenSpan>, start: usize, end: usize, cur: (u8, bool, bool)| {
+                if (cur.0 != 0 || cur.1 || cur.2) && end > start {
+                    spans.push(TokenSpan {
+                        range: start..end,
+                        color: if cur.2 {
+                            palette.code
+                        } else if cur.1 {
+                            palette.link
+                        } else {
+                            Color::Reset
+                        },
+                        attrs: cur.0,
+                    });
+                }
+            };
         for c in row.text.chars() {
             if is_mark(c) {
                 close(&mut spans, seg_start, clean.len(), current);
@@ -931,7 +1047,9 @@ fn apply_marks(rows: &mut [LineEntry], palette: super::feed::ForegroundPalette) 
                     UNDER_ON => open[3] += 1,
                     UNDER_OFF => open[3] = (open[3] - 1).max(0),
                     LINK_ON => open[4] += 1,
-                    _ => open[4] = (open[4] - 1).max(0),
+                    LINK_OFF => open[4] = (open[4] - 1).max(0),
+                    CODE_ON => open[5] += 1,
+                    _ => open[5] = (open[5] - 1).max(0),
                 }
                 seg_start = clean.len();
                 current = state(&open);

@@ -400,7 +400,7 @@ async fn actual_permission_stop_retires_exact_run_denies_backlog_and_stages_next
             "{transcript}"
         );
         assert!(
-            transcript.contains("dropped 2 queued inputs"),
+            transcript.contains("2 queued inputs returned"),
             "{transcript}"
         );
         // A request sent after the retired generation is never displayed

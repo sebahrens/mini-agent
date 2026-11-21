@@ -801,3 +801,29 @@ fn replayed_tool_results_carry_the_persisted_is_error_flag() {
         .collect::<Vec<_>>();
     assert_eq!(flags, vec![Some(true), None]);
 }
+
+#[test]
+fn a_whitespace_only_assistant_row_before_a_tool_call_is_not_replayed() {
+    let mut session = sample_session();
+    session.add_message(MessageRole::User, "go");
+    session.add_message(MessageRole::Assistant, "\n");
+    session.add_tool_call_with_id("call_1", "shell", &serde_json::json!({"command": "ls"}));
+    session.add_tool_result_with_id("call_1", "shell", "ok");
+    session.add_message(MessageRole::Assistant, "done");
+    let history = convert_history(&session);
+    for message in &history {
+        if let Message::Assistant { content, .. } = message {
+            for item in content.iter() {
+                if let AssistantContent::Text(text) = item {
+                    assert!(!text.text.trim().is_empty(), "{history:?}");
+                }
+            }
+        }
+    }
+    assert!(
+        history
+            .iter()
+            .any(|m| matches!(m, Message::Assistant { content, .. }
+        if content.iter().any(|c| matches!(c, AssistantContent::ToolCall(_)))))
+    );
+}

@@ -44,8 +44,27 @@ pub fn resolve_crash_log_path() -> PathBuf {
 pub fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        crate::ui::terminal::restore_for_panic();
-        if let Some(path) = write_crash_report(info) {
+        use crate::ui::terminal::PanicScope;
+        let scope = crate::ui::terminal::panic_scope();
+        if scope != PanicScope::Background {
+            crate::ui::terminal::restore_for_panic();
+        }
+        let report = write_crash_report(info);
+        if scope == PanicScope::Background {
+            // The TUI keeps running and owns the screen: writing to stderr
+            // would corrupt it and tearing the terminal down would leave the
+            // event loop painting on a cooked main screen. Tell the user in
+            // the feed instead.
+            let line = match &report {
+                Some(path) => format!("internal task panicked; crash report at {}", path.display()),
+                None => "internal task panicked (no crash report could be written)".to_string(),
+            };
+            if !crate::ui::post_notice(line) {
+                tracing::error!("background panic while the TUI notice channel is closed");
+            }
+            return;
+        }
+        if let Some(path) = report {
             eprintln!("crash report written to {}", path.display());
         }
         default_hook(info);
@@ -304,7 +323,7 @@ pub fn init(cli: &Cli, is_interactive: bool) {
     let file_filter = build_file_filter();
 
     let stderr_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(!is_interactive)
+        .with_ansi(stderr_ansi_enabled())
         .with_writer(move || {
             match display_target(is_interactive, crate::ui::terminal::tui_owns_terminal()) {
                 DisplayTarget::Suppressed => LogWriter::Sink,
@@ -333,10 +352,12 @@ pub fn init(cli: &Cli, is_interactive: bool) {
     if let Some(ref path) = log_path {
         match open_private_log(path, cli.log_file.is_none()) {
             Ok(file) => {
-                let file_layer = tracing_subscriber::fmt::layer()
-                    .with_writer(Mutex::new(file))
-                    .with_filter(file_filter);
-                registry.with(file_layer).init();
+                if cli.log_file.is_some() {
+                    write_run_marker(&file);
+                } else {
+                    prune_auto_logs_in_background();
+                }
+                registry.with(file_layer(file, file_filter)).init();
                 return;
             }
             Err(e) => {
@@ -350,6 +371,112 @@ pub fn init(cli: &Cli, is_interactive: bool) {
     }
 
     registry.init();
+}
+
+/// The log-file sink. It is never coloured: escape sequences break grep and
+/// editors (mini-agent-nvnkx.155).
+fn file_layer<S>(file: fs::File, filter: EnvFilter) -> impl Layer<S>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer()
+        .with_ansi(false)
+        .with_writer(Mutex::new(file))
+        .with_filter(filter)
+}
+
+/// Colour on stderr only when it is a terminal and `NO_COLOR` is unset.
+fn stderr_ansi_enabled() -> bool {
+    use std::io::IsTerminal;
+    io::stderr().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+}
+
+/// An explicit `--log-file` is appended to, so a later or concurrent run never
+/// erases the log the user was about to inspect; each run starts with a marker.
+fn write_run_marker(mut file: &fs::File) {
+    let now = local_rfc3339(&jiff::ZonedDateTime::now());
+    let _ = writeln!(
+        file,
+        "--- mini-agent run started {now} pid {} ---",
+        std::process::id()
+    );
+}
+
+/// Auto-named `-v` logs and crash reports kept besides the current one.
+const KEEP_AUTO_FILES: usize = 20;
+/// Auto-named files older than this are removed.
+const KEEP_AUTO_DAYS: u64 = 14;
+
+/// Remove stale files in `dir` named `prefix*suffix`: all but the newest `keep`
+/// and any older than `max_age`. Only regular files are touched (never
+/// symlinks, directories or other names), and `current` is never removed.
+/// Returns how many were removed.
+pub(crate) fn prune_stale_files(
+    dir: &std::path::Path,
+    matches: impl Fn(&str) -> bool,
+    current: Option<&std::path::Path>,
+    keep: usize,
+    max_age: std::time::Duration,
+) -> usize {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let mut files: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name();
+            let name = name.to_str()?;
+            if !matches(name) {
+                return None;
+            }
+            let path = entry.path();
+            if current == Some(path.as_path()) {
+                return None;
+            }
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            if !metadata.file_type().is_file() {
+                return None;
+            }
+            Some((metadata.modified().ok()?, path))
+        })
+        .collect();
+    files.sort_by_key(|file| std::cmp::Reverse(file.0));
+    let mut removed = 0;
+    for (index, (modified, path)) in files.iter().enumerate() {
+        let too_old = now.duration_since(*modified).is_ok_and(|age| age > max_age);
+        if (index >= keep || too_old) && fs::remove_file(path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn is_auto_log_name(name: &str) -> bool {
+    name.starts_with("mini-agent-")
+        && !name.starts_with("mini-agent-crash-")
+        && name.ends_with(".log")
+}
+
+fn is_crash_log_name(name: &str) -> bool {
+    name.starts_with("mini-agent-crash-") && name.ends_with(".log")
+}
+
+/// Prune old auto-named logs and crash reports on a detached thread so startup
+/// is not delayed.
+fn prune_auto_logs_in_background() {
+    let Ok(paths) = crate::paths::process_paths_ref() else {
+        return;
+    };
+    let logs = paths.logs_dir();
+    let crashes = paths.crash_logs_dir();
+    let _ = std::thread::Builder::new()
+        .name("log-retention".into())
+        .spawn(move || {
+            let max_age = std::time::Duration::from_secs(KEEP_AUTO_DAYS * 24 * 60 * 60);
+            prune_stale_files(&logs, is_auto_log_name, None, KEEP_AUTO_FILES, max_age);
+            prune_stale_files(&crashes, is_crash_log_name, None, KEEP_AUTO_FILES, max_age);
+        });
 }
 
 enum LogWriter {
@@ -395,9 +522,8 @@ fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<
         ensure_private_log_directory(parent)?;
     }
     let file = fs::OpenOptions::new()
-        .write(true)
         .create(true)
-        .truncate(true)
+        .append(true)
         .mode(0o600)
         .custom_flags(OPEN_NOFOLLOW)
         .open(path)?;
@@ -414,9 +540,8 @@ fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<
         ensure_private_log_directory(parent)?;
     }
     fs::OpenOptions::new()
-        .write(true)
         .create(true)
-        .truncate(true)
+        .append(true)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
 }
@@ -426,11 +551,7 @@ fn open_private_log(path: &std::path::Path, prepare_parent: bool) -> io::Result<
     if prepare_parent && let Some(parent) = path.parent() {
         ensure_private_log_directory(parent)?;
     }
-    fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)
+    fs::OpenOptions::new().create(true).append(true).open(path)
 }
 
 #[cfg(test)]
@@ -582,5 +703,116 @@ mod rfc3339_tests {
             .unwrap()
             .to_zoned_datetime(jiff::tz::TimeZone::fixed(jiff::tz::Offset::constant(1)));
         assert_eq!(local_rfc3339(&plus_one), "2026-12-11T15:40:00+01:00");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod retention_tests {
+    use super::*;
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("ma-log-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn file_sink_never_contains_escape_bytes() {
+        let dir = temp_dir("ansi");
+        let path = dir.join("run.log");
+        let file = open_private_log(&path, true).unwrap();
+        let subscriber =
+            tracing_subscriber::registry().with(file_layer(file, EnvFilter::new("debug")));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::warn!("coloured? no");
+            tracing::debug!(key = "value", "second record");
+        });
+        let bytes = fs::read(&path).unwrap();
+        assert!(!bytes.is_empty());
+        assert!(
+            !bytes.contains(&0x1b),
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_explicit_log_file_is_appended_to_not_truncated() {
+        let dir = temp_dir("append");
+        let path = dir.join("run.log");
+        for run in ["first", "second"] {
+            let file = open_private_log(&path, false).unwrap();
+            write_run_marker(&file);
+            writeln!(&file, "{run} run line").unwrap();
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("first run line") && text.contains("second run line"),
+            "{text}"
+        );
+        assert_eq!(text.matches("run started").count(), 2, "{text}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stale_auto_logs_are_pruned_and_other_names_and_symlinks_survive() {
+        let dir = temp_dir("prune");
+        let current = dir.join("mini-agent-2099-01-01_00-00-00_1.log");
+        fs::write(&current, "current").unwrap();
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        for index in 0..30u64 {
+            let path = dir.join(format!(
+                "mini-agent-2000-01-01_00-00-{index:02}_{index}.log"
+            ));
+            fs::write(&path, "old").unwrap();
+            let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_modified(base + std::time::Duration::from_secs(index))
+                .unwrap();
+        }
+        fs::write(dir.join("notes.txt"), "keep").unwrap();
+        fs::write(dir.join("mini-agent-crash-x.log"), "crash").unwrap();
+        let target = dir.join("target.txt");
+        fs::write(&target, "t").unwrap();
+        std::os::unix::fs::symlink(&target, dir.join("mini-agent-link.log")).unwrap();
+        let removed = prune_stale_files(
+            &dir,
+            is_auto_log_name,
+            Some(&current),
+            20,
+            std::time::Duration::from_secs(14 * 24 * 3600),
+        );
+        assert_eq!(removed, 10);
+        let remaining = fs::read_dir(&dir).unwrap().count();
+        // 20 stale + current + notes + crash + target + symlink.
+        assert_eq!(remaining, 25);
+        assert!(current.exists() && dir.join("notes.txt").exists());
+        assert!(dir.join("mini-agent-link.log").exists());
+        // The newest survive, the oldest go.
+        assert!(dir.join("mini-agent-2000-01-01_00-00-29_29.log").exists());
+        assert!(!dir.join("mini-agent-2000-01-01_00-00-00_0.log").exists());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn files_older_than_the_age_bound_are_removed_even_within_the_count() {
+        let dir = temp_dir("age");
+        let path = dir.join("mini-agent-old.log");
+        fs::write(&path, "old").unwrap();
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(
+            std::time::SystemTime::now() - std::time::Duration::from_secs(30 * 24 * 3600),
+        )
+        .unwrap();
+        let removed = prune_stale_files(
+            &dir,
+            is_auto_log_name,
+            None,
+            20,
+            std::time::Duration::from_secs(14 * 24 * 3600),
+        );
+        assert_eq!(removed, 1);
+        let _ = fs::remove_dir_all(dir);
     }
 }

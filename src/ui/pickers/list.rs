@@ -28,6 +28,7 @@ const BASE_COMMANDS: &[&str] = &[
     "/editsys",
     "/effort",
     "/expand",
+    "/find",
     "/fork",
     "/help",
     "/history",

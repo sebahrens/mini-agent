@@ -644,6 +644,17 @@ pub fn session_to_markdown(session: &Session) -> String {
         })
         .to_string(),
     );
+    let total = session.compaction_count();
+    let first_number = total.saturating_sub(session.compactions.len());
+    for (index, compaction) in session.compactions.iter().enumerate() {
+        let number = first_number + index + 1;
+        out.push_str(&format!(
+            "> Earlier history: {} messages were summarised by compaction {number} ({}). The transcript they replaced is saved as `{}.precompact-{number}.jsonl` in the session directory (the newest few are kept).\n\n",
+            compaction.summarized_count,
+            compaction.created_at.replace(['<', '>', '`', '\n'], " "),
+            session.id.replace(['<', '>', '`', '\n'], " "),
+        ));
+    }
     for message in &session.messages {
         let (_, label) = role_class_label(message, session);
         out.push_str("## ");
@@ -698,10 +709,112 @@ pub fn session_to_markdown(session: &Session) -> String {
                     ));
                 }
             }
+            // The conversation itself is readable Markdown with raw HTML and
+            // unsafe links neutralised; only tool traffic stays in fences.
+            (MessageRole::User | MessageRole::Assistant, _) => {
+                push_neutralised_markdown(&mut out, &message.content);
+                out.push_str("\n\n");
+            }
             _ => push_markdown_block(&mut out, "text", &message.content),
         }
     }
     out
+}
+
+/// Append `markdown` with everything that could be active in a Markdown
+/// viewer neutralised, leaving headings, lists, tables and code untouched:
+/// raw HTML is shown as text (`<` becomes `&lt;`), and a link or image whose
+/// target [`export_url_is_safe`] refuses is turned into literal text.
+fn push_neutralised_markdown(out: &mut String, markdown: &str) {
+    let parser = pulldown_cmark::Parser::new_ext(
+        markdown,
+        Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS,
+    )
+    .into_offset_iter();
+    // (byte offset, text to insert) or a range whose `<` is escaped.
+    let mut escape_ranges: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut backslashes: Vec<usize> = Vec::new();
+    for (event, range) in parser {
+        match event {
+            Event::Html(_) | Event::InlineHtml(_) => escape_ranges.push(range),
+            Event::Start(Tag::Link { dest_url, .. }) if !export_url_is_safe(&dest_url, false) => {
+                backslashes.push(range.start);
+            }
+            Event::Start(Tag::Image { dest_url, .. }) if !export_url_is_safe(&dest_url, true) => {
+                backslashes.push(range.start);
+                backslashes.push(range.start + 1);
+            }
+            _ => {}
+        }
+    }
+    backslashes.sort_unstable();
+    backslashes.dedup();
+    let mut ranges = escape_ranges.into_iter().peekable();
+    let mut marks = backslashes.into_iter().peekable();
+    for (index, character) in markdown.char_indices() {
+        while ranges.peek().is_some_and(|range| range.end <= index) {
+            ranges.next();
+        }
+        while marks.peek().is_some_and(|mark| *mark < index) {
+            marks.next();
+        }
+        if marks.peek() == Some(&index) {
+            marks.next();
+            out.push('\\');
+        }
+        let in_html = ranges
+            .peek()
+            .is_some_and(|range| range.start <= index && index < range.end);
+        match character {
+            '<' if in_html => out.push_str("&lt;"),
+            '>' if in_html => out.push_str("&gt;"),
+            '\0' => out.push('\u{fffd}'),
+            character => out.push(character),
+        }
+    }
+    if !markdown.ends_with('\n') {
+        out.push('\n');
+    }
+    // A fence the message never closed would swallow the rest of the export.
+    if let Some((character, length)) = unclosed_fence(markdown) {
+        for _ in 0..length {
+            out.push(character);
+        }
+        out.push('\n');
+    }
+}
+
+/// The fence (character, length) still open at the end of `markdown`.
+fn unclosed_fence(markdown: &str) -> Option<(char, usize)> {
+    let mut open: Option<(char, usize)> = None;
+    for line in markdown.lines() {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        if indent > 3 {
+            continue;
+        }
+        let trimmed = &line[indent..];
+        let Some(character) = trimmed.chars().next().filter(|c| matches!(c, '`' | '~')) else {
+            continue;
+        };
+        let length = trimmed.chars().take_while(|c| *c == character).count();
+        if length < 3 {
+            continue;
+        }
+        let rest = &trimmed[length..];
+        open = match open {
+            Some((open_character, open_length))
+                if open_character == character
+                    && length >= open_length
+                    && rest.trim().is_empty() =>
+            {
+                None
+            }
+            Some(still_open) => Some(still_open),
+            None if character == '`' && rest.contains('`') => None,
+            None => Some((character, length)),
+        };
+    }
+    open
 }
 
 fn push_markdown_label(out: &mut String, label: &str) {

@@ -56,6 +56,21 @@ enum Language {
     Toml,
     Shell,
     Diff,
+    Go,
+    Java,
+    Yaml,
+    Sql,
+    Markup,
+    Css,
+    Ruby,
+    Php,
+    Kotlin,
+    Swift,
+    CSharp,
+    Lua,
+    Dockerfile,
+    Hcl,
+    Markdown,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Quoted {
@@ -107,14 +122,31 @@ impl CodeState {
         }
         let language = match token.to_ascii_lowercase().as_str() {
             "rust" | "rs" => Language::Rust,
-            "c" | "cpp" | "c++" | "h" | "java" | "go" => Language::C,
+            "c" | "cpp" | "c++" | "cc" | "h" | "hpp" => Language::C,
+            "java" => Language::Java,
+            "go" | "golang" => Language::Go,
+            "yaml" | "yml" => Language::Yaml,
+            "sql" | "postgresql" | "postgres" | "mysql" | "sqlite" => Language::Sql,
+            "html" | "xml" | "svg" | "xhtml" | "htm" => Language::Markup,
+            "css" | "scss" => Language::Css,
+            "ruby" | "rb" => Language::Ruby,
+            "php" => Language::Php,
+            "kotlin" | "kt" | "kts" => Language::Kotlin,
+            "swift" => Language::Swift,
+            "csharp" | "cs" | "c#" => Language::CSharp,
+            "lua" => Language::Lua,
+            "dockerfile" | "docker" | "containerfile" => Language::Dockerfile,
+            "hcl" | "terraform" | "tf" => Language::Hcl,
+            "markdown" | "md" => Language::Markdown,
             "javascript" | "js" | "node" | "typescript" | "ts" | "jsx" | "tsx" => {
                 Language::JavaScript
             }
             "python" | "py" => Language::Python,
             "json" | "jsonc" => Language::Json,
             "toml" => Language::Toml,
-            "sh" | "shell" | "bash" | "zsh" => Language::Shell,
+            "sh" | "shell" | "bash" | "zsh" | "console" | "shellsession" | "fish" => {
+                Language::Shell
+            }
             "diff" | "patch" => Language::Diff,
             _ => return None,
         };
@@ -208,6 +240,28 @@ impl CodeState {
                 .into(),
             );
         }
+        if self.language == Language::Markdown {
+            let trimmed = display.trim_start();
+            let color = if trimmed.starts_with('#') {
+                Some(palette.link)
+            } else if trimmed.starts_with('>') {
+                Some(palette.system)
+            } else if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+                Some(palette.warning)
+            } else {
+                None
+            };
+            let color = color?;
+            self.spans += 1;
+            return Some(
+                vec![TokenSpan {
+                    range: 0..display.len(),
+                    attrs: 0,
+                    color,
+                }]
+                .into(),
+            );
+        }
         let bytes = display.as_bytes();
         let mut pos = 0;
         let mut spans: Vec<TokenSpan> = Vec::new();
@@ -218,9 +272,14 @@ impl CodeState {
             if self.comment_depth > 0 {
                 while pos < bytes.len() {
                     scan_step();
-                    if bytes[pos..].starts_with(b"*/") {
+                    let close: &[u8] = if self.language == Language::Markup {
+                        b"-->"
+                    } else {
+                        b"*/"
+                    };
+                    if bytes[pos..].starts_with(close) {
                         self.comment_depth -= 1;
-                        pos += 2;
+                        pos += close.len();
                         if self.comment_depth == 0 {
                             break;
                         }
@@ -235,14 +294,19 @@ impl CodeState {
             } else if self.quote != Quoted::None {
                 self.scan_quote(display, &mut pos);
                 color = palette.diff_add;
-            } else if self.slash_comments() && bytes[pos..].starts_with(b"//")
-                || self.hash_comments() && bytes[pos] == b'#'
+            } else if self.line_comment_at(bytes, pos) || self.hash_comments() && bytes[pos] == b'#'
             {
                 pos = bytes.len();
                 color = palette.system;
-            } else if self.slash_comments() && bytes[pos..].starts_with(b"/*") {
+            } else if self.language == Language::Markup && bytes[pos..].starts_with(b"<!--")
+                || self.block_comments() && bytes[pos..].starts_with(b"/*")
+            {
                 self.comment_depth = 1;
-                pos += 2;
+                pos += if self.language == Language::Markup {
+                    4
+                } else {
+                    2
+                };
                 // Re-enter the loop with the comment opener included in its span.
                 push_span(&mut spans, start..pos, palette.system);
                 if self.spans.saturating_add(spans.len()) > MAX_SPANS {
@@ -258,8 +322,10 @@ impl CodeState {
                 color = palette.diff_add;
             } else if matches!(bytes[pos], b'"' | b'\'' | b'`') && self.accept_quote(display, pos) {
                 let quote = bytes[pos];
-                let triple = matches!(self.language, Language::Python | Language::Toml)
-                    && bytes[pos..].starts_with(&[quote; 3]);
+                let triple = matches!(
+                    self.language,
+                    Language::Python | Language::Toml | Language::Kotlin | Language::Swift
+                ) && bytes[pos..].starts_with(&[quote; 3]);
                 self.quote = if triple {
                     Quoted::Triple(quote)
                 } else {
@@ -282,12 +348,17 @@ impl CodeState {
                 while pos < bytes.len() {
                     scan_step();
                     let ch = display[pos..].chars().next().unwrap();
-                    if !identifier_start(ch) && !ch.is_ascii_digit() {
+                    if !(identifier_start(ch)
+                        || ch.is_ascii_digit()
+                        || ch == '-' && self.dashed_identifiers())
+                    {
                         break;
                     }
                     pos += ch.len_utf8();
                 }
-                color = if is_keyword(self.language, &display[start..pos]) {
+                color = if is_keyword(self.language, &display[start..pos])
+                    || self.is_key_or_tag(bytes, start, pos)
+                {
                     palette.link
                 } else {
                     palette.code
@@ -308,7 +379,24 @@ impl CodeState {
             && q != b'`'
             && matches!(
                 self.language,
-                Language::C | Language::JavaScript | Language::Python | Language::Json
+                Language::C
+                    | Language::JavaScript
+                    | Language::Python
+                    | Language::Json
+                    | Language::Go
+                    | Language::Java
+                    | Language::Yaml
+                    | Language::Sql
+                    | Language::Markup
+                    | Language::Css
+                    | Language::Ruby
+                    | Language::Php
+                    | Language::Kotlin
+                    | Language::Swift
+                    | Language::CSharp
+                    | Language::Lua
+                    | Language::Dockerfile
+                    | Language::Hcl
             )
             && line.ends_with('\n')
             && !display.ends_with('\\')
@@ -318,22 +406,84 @@ impl CodeState {
         self.spans += spans.len();
         Some(spans.into())
     }
-    fn slash_comments(self) -> bool {
+    /// `//` (or `--`) line comments.
+    fn line_comment_at(self, bytes: &[u8], pos: usize) -> bool {
+        match self.language {
+            Language::Rust
+            | Language::C
+            | Language::JavaScript
+            | Language::Json
+            | Language::Go
+            | Language::Java
+            | Language::Kotlin
+            | Language::Swift
+            | Language::CSharp
+            | Language::Php
+            | Language::Hcl => bytes[pos..].starts_with(b"//"),
+            Language::Sql | Language::Lua => bytes[pos..].starts_with(b"--"),
+            _ => false,
+        }
+    }
+    fn block_comments(self) -> bool {
         matches!(
             self.language,
-            Language::Rust | Language::C | Language::JavaScript | Language::Json
+            Language::Rust
+                | Language::C
+                | Language::JavaScript
+                | Language::Json
+                | Language::Go
+                | Language::Java
+                | Language::Kotlin
+                | Language::Swift
+                | Language::CSharp
+                | Language::Php
+                | Language::Hcl
+                | Language::Css
+                | Language::Sql
         )
     }
     fn hash_comments(self) -> bool {
         matches!(
             self.language,
-            Language::Python | Language::Toml | Language::Shell
+            Language::Python
+                | Language::Toml
+                | Language::Shell
+                | Language::Yaml
+                | Language::Ruby
+                | Language::Dockerfile
+                | Language::Php
+                | Language::Hcl
         )
+    }
+    fn dashed_identifiers(self) -> bool {
+        matches!(
+            self.language,
+            Language::Yaml | Language::Css | Language::Markup
+        )
+    }
+    /// YAML/CSS keys and properties (`name:`), markup tag and attribute names.
+    fn is_key_or_tag(self, bytes: &[u8], start: usize, end: usize) -> bool {
+        match self.language {
+            Language::Yaml | Language::Css => bytes.get(end) == Some(&b':'),
+            Language::Markup => {
+                start > 0 && bytes[start - 1] == b'<'
+                    || start > 1 && bytes[start - 1] == b'/' && bytes[start - 2] == b'<'
+                    || bytes.get(end) == Some(&b'=')
+            }
+            _ => false,
+        }
     }
     fn accept_quote(self, text: &str, pos: usize) -> bool {
         let q = text.as_bytes()[pos];
         if q == b'`' {
-            return self.language == Language::JavaScript;
+            return matches!(
+                self.language,
+                Language::JavaScript | Language::Go | Language::Sql | Language::Ruby
+            );
+        }
+        // Apostrophes in markup text and CSS are not string delimiters.
+        if q == b'\'' && matches!(self.language, Language::Markup | Language::Markdown) {
+            return false;
         }
         // Rust lifetimes are identifiers, not unclosed character literals.
         if self.language == Language::Rust && q == b'\'' {
@@ -614,8 +764,472 @@ fn is_keyword(language: Language, word: &str) -> bool {
                     | "export"
                     | "local"
             ),
-            Language::Json | Language::Toml | Language::Diff => false,
+            Language::Json | Language::Toml | Language::Diff | Language::Markdown => false,
+            other => extra_keywords(other)
+                .iter()
+                .any(|keyword| keyword.eq_ignore_ascii_case(word) && ci_ok(other, keyword, word)),
         }
+}
+
+/// Dockerfile and SQL keywords match in any case; the others only as written.
+fn ci_ok(language: Language, keyword: &str, word: &str) -> bool {
+    matches!(language, Language::Sql | Language::Dockerfile) || keyword == word
+}
+
+fn extra_keywords(language: Language) -> &'static [&'static str] {
+    match language {
+        Language::Go => &[
+            "package",
+            "import",
+            "func",
+            "var",
+            "const",
+            "type",
+            "struct",
+            "interface",
+            "map",
+            "chan",
+            "go",
+            "defer",
+            "select",
+            "range",
+            "if",
+            "else",
+            "for",
+            "switch",
+            "case",
+            "default",
+            "return",
+            "break",
+            "continue",
+            "fallthrough",
+            "nil",
+            "iota",
+        ],
+        Language::Java => &[
+            "package",
+            "import",
+            "class",
+            "interface",
+            "enum",
+            "extends",
+            "implements",
+            "public",
+            "private",
+            "protected",
+            "static",
+            "final",
+            "abstract",
+            "void",
+            "int",
+            "long",
+            "boolean",
+            "char",
+            "double",
+            "float",
+            "new",
+            "this",
+            "super",
+            "if",
+            "else",
+            "for",
+            "while",
+            "do",
+            "switch",
+            "case",
+            "default",
+            "return",
+            "break",
+            "continue",
+            "try",
+            "catch",
+            "finally",
+            "throw",
+            "throws",
+            "synchronized",
+            "instanceof",
+            "var",
+            "record",
+        ],
+        Language::Yaml => &["yes", "no", "on", "off", "~"],
+        Language::Sql => &[
+            "select",
+            "from",
+            "where",
+            "insert",
+            "into",
+            "values",
+            "update",
+            "set",
+            "delete",
+            "create",
+            "alter",
+            "drop",
+            "table",
+            "index",
+            "view",
+            "join",
+            "inner",
+            "left",
+            "right",
+            "outer",
+            "full",
+            "cross",
+            "on",
+            "using",
+            "group",
+            "by",
+            "order",
+            "having",
+            "limit",
+            "offset",
+            "union",
+            "all",
+            "distinct",
+            "as",
+            "and",
+            "or",
+            "not",
+            "in",
+            "is",
+            "like",
+            "between",
+            "exists",
+            "case",
+            "when",
+            "then",
+            "else",
+            "end",
+            "primary",
+            "key",
+            "foreign",
+            "references",
+            "default",
+            "constraint",
+            "unique",
+            "with",
+            "returning",
+            "begin",
+            "commit",
+            "rollback",
+            "asc",
+            "desc",
+            "count",
+            "sum",
+            "avg",
+            "min",
+            "max",
+            "int",
+            "integer",
+            "text",
+            "varchar",
+            "boolean",
+            "timestamp",
+            "date",
+        ],
+        Language::Css => &[
+            "important",
+            "inherit",
+            "initial",
+            "unset",
+            "none",
+            "auto",
+            "solid",
+            "block",
+            "inline",
+            "flex",
+            "grid",
+            "absolute",
+            "relative",
+            "fixed",
+        ],
+        Language::Ruby => &[
+            "def",
+            "end",
+            "class",
+            "module",
+            "if",
+            "elsif",
+            "else",
+            "unless",
+            "while",
+            "until",
+            "for",
+            "in",
+            "do",
+            "begin",
+            "rescue",
+            "ensure",
+            "raise",
+            "return",
+            "yield",
+            "self",
+            "nil",
+            "require",
+            "require_relative",
+            "include",
+            "extend",
+            "attr_accessor",
+            "attr_reader",
+            "attr_writer",
+            "case",
+            "when",
+            "then",
+            "and",
+            "or",
+            "not",
+            "lambda",
+            "proc",
+            "super",
+            "alias",
+            "private",
+            "protected",
+            "public",
+        ],
+        Language::Php => &[
+            "function",
+            "class",
+            "interface",
+            "trait",
+            "extends",
+            "implements",
+            "public",
+            "private",
+            "protected",
+            "static",
+            "final",
+            "abstract",
+            "namespace",
+            "use",
+            "new",
+            "return",
+            "if",
+            "else",
+            "elseif",
+            "foreach",
+            "for",
+            "while",
+            "do",
+            "switch",
+            "case",
+            "break",
+            "continue",
+            "try",
+            "catch",
+            "finally",
+            "throw",
+            "echo",
+            "print",
+            "array",
+            "const",
+            "global",
+            "isset",
+            "unset",
+            "empty",
+            "match",
+            "fn",
+            "as",
+            "instanceof",
+        ],
+        Language::Kotlin => &[
+            "fun",
+            "val",
+            "var",
+            "class",
+            "object",
+            "interface",
+            "data",
+            "sealed",
+            "enum",
+            "package",
+            "import",
+            "if",
+            "else",
+            "when",
+            "for",
+            "while",
+            "do",
+            "return",
+            "break",
+            "continue",
+            "try",
+            "catch",
+            "finally",
+            "throw",
+            "is",
+            "in",
+            "as",
+            "override",
+            "open",
+            "abstract",
+            "private",
+            "protected",
+            "public",
+            "internal",
+            "companion",
+            "suspend",
+            "lateinit",
+            "by",
+            "init",
+            "this",
+            "super",
+            "null",
+            "typealias",
+        ],
+        Language::Swift => &[
+            "func",
+            "let",
+            "var",
+            "class",
+            "struct",
+            "enum",
+            "protocol",
+            "extension",
+            "import",
+            "if",
+            "else",
+            "guard",
+            "switch",
+            "case",
+            "default",
+            "for",
+            "while",
+            "repeat",
+            "return",
+            "break",
+            "continue",
+            "in",
+            "is",
+            "as",
+            "try",
+            "catch",
+            "throw",
+            "throws",
+            "defer",
+            "init",
+            "deinit",
+            "self",
+            "super",
+            "nil",
+            "public",
+            "private",
+            "internal",
+            "fileprivate",
+            "open",
+            "static",
+            "final",
+            "override",
+            "async",
+            "await",
+            "where",
+            "some",
+            "any",
+        ],
+        Language::CSharp => &[
+            "using",
+            "namespace",
+            "class",
+            "struct",
+            "interface",
+            "enum",
+            "record",
+            "public",
+            "private",
+            "protected",
+            "internal",
+            "static",
+            "readonly",
+            "const",
+            "abstract",
+            "virtual",
+            "override",
+            "sealed",
+            "partial",
+            "void",
+            "int",
+            "long",
+            "string",
+            "bool",
+            "double",
+            "float",
+            "char",
+            "var",
+            "new",
+            "this",
+            "base",
+            "null",
+            "if",
+            "else",
+            "for",
+            "foreach",
+            "while",
+            "do",
+            "switch",
+            "case",
+            "default",
+            "return",
+            "break",
+            "continue",
+            "try",
+            "catch",
+            "finally",
+            "throw",
+            "async",
+            "await",
+            "in",
+            "is",
+            "as",
+            "get",
+            "set",
+        ],
+        Language::Lua => &[
+            "function", "local", "end", "if", "then", "else", "elseif", "for", "while", "do",
+            "repeat", "until", "return", "break", "in", "and", "or", "not", "nil", "goto",
+        ],
+        Language::Dockerfile => &[
+            "from",
+            "run",
+            "cmd",
+            "label",
+            "expose",
+            "env",
+            "add",
+            "copy",
+            "entrypoint",
+            "volume",
+            "user",
+            "workdir",
+            "arg",
+            "onbuild",
+            "stopsignal",
+            "healthcheck",
+            "shell",
+            "as",
+            "maintainer",
+        ],
+        Language::Hcl => &[
+            "resource",
+            "variable",
+            "output",
+            "module",
+            "provider",
+            "data",
+            "locals",
+            "terraform",
+            "for_each",
+            "count",
+            "dynamic",
+            "for",
+            "in",
+            "if",
+            "depends_on",
+            "lifecycle",
+            "provisioner",
+            "backend",
+            "required_providers",
+        ],
+        _ => &[],
+    }
 }
 /// Whether `text` is small enough to highlight: at most
 /// `MAX_HIGHLIGHT_BYTES` bytes, `MAX_HIGHLIGHT_LINES` lines, and no line

@@ -19,6 +19,43 @@ static SYSTEM_TERMINAL_ATTACHED: AtomicBool = AtomicBool::new(false);
 /// including editor/pager suspensions; cleared only when the guard drops.
 static SYSTEM_TERMINAL_SESSION: AtomicBool = AtomicBool::new(false);
 
+/// The thread that attached the terminal (the one running the event loop). A
+/// panic on any other thread is a background failure: the TUI keeps running,
+/// so the terminal must not be torn down underneath it (mini-agent-nvnkx.253).
+static UI_THREAD: std::sync::Mutex<Option<std::thread::ThreadId>> = std::sync::Mutex::new(None);
+
+fn note_ui_thread(id: Option<std::thread::ThreadId>) {
+    *UI_THREAD.lock().unwrap_or_else(|error| error.into_inner()) = id;
+}
+
+/// Where a panic happened relative to the interactive terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PanicScope {
+    /// No interactive terminal is attached or owned.
+    NoTerminal,
+    /// The TUI thread panicked: the process is going down, restore the screen.
+    UiThread,
+    /// Another thread panicked while the TUI keeps running.
+    Background,
+}
+
+pub(crate) fn panic_scope() -> PanicScope {
+    let owner = *UI_THREAD.lock().unwrap_or_else(|error| error.into_inner());
+    classify_panic(tui_owns_terminal(), owner, std::thread::current().id())
+}
+
+fn classify_panic(
+    owns_terminal: bool,
+    owner: Option<std::thread::ThreadId>,
+    current: std::thread::ThreadId,
+) -> PanicScope {
+    match (owns_terminal, owner) {
+        (false, _) => PanicScope::NoTerminal,
+        (true, Some(owner)) if owner != current => PanicScope::Background,
+        (true, _) => PanicScope::UiThread,
+    }
+}
+
 /// Whether the interactive TUI currently owns the terminal (attached, or
 /// suspended for an external editor or pager it will resume over). Tracing
 /// output must not be written to stdout/stderr while this holds.
@@ -1269,6 +1306,7 @@ impl TerminalGuard {
         };
         SYSTEM_TERMINAL_SESSION.store(true, Ordering::Release);
         SYSTEM_TERMINAL_ATTACHED.store(true, Ordering::Release);
+        note_ui_thread(Some(std::thread::current().id()));
         Ok(guard)
     }
 
@@ -1290,6 +1328,7 @@ impl TerminalGuard {
             .map_err(|error| TerminalLifecycleError::new("resumption", error));
         if result.is_ok() {
             SYSTEM_TERMINAL_ATTACHED.store(true, Ordering::Release);
+            note_ui_thread(Some(std::thread::current().id()));
             note_resumed();
         }
         result
@@ -1300,6 +1339,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         SYSTEM_TERMINAL_ATTACHED.store(false, Ordering::Release);
         SYSTEM_TERMINAL_SESSION.store(false, Ordering::Release);
+        note_ui_thread(None);
     }
 }
 
@@ -1324,6 +1364,24 @@ pub(crate) fn restore_for_panic() {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn a_panic_on_another_thread_is_background_while_the_ui_thread_restores() {
+        let ui = std::thread::current().id();
+        let other = std::thread::spawn(|| std::thread::current().id())
+            .join()
+            .unwrap();
+        assert_eq!(
+            classify_panic(true, Some(ui), other),
+            PanicScope::Background
+        );
+        assert_eq!(classify_panic(true, Some(ui), ui), PanicScope::UiThread);
+        assert_eq!(classify_panic(true, None, other), PanicScope::UiThread);
+        assert_eq!(
+            classify_panic(false, Some(ui), other),
+            PanicScope::NoTerminal
+        );
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Operation {

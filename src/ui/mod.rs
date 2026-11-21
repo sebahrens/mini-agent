@@ -612,6 +612,41 @@ impl ReaderErrors {
     }
 }
 
+/// Where background components (panic hook, formatter) send user-facing lines
+/// while the interactive TUI runs.
+static NOTICE_SENDER: std::sync::Mutex<Option<mpsc::Sender<UserEvent>>> =
+    std::sync::Mutex::new(None);
+
+pub(crate) fn register_notice_sender(tx: mpsc::Sender<UserEvent>) {
+    *NOTICE_SENDER
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(tx);
+}
+
+/// Queue a one-line notice for the interactive feed. Never blocks; returns
+/// whether it was queued (false without a running TUI or when it is closed).
+pub(crate) fn post_notice(line: String) -> bool {
+    post_notice_to(&NOTICE_SENDER, line)
+}
+
+fn post_notice_to(slot: &std::sync::Mutex<Option<mpsc::Sender<UserEvent>>>, line: String) -> bool {
+    let sender = slot
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    sender.is_some_and(|tx| tx.try_send(UserEvent::Notice(line)).is_ok())
+}
+
+/// A sink for [`FormatAfterEdit::set_notice_sink`] that shows formatter
+/// failures in the TUI notice area (they are always logged as well).
+///
+/// [`FormatAfterEdit::set_notice_sink`]: crate::agent::tools::format_after_edit::FormatAfterEdit::set_notice_sink
+pub(crate) fn notice_sink() -> crate::agent::tools::format_after_edit::NoticeSink {
+    Arc::new(|line: &str| {
+        let _ = post_notice(line.to_string());
+    })
+}
+
 /// Turn termination requests into an orderly [`UserEvent::Quit`] so the run is
 /// stopped, the session saved and the terminal restored (raw mode, mouse,
 /// bracketed paste, keyboard protocol, cursor) instead of the process dying
@@ -2070,7 +2105,21 @@ pub(crate) fn preserve_pending_main_turn_progress(
     run: &mut AgentRunState,
     session: &mut Session,
 ) -> bool {
-    if !pending_main_turn_has_progress(run, session) {
+    let has_progress = pending_main_turn_has_progress(run, session);
+    commit_pending_main_turn_progress(run, session, has_progress)
+}
+
+/// The second half of [`preserve_pending_main_turn_progress`], for callers that
+/// decided `has_progress` before they aborted the run. An interrupt must abort
+/// the task, kill its commands and retire the run first: a foreground command's
+/// guard registers what it printed only when its future is dropped, and the
+/// unresolved calls are closed from that text here (mini-agent-nvnkx.160).
+pub(crate) fn commit_pending_main_turn_progress(
+    run: &mut AgentRunState,
+    session: &mut Session,
+    has_progress: bool,
+) -> bool {
+    if !has_progress {
         return false;
     }
 
@@ -2124,7 +2173,16 @@ pub(crate) fn persist_session_if_settled(
     mut notice: impl FnMut(&str),
 ) -> anyhow::Result<bool> {
     crate::session::storage::report_pending_save_notices(session, &mut notice);
-    if !persistence_enabled || run.pending_turn.is_some() {
+    if !persistence_enabled {
+        return Ok(false);
+    }
+    if let Some(turn) = run.pending_turn.as_ref() {
+        // The snapshot stays at the pre-turn state, but a crash must not lose
+        // the turn's tool calls: append them to the turn journal
+        // (mini-agent-nvnkx.46). Native sessions have their own checkpoint.
+        if run.native_owner.is_none() && session.native_history_snapshot().is_none() {
+            crate::session::turn_journal::append(session, turn.base_message_len());
+        }
         return Ok(false);
     }
     // Turn-end snapshots are serialized here and written off the UI task;
@@ -2447,7 +2505,86 @@ pub async fn run_interactive(
     #[cfg(feature = "subagents")]
     let result = result.and(app.persist_background_state());
     app.shutdown_services().await;
+    // Leaving the alternate screen takes the conversation with it, so tell the
+    // user, on the restored primary screen, how to come back to it.
+    let summary = app.exit_summary();
+    drop(app);
+    if let Some(summary) = summary {
+        use std::io::IsTerminal;
+        if io::stdout().is_terminal() && io::stderr().is_terminal() {
+            eprintln!("{summary}");
+        }
+    }
     result
+}
+
+/// Plain text printed to the normal screen when the TUI exits: the session and
+/// the exact command that resumes it, with the usage totals the status line
+/// tracks. `None` for a session that was not saved or has no turn yet.
+pub(crate) fn exit_summary(session: &Session, no_session: bool) -> Option<String> {
+    let turns = session
+        .messages
+        .iter()
+        .filter(|message| message.role == MessageRole::User)
+        .count();
+    if no_session || turns == 0 {
+        return None;
+    }
+    let title = if !session.name.is_empty() {
+        Some(session.name.to_string())
+    } else {
+        session.generated_title.as_ref().map(ToString::to_string)
+    };
+    let title = title
+        .map(|title| format!(" \"{}\"", crate::ui::events::sanitize_output(&title)))
+        .unwrap_or_default();
+    let mut usage = format!(
+        "{turns} turn{}, {} in / {} out tokens",
+        if turns == 1 { "" } else { "s" },
+        session.total_input_tokens,
+        session.total_output_tokens
+    );
+    let cost = session.recorded_total_cost();
+    if cost > 0.0 {
+        let marker = if session.cost_is_incomplete() {
+            "+?"
+        } else {
+            ""
+        };
+        usage.push_str(&format!(", ${cost:.4}{marker}"));
+    }
+    Some(format!(
+        "Session {}{title}: {usage}\nResume it with: mini-agent --session {}   (or: mini-agent -c for the most recent)",
+        session.id.chars().take(8).collect::<String>(),
+        session.id
+    ))
+}
+
+#[cfg(test)]
+mod exit_summary_tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_session_with_a_turn_prints_the_resume_command_and_totals() {
+        let mut session = Session::new("p", "m", 1000, "my session");
+        assert!(exit_summary(&session, false).is_none(), "no turn yet");
+        session.add_message(MessageRole::User, "hi");
+        session.total_input_tokens = 1200;
+        session.total_output_tokens = 300;
+        let text = exit_summary(&session, false).unwrap();
+        assert!(
+            text.contains(&format!("mini-agent --session {}", session.id)),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"my session\"") && text.contains("1 turn, 1200 in / 300 out"),
+            "{text}"
+        );
+        assert!(
+            exit_summary(&session, true).is_none(),
+            "unsaved sessions cannot be resumed"
+        );
+    }
 }
 
 #[cfg(feature = "advisor")]
@@ -3002,5 +3139,25 @@ mod compaction_cancel_tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), cancel.cancelled())
             .await
             .expect("a notified compaction wakes");
+    }
+}
+
+#[cfg(test)]
+mod notice_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn notices_reach_the_channel_without_blocking() {
+        let slot = std::sync::Mutex::new(None);
+        assert!(!post_notice_to(&slot, "nobody listens".into()));
+        let (tx, mut rx) = mpsc::channel::<UserEvent>(1);
+        *slot.lock().unwrap() = Some(tx);
+        assert!(post_notice_to(&slot, "internal task panicked".into()));
+        assert!(
+            matches!(rx.recv().await, Some(UserEvent::Notice(line)) if line.contains("panicked"))
+        );
+        // A full channel drops the line instead of blocking the panicking thread.
+        assert!(post_notice_to(&slot, "a".into()));
+        assert!(!post_notice_to(&slot, "b".into()));
     }
 }

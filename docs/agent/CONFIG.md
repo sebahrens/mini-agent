@@ -1868,6 +1868,17 @@ state. A summary the provider cut off at its output limit ends with
 fire only when a compaction record was committed; `PreCompact` fires once per
 compaction, before the first summarizer request of either path.
 
+While an interactive turn is in progress the session file stays at its pre-turn state, so
+the turn's messages and the file-checkpoint records it created are appended to
+`<session id>.turn.jsonl` beside it (private permissions, `fsync` batched to about once
+per second; not used for native Anthropic sessions, which have their own checkpoint). A
+crash, kill or power loss mid-turn is recovered at the next load: the journal is replayed
+when it was started against exactly the snapshot that loaded, calls without a result are
+closed as outcome-unknown, and the "previous turn was cut off" instruction is added. The
+journal is deleted when the next snapshot is written or the session is deleted. Leaving the
+interactive TUI prints the session id, token/cost totals and the `mini-agent --session <id>`
+resume command to the normal screen (skipped without a terminal or with `--no-session`).
+
 Compaction is otherwise irreversible, so each committed compaction also writes the
 transcript it replaced to `<session id>.precompact-<n>.jsonl` beside the session file
 (private permissions, one persisted message per line; the newest five are kept and all
@@ -4788,7 +4799,10 @@ mini-agent -v
 Enables full trace-level logging to a timestamped log file below the state
 root's `logs/` directory (`MINI_AGENT_STATE_DIR` overrides the state root). The log
 file is named `mini-agent-YYYY-MM-DD_HH-MM-SS_<pid>.log`. A new file is created
-per instance — previous runs are never overwritten.
+per instance — previous runs are never overwritten. At startup the 20 newest
+auto-named logs (and crash reports in the crash directory) are kept and older
+ones, or any older than 14 days, are removed; other file names and symlinks are
+never touched. Log files contain no ANSI colour escapes.
 
 With `-v`, visible diagnostic output stays at the default `warn` level. The
 log file captures everything at `trace` level for all mini-agent
@@ -4801,7 +4815,8 @@ mini-agent --log-file /tmp/debug.log
 ```
 
 Writes full trace-level logs to the specified path instead of the default
-location. Implies `-v` for the file output. Can be combined with `-v` (no
+location. The file is appended to, never truncated, and each run writes a
+`--- mini-agent run started ... ---` marker first. Implies `-v` for the file output. Can be combined with `-v` (no
 effect on the path, since `--log-file` takes precedence).
 
 ### Custom stderr log level (`--log-level`)

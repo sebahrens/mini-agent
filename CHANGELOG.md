@@ -119,6 +119,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - `--distill-learned-skill <session> list|last|<id prefix>` lists successful `js` calls, distils the latest, or accepts an unambiguous tool-call id prefix; `--approve/--reject/--activate/--promote/--retire/--reevaluate-learned-skill` accept an unambiguous id prefix of at least 6 hex characters; the TUI `/skills` view is not done (mini-agent-nvnkx.121).
 - VS Code: a Mini Agent activity-bar chat view (works without Copilot Chat) showing messages, collapsible tool calls with diffs, a persistent plan and a context meter; edit permission requests open the native diff editor; the active file or selection (`mini-agent.attachActiveEditor`) and opt-in diagnostics (`mini-agent.attachDiagnostics`) ride on every prompt (mini-agent-nvnkx.105, .106).
 - `.github/workflows/windows-arm64-smoke.yml` builds and self-checks `aarch64-pc-windows-msvc` natively; the release matrix does not ship it yet (docs/development/windows-arm64.md) (mini-agent-nvnkx.143).
+- Added: transcript search: `alt+s` (`transcript_search`) or `/find <text>` opens a one-line query, jumps to matches (smart case), steps with `n`/`N`/Enter, unfolds a collapsed tool result that holds the match and highlights it; Esc restores the scroll position (mini-agent-nvnkx.91).
+- Added: leaving the TUI prints the session, its token/cost totals and the exact `mini-agent --session <id>` resume command on the normal screen (mini-agent-nvnkx.92).
+- Added: `ask_user_question` takes `multi_select` (several options, answered as a list of labels); the overlay has a highlighted option moved with Up/Down, Space to tick, Enter to confirm, Left/Backspace-on-empty to return to the previous question, and a line editor for free text (mini-agent-nvnkx.94).
+- Added: fenced code highlighting covers Go, Java, C#, Kotlin, Swift, Ruby, PHP, Lua, YAML, SQL, HTML/XML, CSS, Dockerfile, HCL, Markdown and `console` blocks, with aliases such as `yml`, `golang`, `kt` and `cs` (mini-agent-nvnkx.95).
+- Added: an interactive turn in progress is journaled to `<session id>.turn.jsonl` (messages and file-checkpoint records, fsync batched) so a crash or kill mid-turn no longer loses its tool calls; the next load replays them and adds the "cut off" instruction (mini-agent-nvnkx.46).
+- Added: formatter failures reach the TUI notice area through `FormatAfterEdit::set_notice_sink` (mini-agent-nvnkx.246).
 
 ### Fixed
 
@@ -371,6 +377,15 @@ Notable changes to mini-agent are documented in this file. The format follows
 - A resumed session is told once that background shell jobs and tasks started by the previous process are gone (mini-agent-nvnkx.270)
 - Fixed: a headless run no longer panics with "JoinHandle polled after completion" when the OpenRouter pricing refresh finishes inside its wait (`finish_within` awaited the finished handle a second time).
 - Fixed: the Windows MSI adds its install directory to `PATH` (user `PATH` per-user, system `PATH` for `ALLUSERS=1`, removed on uninstall), so the install guide's `mini-agent --version` step works in a new shell; the release smoke resolves `mini-agent.exe` by bare name and checks the entry is removed (mini-agent-nvnkx.301).
+- Fixed: agent markdown separates paragraphs with a blank row, shows inline code as a colour span without backticks, keeps the quote bar for text after a nested blockquote, lays out the first reply row after the `< ` marker instead of re-wrapping it, and styles the line still being streamed (inline markdown, code fences) (mini-agent-nvnkx.83, .84, .96, .97, .98).
+- Fixed: `/export` Markdown writes user and assistant messages as Markdown with raw HTML and unsafe links neutralised and notes each compaction and its sidecar (mini-agent-nvnkx.56).
+- Fixed: a panic on a background thread no longer tears the terminal down under the running TUI; the crash report path is shown in the feed instead (mini-agent-nvnkx.253).
+- Fixed: `--log-file` logs and the `-v` file contain no ANSI escapes, an explicit `--log-file` is appended to (with a run marker) instead of truncated, and old auto-named `-v` logs and crash reports are pruned to the newest 20 and 14 days (mini-agent-nvnkx.155, .227).
+- Fixed: whitespace-only assistant text before a tool call is no longer stored or replayed, and existing rows of that kind replay cleanly (mini-agent-nvnkx.162).
+- Fixed: Ctrl-C closes an interrupted foreground shell call with what it printed instead of "outcome unknown" (the run is aborted and retired before unresolved calls are closed) (mini-agent-nvnkx.160).
+- Fixed: inputs queued while a run ends in an interrupt or error are returned to the editor (or the history and kill ring) instead of being dropped (mini-agent-nvnkx.291).
+- Fixed: a refused file rewind no longer cancels background tasks and saves the session (mini-agent-nvnkx.293).
+- Fixed: `/share` records its abort handle before the upload task can clear it (mini-agent-nvnkx.261).
 
 ### Added
 

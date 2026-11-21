@@ -9,7 +9,9 @@ use compact_str::CompactString;
 use crossterm::style::Color;
 
 use super::events::{Sanitized, sanitize_output};
-use super::markdown::{StyledMarkdown, markdown_with_code_state, word_wrap_flagged};
+use super::markdown::{
+    StyledMarkdown, markdown_with_code_state, word_wrap_flagged, word_wrap_flagged_first,
+};
 use super::renderer::{Cont, LineEntry};
 use super::{C_AGENT, C_ERROR, C_PERM, C_TOOL};
 
@@ -174,6 +176,19 @@ pub struct Block {
     /// A foldable block (a tool result) keeps the form it is not showing;
     /// toggling swaps it with `text`.
     fold: Option<Box<Fold>>,
+}
+
+/// One transcript search match (see [`Feed::search`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SearchHit {
+    /// Laid-out row holding the match.
+    pub line: usize,
+    pub block: usize,
+    /// Byte range of the match inside that row's text.
+    pub range: std::ops::Range<usize>,
+    /// The match is only in the hidden form of a collapsed fold: unfold the
+    /// block, then search again to find its row.
+    pub hidden: bool,
 }
 
 /// The hidden form of a foldable block.
@@ -931,6 +946,69 @@ impl Feed {
             .into_iter()
             .find(|&(_, start, len)| line >= start && line < start + len)
             .map(|(index, start, _)| (index, line - start))
+    }
+
+    /// Every row of the transcript at `width` that contains `query`, plus the
+    /// collapsed folds (tool results) that hold it only in their hidden form.
+    /// Matching is case-insensitive for ASCII unless `query` has an uppercase
+    /// letter (smart case); a match split across a wrapped row boundary is not
+    /// found.
+    pub(crate) fn search(&self, width: usize, query: &str) -> Vec<SearchHit> {
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let sensitive = query.chars().any(char::is_uppercase);
+        let needle = if sensitive {
+            query.to_string()
+        } else {
+            query.to_ascii_lowercase()
+        };
+        let find = |text: &str| -> Option<std::ops::Range<usize>> {
+            let start = if sensitive {
+                text.find(&needle)?
+            } else {
+                text.to_ascii_lowercase().find(&needle)?
+            };
+            Some(start..start + needle.len())
+        };
+        let lines = self.lines(width);
+        let mut hits = Vec::new();
+        for (block, start, len) in self.block_row_spans(width) {
+            let mut found = false;
+            for line in start..start + len {
+                let Some(entry) = lines.get(line) else {
+                    continue;
+                };
+                if let Some(range) = find(&entry.text) {
+                    hits.push(SearchHit {
+                        line,
+                        block,
+                        range,
+                        hidden: false,
+                    });
+                    found = true;
+                }
+            }
+            if !found
+                && let Some(fold) = self.blocks[block].fold.as_ref()
+                && !fold.expanded
+                && find(&fold.alternate).is_some()
+            {
+                hits.push(SearchHit {
+                    line: start,
+                    block,
+                    range: 0..0,
+                    hidden: true,
+                });
+            }
+        }
+        hits
+    }
+
+    /// Unfold the foldable block `index` (a search hit hidden in its folded
+    /// form). Returns whether it changed.
+    pub(crate) fn expand_block(&mut self, index: usize) -> bool {
+        self.set_fold_at(index, Some(true)) == Some(true)
     }
 
     /// First row and row count of block `index` at `width`.
@@ -2309,7 +2387,13 @@ fn contains_global_markdown_definition(text: &str) -> bool {
 /// segments. Appending a token to the tail never clones completed rows.
 fn agent_block_segments(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Vec<LineEntry>>> {
     let mut segments = agent_completed_lines(feed, block, width);
-    let tail = agent_tail_lines(block, width, segments.is_empty(), feed.palette);
+    let tail = agent_tail_lines(
+        block,
+        width,
+        segments.is_empty(),
+        feed.palette,
+        !feed.monochrome,
+    );
     if !tail.is_empty() {
         segments.push(Arc::new(tail));
     }
@@ -2340,6 +2424,7 @@ fn render_region(
     width: usize,
     highlighting: bool,
     ends_inside_fence: bool,
+    first_indent: usize,
 ) -> StyledMarkdown {
     // Fence budgets are enforced per fence by `CodeState`.
     let mut rendered = match entry_fence {
@@ -2348,9 +2433,9 @@ fn render_region(
             replayed.push_str(&fence.opener);
             replayed.push('\n');
             replayed.push_str(text);
-            parse_agent_markdown(feed, block, &replayed, width, highlighting, entry_code)
+            parse_agent_markdown(feed, block, &replayed, width, highlighting, entry_code, 0)
         }
-        None => parse_agent_markdown(feed, block, text, width, highlighting, None),
+        None => parse_agent_markdown(feed, block, text, width, highlighting, None, first_indent),
     };
     if ends_inside_fence {
         // Closing a code block emits the blank separator row, and the code
@@ -2486,6 +2571,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
                 width,
                 highlighting,
                 stable_fence.is_some(),
+                if has_rows { 0 } else { AGENT_PREFIX_WIDTH },
             );
             stable_code = finalized.code_state.take();
             let mut finalized = finalized.lines;
@@ -2505,6 +2591,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
             width,
             highlighting,
             false,
+            if has_rows { 0 } else { AGENT_PREFIX_WIDTH },
         );
         let mut suffix = suffix.lines;
         if !has_rows && !suffix.is_empty() {
@@ -2544,6 +2631,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
             width,
             highlighting,
             stable_fence.is_some(),
+            AGENT_PREFIX_WIDTH,
         );
         stable_code = finalized.code_state.take();
         let mut finalized = finalized.lines;
@@ -2562,6 +2650,7 @@ fn agent_completed_lines(feed: &Feed, block: &Block, width: usize) -> Vec<Arc<Ve
         width,
         highlighting,
         false,
+        if has_rows { 0 } else { AGENT_PREFIX_WIDTH },
     );
     let mut suffix = suffix.lines;
     if !has_rows && !suffix.is_empty() {
@@ -2600,6 +2689,9 @@ fn push_stable_segment(segments: &mut Vec<Arc<Vec<LineEntry>>>, rows: Vec<LineEn
     }
     segments.push(Arc::new(rows));
 }
+
+/// Columns of the `< ` marker prepended to an agent reply's first row.
+const AGENT_PREFIX_WIDTH: usize = 2;
 
 /// Prefix the first row of an agent reply with `< `. The rows were laid out at
 /// `width`, so a first row wider than `width - 2` is re-wrapped with the prefix
@@ -2679,6 +2771,7 @@ fn parse_agent_markdown(
     width: usize,
     highlighting: bool,
     entry_code: Option<super::highlight::CodeState>,
+    first_indent: usize,
 ) -> StyledMarkdown {
     #[cfg(test)]
     feed.markdown_bytes_parsed
@@ -2690,6 +2783,7 @@ fn parse_agent_markdown(
         highlighting,
         entry_code,
         Some(&block.agent_render().syntax),
+        first_indent,
     );
     for row in &mut rendered.lines {
         row.color = super::markdown::palette_color(row.color, feed.palette);
@@ -2697,11 +2791,45 @@ fn parse_agent_markdown(
     rendered
 }
 
+/// The fence still open at `up_to`, scanning completed lines from the stable
+/// boundary the markdown cache reports (or from the start without one).
+fn open_fence_at(block: &Block, up_to: usize) -> Option<OpenFence> {
+    let (start, mut fence) = block
+        .agent_render()
+        .md
+        .borrow()
+        .as_ref()
+        .filter(|cache| cache.stable_len <= up_to)
+        .map_or((0, None), |cache| {
+            (cache.stable_len, cache.stable_fence.clone())
+        });
+    for line in block.text[start..up_to].split_inclusive('\n') {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        fence = match fence {
+            Some(open) if fence_closing(line, &open) => None,
+            Some(open) => Some(open),
+            None => fence_opening(line).map(|(character, length, _)| OpenFence {
+                opener: CompactString::from(line),
+                character,
+                length,
+                replayable: false,
+            }),
+        };
+    }
+    fence
+}
+
+/// Lay out the line still being written. Inside an open code fence it is drawn
+/// as code (hard-wrapped, code colour); otherwise it goes through the inline
+/// markdown layout so emphasis, code and links already carry their final
+/// styling. It stays out of the stable cache.
 fn agent_tail_lines(
     block: &Block,
     width: usize,
     needs_prefix: bool,
     palette: ForegroundPalette,
+    highlighting: bool,
 ) -> Vec<LineEntry> {
     if !block.running {
         return Vec::new();
@@ -2711,22 +2839,61 @@ fn agent_tail_lines(
     if tail.is_empty() {
         return Vec::new();
     }
-    let color = palette.agent;
-    let mut lines = word_wrap_flagged(tail, width)
-        .into_iter()
-        .map(|(text, cont)| LineEntry {
-            syntax_spans: None,
-            text,
-            color,
-            theme_accent: false,
-            cont,
-            lead: 0,
-        })
-        .collect::<Vec<_>>();
+    let first_indent = if needs_prefix { AGENT_PREFIX_WIDTH } else { 0 };
+    let mut lines = if open_fence_at(block, completed_len).is_some() {
+        let mut rows = Vec::new();
+        super::markdown::push_code_rows(&mut rows, tail, None, width);
+        for row in &mut rows {
+            row.color = super::markdown::palette_color(row.color, palette);
+        }
+        rows
+    } else {
+        inline_tail_rows(tail, width, palette, highlighting, first_indent)
+    };
     if needs_prefix {
         prefix_agent_first_line(&mut lines, width);
     }
     lines
+}
+
+/// The tail line laid out as markdown, or as plain wrapped text when it is
+/// not safe to parse on its own (indented code, link definitions).
+fn inline_tail_rows(
+    tail: &str,
+    width: usize,
+    palette: ForegroundPalette,
+    highlighting: bool,
+    first_indent: usize,
+) -> Vec<LineEntry> {
+    let plain = |tail: &str| {
+        word_wrap_flagged_first(tail, width, first_indent)
+            .into_iter()
+            .map(|(text, cont)| LineEntry {
+                syntax_spans: None,
+                text,
+                color: palette.agent,
+                theme_accent: false,
+                cont,
+                lead: 0,
+            })
+            .collect::<Vec<_>>()
+    };
+    if tail.starts_with("    ") || tail.starts_with('\t') || tail.trim_start().starts_with("```") {
+        return plain(tail);
+    }
+    let mut rendered =
+        markdown_with_code_state(tail, width, palette, highlighting, None, None, first_indent)
+            .lines;
+    while rendered.last().is_some_and(|row| row.text.is_empty()) {
+        rendered.pop();
+    }
+    if rendered.is_empty() {
+        return plain(tail);
+    }
+    for row in &mut rendered {
+        row.color = super::markdown::palette_color(row.color, palette);
+    }
+    rendered
 }
 
 /// Return the memoized markdown layout when it matches `(width, parsed_len)`.

@@ -1872,7 +1872,7 @@ impl Renderer {
         self.frame(|this| paint(&mut frame_out!(this), cols, floor, bg))
     }
 
-    fn max_line_width(&self) -> usize {
+    pub(crate) fn max_line_width(&self) -> usize {
         let (cols, _) = self.terminal_size();
         cols.saturating_sub(1 + self.chat_margin) as usize
     }
@@ -2367,6 +2367,63 @@ impl Renderer {
 
     pub fn is_scrolling(&self) -> bool {
         self.scroll_offset > 0
+    }
+
+    /// Rows scrolled up from the bottom (0 follows the newest output).
+    pub(crate) fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    /// Restore a [`Renderer::scroll_offset`] saved earlier (clamped).
+    pub(crate) fn restore_scroll_offset(&mut self, offset: usize) {
+        let visible = self.visible_lines();
+        let max_offset = self.buffer_len().saturating_sub(visible);
+        self.scroll_offset = offset.min(max_offset);
+        self.clear_selection();
+    }
+
+    /// Transcript search matches at the current width.
+    pub(crate) fn search_transcript(&self, query: &str) -> Vec<crate::ui::feed::SearchHit> {
+        self.feed.search(self.max_line_width(), query)
+    }
+
+    /// Unfold a collapsed block that holds a search match only in its hidden
+    /// form.
+    pub(crate) fn reveal_block(&mut self, block: usize) -> bool {
+        let changed = self.feed.expand_block(block);
+        if changed {
+            self.chat_dirty = true;
+        }
+        changed
+    }
+
+    /// Scroll so `hit` is centred in the viewport and highlight the match
+    /// with the transcript selection.
+    pub(crate) fn show_search_hit(&mut self, hit: &crate::ui::feed::SearchHit) -> io::Result<()> {
+        let lines = self.chat_lines(self.max_line_width());
+        let total = lines.len();
+        let visible = self.visible_lines();
+        let top = hit
+            .line
+            .saturating_sub(visible / 2)
+            .min(total.saturating_sub(visible));
+        self.scroll_offset = total.saturating_sub(top + visible);
+        self.clear_selection();
+        if let Some(entry) = lines.get(hit.line)
+            && hit.range.end > hit.range.start
+            && entry.text.is_char_boundary(hit.range.start)
+            && entry.text.is_char_boundary(hit.range.end)
+        {
+            let start = crate::ui::utils::display_width(&entry.text[..hit.range.start]);
+            let end = crate::ui::utils::display_width(&entry.text[..hit.range.end])
+                .saturating_sub(1)
+                .max(start);
+            self.selection_active = true;
+            self.selection_start = Some(SelectionPoint::new(hit.line, start));
+            self.selection_end = Some(SelectionPoint::new(hit.line, end));
+        }
+        self.chat_dirty = true;
+        self.render_viewport()
     }
 
     /// Map a mouse click at `(row, col)` to a cursor byte offset inside the

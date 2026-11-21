@@ -12,8 +12,10 @@ generated phases and automatic goal rounds share the turn's budget. New
 submitted user text or approval to execute a reviewed plan starts a fresh
 budget.
 
-Use either `{question, options?, allow_free_text?}` or
-`{questions: [{question, options?, allow_free_text?}, ...]}`. Each option has
+Use either `{question, options?, allow_free_text?, multi_select?}` or
+`{questions: [{question, options?, allow_free_text?, multi_select?}, ...]}`.
+`multi_select` (needs at least two options) lets the user tick several options;
+the answer reported to the model is then a list of labels. Each option has
 `label` and an optional `description`. A batch contains one to four questions,
 each with at most eight options. Free text defaults to allowed. Empty questions,
 duplicate option labels, oversized strings and malformed batches are rejected
@@ -21,8 +23,15 @@ before requesting an answer. Runtime limits are UTF-8 bytes: question 2,048,
 label 128, description 512, batch 16,384 and each free-text answer 4,096.
 
 In the TUI, the prompt displays its question number and numbered options above
-the input. Choose a displayed number, or press `t` to type another answer when
-free text is offered; press Enter to submit text. Esc in typing mode of a choice question clears the draft and returns to the options; Esc from the option list stops. Pastes are normalised like the editor's (carriage returns become newlines) and capped at 4,096 bytes with a notice. Each question in the batch is
+the input, with the highlighted option marked `›`. Move with Up/Down (or `k`/`j`)
+and press Enter to choose, or choose a displayed number directly; on a
+multi-select question Space (or a number) ticks and unticks options and Enter
+confirms the ticked ones (the highlighted one when none is ticked). Press `t` to
+type another answer when free text is offered. The free-text draft is a real
+line editor (cursor movement, Ctrl+W word delete, `\`+Enter or the newline key
+for a new line, paste) capped at 4,096 bytes; Enter submits it. Left (or
+Backspace on an empty draft) returns to the previous question of the batch with
+its earlier answer restored, until the last answer sends the reply. Esc in typing mode of a choice question clears the draft and returns to the options; Esc from the option list stops. Pastes are normalised like the editor's (carriage returns become newlines) and capped at 4,096 bytes with a notice. Each question in the batch is
 shown in sequence. The ordinary input draft stays separate; held choice-key repeats do not answer
 the next question. Escape or Ctrl+C
 cancels the exact pending reply and stops its owning run. A cancelled or stale
