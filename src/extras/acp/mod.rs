@@ -6894,6 +6894,8 @@ async fn prepare_segment(
     }
     // Goal calibration uses the compaction's usage too. Financial receipts
     // belong to this ACP logical session and survive prompt cancellation.
+    // Without `goal`, `CompactionUsage` is `()` and only carried for symmetry.
+    #[cfg_attr(not(feature = "goal"), allow(clippy::let_unit_value))]
     let compaction_usage = compact_segment_history(
         state,
         turn,
