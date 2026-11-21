@@ -69,6 +69,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Large pastes (more than 10 lines or 1,000 characters) become an atomic `[Pasted text #N +M lines]` chip in the prompt that the cursor steps over and Backspace removes whole; submit, history and the external editor use the full text (mini-agent-nvnkx.88).
 - `/vim` Normal mode: operators `d`/`c`/`y` with counts, motions (`w e b 0 ^ $ gg G f F t T`, `iw`/`aw`), `x X D C p P o O r ~` and `.` repeat of the last change (mini-agent-nvnkx.89).
 - Pasting or dragging an image file path into the prompt attaches the image as `/add <path>` would, when the permission policy allows reading it (mini-agent-nvnkx.256).
+- Added: transcript search: `alt+s` (`transcript_search`) or `/find <text>` opens a one-line query, jumps to matches (smart case), steps with `n`/`N`/Enter, unfolds a collapsed tool result that holds the match and highlights it; Esc restores the scroll position (mini-agent-nvnkx.91).
+- Added: leaving the TUI prints the session, its token/cost totals and the exact `mini-agent --session <id>` resume command on the normal screen (mini-agent-nvnkx.92).
+- Added: `ask_user_question` takes `multi_select` (several options, answered as a list of labels); the overlay has a highlighted option moved with Up/Down, Space to tick, Enter to confirm, Left/Backspace-on-empty to return to the previous question, and a line editor for free text (mini-agent-nvnkx.94).
+- Added: fenced code highlighting covers Go, Java, C#, Kotlin, Swift, Ruby, PHP, Lua, YAML, SQL, HTML/XML, CSS, Dockerfile, HCL, Markdown and `console` blocks, with aliases such as `yml`, `golang`, `kt` and `cs` (mini-agent-nvnkx.95).
+- Added: an interactive turn in progress is journaled to `<session id>.turn.jsonl` (messages and file-checkpoint records, fsync batched) so a crash or kill mid-turn no longer loses its tool calls; the next load replays them and adds the "cut off" instruction (mini-agent-nvnkx.46).
+- Added: formatter failures reach the TUI notice area through `FormatAfterEdit::set_notice_sink` (mini-agent-nvnkx.246).
 
 ### Fixed
 
@@ -292,6 +298,15 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Ctrl+V with no clipboard image pastes the clipboard text (`pbpaste`, `wl-paste`, `xclip`) or says there is nothing to paste, instead of reporting an unavailable platform; a missing Linux image target is "no image" (mini-agent-nvnkx.255).
 - macOS and Windows clipboard image helpers accept PNGs up to the 24 MiB raw bound so large Retina screenshots reach the downscaler (mini-agent-nvnkx.249).
 - Copying selected text over SSH or inside tmux uses OSC 52 or `tmux load-buffer -w` instead of the remote machine's clipboard helpers, names the route in the notice, refuses payloads too large for OSC 52, and `MINI_AGENT_CLIPBOARD=auto|osc52|helper|tmux` overrides the choice (mini-agent-nvnkx.285).
+- Fixed: agent markdown separates paragraphs with a blank row, shows inline code as a colour span without backticks, keeps the quote bar for text after a nested blockquote, lays out the first reply row after the `< ` marker instead of re-wrapping it, and styles the line still being streamed (inline markdown, code fences) (mini-agent-nvnkx.83, .84, .96, .97, .98).
+- Fixed: `/export` Markdown writes user and assistant messages as Markdown with raw HTML and unsafe links neutralised and notes each compaction and its sidecar (mini-agent-nvnkx.56).
+- Fixed: a panic on a background thread no longer tears the terminal down under the running TUI; the crash report path is shown in the feed instead (mini-agent-nvnkx.253).
+- Fixed: `--log-file` logs and the `-v` file contain no ANSI escapes, an explicit `--log-file` is appended to (with a run marker) instead of truncated, and old auto-named `-v` logs and crash reports are pruned to the newest 20 and 14 days (mini-agent-nvnkx.155, .227).
+- Fixed: whitespace-only assistant text before a tool call is no longer stored or replayed, and existing rows of that kind replay cleanly (mini-agent-nvnkx.162).
+- Fixed: Ctrl-C closes an interrupted foreground shell call with what it printed instead of "outcome unknown" (the run is aborted and retired before unresolved calls are closed) (mini-agent-nvnkx.160).
+- Fixed: inputs queued while a run ends in an interrupt or error are returned to the editor (or the history and kill ring) instead of being dropped (mini-agent-nvnkx.291).
+- Fixed: a refused file rewind no longer cancels background tasks and saves the session (mini-agent-nvnkx.293).
+- Fixed: `/share` records its abort handle before the upload task can clear it (mini-agent-nvnkx.261).
 
 ### Added
 

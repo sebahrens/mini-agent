@@ -213,9 +213,7 @@ impl QuestionState {
             UserEvent::Key(key)
                 if matches!(key.code, KeyCode::Up | KeyCode::Down) && key.modifiers.is_empty()
         );
-        if !moves_selection
-            && let Some(scroll) = super::permission_handler::prompt_scroll(event)
-        {
+        if !moves_selection && let Some(scroll) = super::permission_handler::prompt_scroll(event) {
             super::permission_handler::apply_prompt_scroll(renderer, scroll)?;
             super::permission_handler::draw_prompt(renderer)?;
             return Ok(QuestionEvent::Waiting);
@@ -240,7 +238,7 @@ impl QuestionState {
             .expect("question owns reply")
             .questions
             .0[self.answers.len()]
-            .clone();
+        .clone();
         let mut answer = None;
         match event {
             UserEvent::Quit => return Ok(QuestionEvent::Unhandled),
@@ -324,10 +322,12 @@ impl QuestionState {
                             Answer::Option(self.selected)
                         });
                     }
-                    KeyCode::Char(' ') if question.multi_select && count > 0 => {
-                        if !self.checked.remove(&self.selected) {
-                            self.checked.insert(self.selected);
-                        }
+                    KeyCode::Char(' ')
+                        if question.multi_select
+                            && count > 0
+                            && !self.checked.remove(&self.selected) =>
+                    {
+                        self.checked.insert(self.selected);
                     }
                     KeyCode::Char(c @ '1'..='8') => {
                         let index = (c as usize) - ('1' as usize);
@@ -527,7 +527,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            state.draft(), answer,
+            state.draft(),
+            answer,
             "invalid terminal controls do not rewrite an answer"
         );
         state.handle(&key(KeyCode::Enter), &mut renderer).unwrap();
@@ -540,7 +541,8 @@ mod tests {
             .handle(&key(KeyCode::Char('é')), &mut renderer)
             .unwrap();
         assert_eq!(
-            state.draft(), full,
+            state.draft(),
+            full,
             "the limit counts UTF-8 bytes without truncating a character"
         );
         assert!(matches!(
@@ -659,22 +661,38 @@ mod tests {
         assert!(state.answers.is_empty());
         assert_eq!(state.selected, 2);
         // Up wraps, then the first option is chosen with a digit.
-        state.handle(&key(KeyCode::Char('1')), &mut renderer).unwrap();
+        state
+            .handle(&key(KeyCode::Char('1')), &mut renderer)
+            .unwrap();
         assert_eq!(state.answers, vec![Answer::Option(0)]);
         // Multi-select: Space ticks the highlighted option, a digit another,
         // pressing Space twice unticks.
-        state.handle(&key(KeyCode::Char(' ')), &mut renderer).unwrap();
-        state.handle(&key(KeyCode::Char(' ')), &mut renderer).unwrap();
-        state.handle(&key(KeyCode::Char(' ')), &mut renderer).unwrap();
-        state.handle(&key(KeyCode::Char('3')), &mut renderer).unwrap();
-        assert_eq!(state.checked.iter().copied().collect::<Vec<_>>(), vec![0, 2]);
+        state
+            .handle(&key(KeyCode::Char(' ')), &mut renderer)
+            .unwrap();
+        state
+            .handle(&key(KeyCode::Char(' ')), &mut renderer)
+            .unwrap();
+        state
+            .handle(&key(KeyCode::Char(' ')), &mut renderer)
+            .unwrap();
+        state
+            .handle(&key(KeyCode::Char('3')), &mut renderer)
+            .unwrap();
+        assert_eq!(
+            state.checked.iter().copied().collect::<Vec<_>>(),
+            vec![0, 2]
+        );
         assert!(matches!(
             state.handle(&key(KeyCode::Enter), &mut renderer).unwrap(),
             QuestionEvent::Finished
         ));
         match reply.await.unwrap() {
             QuestionAnswer::Answered(answers) => {
-                assert_eq!(answers, vec![Answer::Option(0), Answer::Options(vec![0, 2])])
+                assert_eq!(
+                    answers,
+                    vec![Answer::Option(0), Answer::Options(vec![0, 2])]
+                )
             }
             _ => panic!("expected answers"),
         }
@@ -685,7 +703,9 @@ mod tests {
         let (request, _reply) = request();
         let mut renderer = Renderer::for_app_test().unwrap();
         let mut state = QuestionState::begin(request, &mut renderer).unwrap();
-        state.handle(&key(KeyCode::Char('1')), &mut renderer).unwrap();
+        state
+            .handle(&key(KeyCode::Char('1')), &mut renderer)
+            .unwrap();
         assert!(state.text_mode, "question 2 is text-only");
         for c in "alpha beta".chars() {
             state.handle(&key(KeyCode::Char(c)), &mut renderer).unwrap();
@@ -701,7 +721,9 @@ mod tests {
         assert_eq!(state.editor.cursor, 5, "Left moves the cursor in text mode");
         // Clear the draft; Backspace on the empty draft returns to question 1.
         state.clear_draft();
-        state.handle(&key(KeyCode::Backspace), &mut renderer).unwrap();
+        state
+            .handle(&key(KeyCode::Backspace), &mut renderer)
+            .unwrap();
         assert!(state.answers.is_empty() && !state.text_mode);
     }
 }

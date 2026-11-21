@@ -1981,7 +1981,7 @@ impl InputEditor {
 
     /// Hand back inputs queued during a run that ended without running them:
     /// joined into the draft when the editor is empty (returns `true`),
-    /// otherwise pushed to the kill ring and input history (returns `false`).
+    /// otherwise pushed to the input history (returns `false`).
     pub(crate) fn recover_queued_inputs(&mut self, texts: &[String]) -> bool {
         if self.buffer.is_empty() && self.pastes.is_empty() {
             self.load_text(&texts.join("\n"));
@@ -1991,7 +1991,8 @@ impl InputEditor {
             if text.trim().is_empty() {
                 continue;
             }
-            self.push_kill(CompactString::from(text.as_str()));
+            // History only: the kill ring keeps its order, so Ctrl+Y still
+            // yanks the user's own latest draft first.
             if !crate::ui::slash::config::is_command(text) {
                 self.history.push(CompactString::from(text.as_str()));
             }
@@ -2476,7 +2477,7 @@ mod settings_history_tests {
         assert!(!busy.recover_queued_inputs(&texts));
         assert_eq!(busy.buffer, "draft");
         assert_eq!(busy.history.len(), 2);
-        assert_eq!(busy.kill_ring.first().map(|t| t.as_str()), Some("second"));
+        assert!(busy.kill_ring.is_empty());
     }
 
     #[test]

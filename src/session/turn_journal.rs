@@ -155,14 +155,10 @@ fn append_locked(
 /// Forget and delete the journal of `session_id`: the turn settled and the
 /// snapshot holds everything.
 pub(crate) fn discard(session_id: &str) {
-    let known = with_states(|states| states.remove(session_id).is_some());
+    with_states(|states| states.remove(session_id));
     // A journal left by an earlier process is stale once a snapshot settles.
     if let Ok(path) = crate::session::storage::turn_journal_path(session_id) {
-        if known {
-            let _ = std::fs::remove_file(path);
-        } else if std::fs::symlink_metadata(&path).is_ok() {
-            let _ = std::fs::remove_file(path);
-        }
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -321,7 +317,7 @@ mod tests {
             .unwrap()
             .expect("the snapshot loads");
         assert_eq!(reloaded.messages.len(), base_len + 5 + 1 /* notice */);
-        let roles: Vec<_> = reloaded.messages.iter().map(|m| m.role.clone()).collect();
+        let roles: Vec<_> = reloaded.messages.iter().map(|m| m.role).collect();
         assert!(roles.contains(&MessageRole::ToolCall));
         let unresolved = reloaded
             .messages

@@ -251,9 +251,7 @@ impl CodeState {
             } else {
                 None
             };
-            let Some(color) = color else {
-                return None;
-            };
+            let color = color?;
             self.spans += 1;
             return Some(
                 vec![TokenSpan {
@@ -350,9 +348,9 @@ impl CodeState {
                 while pos < bytes.len() {
                     scan_step();
                     let ch = display[pos..].chars().next().unwrap();
-                    if !identifier_start(ch)
-                        && !ch.is_ascii_digit()
-                        && !(ch == '-' && self.dashed_identifiers())
+                    if !(identifier_start(ch)
+                        || ch.is_ascii_digit()
+                        || ch == '-' && self.dashed_identifiers())
                     {
                         break;
                     }

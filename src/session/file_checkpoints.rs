@@ -2091,7 +2091,10 @@ mod journal_delta_tests {
         // An older turn's record is outside the delta.
         let delta = live.journal_delta(4);
         assert_eq!(delta["records"].as_array().unwrap().len(), 1);
-        assert_eq!(live.journal_delta(5)["records"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            live.journal_delta(5)["records"].as_array().unwrap().len(),
+            0
+        );
         // The snapshot on disk predates the turn: its inventory is empty.
         let snapshot = FileCheckpoints::default();
         assert!(snapshot.is_empty());
@@ -2100,10 +2103,22 @@ mod journal_delta_tests {
         assert_eq!(snapshot.revision(), 3);
         // Replaying twice adds nothing; a corrupt delta changes nothing.
         snapshot.apply_journal_delta(&delta).unwrap();
-        assert_eq!(snapshot.journal_delta(0)["records"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            snapshot.journal_delta(0)["records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
         let mut bad = delta.clone();
         bad["records"][0]["after"] = "not-a-digest".into();
         assert!(snapshot.apply_journal_delta(&bad).is_err());
-        assert_eq!(snapshot.journal_delta(0)["records"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            snapshot.journal_delta(0)["records"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 }

@@ -2538,7 +2538,11 @@ pub(crate) fn exit_summary(session: &Session, no_session: bool) -> Option<String
     );
     let cost = session.recorded_total_cost();
     if cost > 0.0 {
-        let marker = if session.cost_is_incomplete() { "+?" } else { "" };
+        let marker = if session.cost_is_incomplete() {
+            "+?"
+        } else {
+            ""
+        };
         usage.push_str(&format!(", ${cost:.4}{marker}"));
     }
     Some(format!(
@@ -2560,9 +2564,18 @@ mod exit_summary_tests {
         session.total_input_tokens = 1200;
         session.total_output_tokens = 300;
         let text = exit_summary(&session, false).unwrap();
-        assert!(text.contains(&format!("mini-agent --session {}", session.id)), "{text}");
-        assert!(text.contains("\"my session\"") && text.contains("1 turn, 1200 in / 300 out"), "{text}");
-        assert!(exit_summary(&session, true).is_none(), "unsaved sessions cannot be resumed");
+        assert!(
+            text.contains(&format!("mini-agent --session {}", session.id)),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"my session\"") && text.contains("1 turn, 1200 in / 300 out"),
+            "{text}"
+        );
+        assert!(
+            exit_summary(&session, true).is_none(),
+            "unsaved sessions cannot be resumed"
+        );
     }
 }
 

@@ -131,7 +131,11 @@ impl App<'_> {
         let Some(search) = self.transcript_search.as_ref() else {
             return Ok(());
         };
-        let Some(hit) = search.current.and_then(|index| search.hits.get(index)).cloned() else {
+        let Some(hit) = search
+            .current
+            .and_then(|index| search.hits.get(index))
+            .cloned()
+        else {
             return Ok(());
         };
         if hit.hidden {
@@ -142,13 +146,19 @@ impl App<'_> {
             let current = hits.iter().position(|h| h.block == hit.block && !h.hidden);
             if let Some(search) = self.transcript_search.as_mut() {
                 search.hits = hits;
-                search.current = current.or(search.current).filter(|i| *i < search.hits.len());
+                search.current = current
+                    .or(search.current)
+                    .filter(|i| *i < search.hits.len());
             }
         }
         let Some(search) = self.transcript_search.as_ref() else {
             return Ok(());
         };
-        if let Some(hit) = search.current.and_then(|index| search.hits.get(index)).cloned() {
+        if let Some(hit) = search
+            .current
+            .and_then(|index| search.hits.get(index))
+            .cloned()
+        {
             self.renderer.show_search_hit(&hit)?;
         }
         Ok(())
@@ -193,7 +203,9 @@ impl App<'_> {
                 }
                 self.step_search(true)?;
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => self.step_search(false)?,
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.step_search(false)?
+            }
             KeyCode::Enter => self.step_search(true)?,
             KeyCode::Backspace if typing => {
                 if let Some(search) = self.transcript_search.as_mut() {
@@ -201,8 +213,7 @@ impl App<'_> {
                 }
                 self.update_search(true)?;
             }
-            KeyCode::Char(c)
-                if typing && plain && !c.is_control() => {
+            KeyCode::Char(c) if typing && plain && !c.is_control() => {
                 if let Some(search) = self.transcript_search.as_mut()
                     && search.query.len() + c.len_utf8() <= 256
                 {

@@ -49,7 +49,10 @@ fn markdown75_preserves_transcript_order_and_structured_tool_arguments() {
     // stay fenced.
     assert_eq!(blocks.len(), 4);
     assert!(markdown.contains("\nhello there\n"), "{markdown}");
-    assert!(markdown.contains("\nhi! **how** can I help?\n"), "{markdown}");
+    assert!(
+        markdown.contains("\nhi! **how** can I help?\n"),
+        "{markdown}"
+    );
     let call: serde_json::Value = serde_json::from_str(&blocks[1]).unwrap();
     assert_eq!(call["name"], "bash");
     assert_eq!(call["arguments"], serde_json::json!({"command": "ls -la"}));
@@ -1023,11 +1026,26 @@ fn markdown56_conversation_text_exports_as_markdown_with_html_neutralised() {
         "# Plan\n\n- one\n- two `<b>kept</b>`\n\n```rust\nlet a = 1 < 2;\n```\n\n[bad](javascript:alert(1)) and [ok](https://example.com)\n\n<img src=x onerror=alert(1)>\n",
     );
     let markdown = session_to_markdown(&session);
-    assert!(markdown.contains("\n# Plan\n\n- one\n- two `<b>kept</b>`\n"), "{markdown}");
-    assert!(markdown.contains("```rust\nlet a = 1 < 2;\n```"), "{markdown}");
-    assert!(markdown.contains("&lt;script&gt;alert(1)&lt;/script&gt; please"), "{markdown}");
-    assert!(markdown.contains("&lt;img src=x onerror=alert(1)&gt;"), "{markdown}");
-    assert!(markdown.contains("\\[bad](javascript:alert(1))"), "{markdown}");
+    assert!(
+        markdown.contains("\n# Plan\n\n- one\n- two `<b>kept</b>`\n"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("```rust\nlet a = 1 < 2;\n```"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("&lt;script&gt;alert(1)&lt;/script&gt; please"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "{markdown}"
+    );
+    assert!(
+        markdown.contains("\\[bad](javascript:alert(1))"),
+        "{markdown}"
+    );
     assert!(markdown.contains("[ok](https://example.com)"), "{markdown}");
     use pulldown_cmark::{Event, Tag};
     for event in pulldown_cmark::Parser::new(&markdown) {
@@ -1045,9 +1063,9 @@ fn markdown56_conversation_text_exports_as_markdown_with_html_neutralised() {
 fn markdown56_compactions_are_noted_with_their_sidecar() {
     let session = compacted_session_with_provider_reasoning();
     let markdown = session_to_markdown(&session);
-    assert!(markdown.contains("2 messages were summarised by compaction 1"), "{markdown}");
     assert!(
-        markdown.contains(&format!(".precompact-1.jsonl")),
+        markdown.contains("2 messages were summarised by compaction 1"),
         "{markdown}"
     );
+    assert!(markdown.contains(".precompact-1.jsonl"), "{markdown}");
 }

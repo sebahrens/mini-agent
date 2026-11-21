@@ -1344,6 +1344,19 @@ have an ambiguous caller outcome. External aliases and approved parent identity
 are revalidated; symlink/FIFO workspace targets are refused. No file creation,
 implicit permission grant or notebook execution occurs.
 
+## Terminal markdown layout
+
+Agent text is laid out as markdown rows. Consecutive top-level paragraphs are separated by one
+blank row (the separator belongs to the paragraph's own streamed region, so a streamed and a
+whole-text layout agree; the last paragraph of a text gets none). Inside a quote or a loose list
+item a paragraph after a paragraph also gets a blank row; tight list items and soft breaks do not.
+Blockquote nesting is tracked as a depth, so every row of a nested quote carries one bar per level.
+Inline code is a colour span without its backticks (backticks remain in monochrome mode and in
+table cells). The reply's first row is laid out at `width - 2` for the `< ` marker, so the rest of
+the paragraph flows normally instead of the first row being re-wrapped afterwards. The line still
+being streamed is laid out like completed text: inline markdown is styled (an unclosed marker stays
+literal), and inside an open code fence it is drawn as code (hard-wrapped, code colour).
+
 ## Terminal code presentation
 
 `src/ui/highlight.rs` adds bounded lexical foreground spans to fenced Markdown.
@@ -1352,8 +1365,10 @@ at streamed fence boundaries and caching tokens independently of terminal width.
 Unknown fence labels and oversized blocks use the ordinary code foreground;
 monochrome mode skips tokenization. Theme changes invalidate token and layout caches.
 
-Common Rust, C-family, JavaScript/TypeScript, Python, JSON, TOML, shell and diff/patch
-labels are recognized. This is lexical presentation, with no code execution or
+Common Rust, C/C++, Go, Java, C#, Kotlin, Swift, JavaScript/TypeScript, Python, Ruby, PHP,
+Lua, JSON, TOML, YAML, SQL, HTML/XML, CSS, Dockerfile, HCL/Terraform, Markdown, shell
+(including `console`) and diff/patch labels (and aliases such as `yml`, `golang`, `kt`, `cs`)
+are recognized. This is lexical presentation, with no code execution or
 loaded grammar files. Model-authored diff fences do not become mutation metadata;
 actual typed mutation rows retain their existing event path and colors. Limits and
 the engine/size tradeoff are recorded in

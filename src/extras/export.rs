@@ -803,7 +803,9 @@ fn unclosed_fence(markdown: &str) -> Option<(char, usize)> {
         let rest = &trimmed[length..];
         open = match open {
             Some((open_character, open_length))
-                if open_character == character && length >= open_length && rest.trim().is_empty() =>
+                if open_character == character
+                    && length >= open_length
+                    && rest.trim().is_empty() =>
             {
                 None
             }

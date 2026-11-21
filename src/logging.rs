@@ -441,7 +441,7 @@ pub(crate) fn prune_stale_files(
             Some((metadata.modified().ok()?, path))
         })
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|file| std::cmp::Reverse(file.0));
     let mut removed = 0;
     for (index, (modified, path)) in files.iter().enumerate() {
         let too_old = now.duration_since(*modified).is_ok_and(|age| age > max_age);

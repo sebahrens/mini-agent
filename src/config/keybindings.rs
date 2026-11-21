@@ -99,7 +99,12 @@ const SPECS: &[ActionSpec] = &[
     app!(CycleMode, "cycle_mode", "shift+tab", "backtab"),
     app!(CycleReasoning, "cycle_reasoning", "alt+r"),
     app!(HistorySearch, "history_search", "ctrl+r"),
-    app!(TranscriptSearch, "transcript_search", "alt+s", "ctrl+shift+f"),
+    app!(
+        TranscriptSearch,
+        "transcript_search",
+        "alt+s",
+        "ctrl+shift+f"
+    ),
     app!(PageUp, "page_up", "pageup", "alt+up"),
     app!(PageDown, "page_down", "pagedown", "alt+down"),
     app!(

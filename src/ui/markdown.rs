@@ -522,15 +522,16 @@ pub(crate) fn markdown_with_code_state(
     for (event, range) in parser.into_offset_iter() {
         match event {
             Event::Start(tag) => match tag {
-                Tag::Paragraph => {
-                    if prev_para_in_container && (in_blockquote || !lists.frames.is_empty()) {
-                        result.push(blank_row(if in_blockquote {
-                            Color::DarkGrey
-                        } else {
-                            Color::White
-                        }));
-                    }
+                Tag::Paragraph
+                    if prev_para_in_container && (in_blockquote || !lists.frames.is_empty()) =>
+                {
+                    result.push(blank_row(if in_blockquote {
+                        Color::DarkGrey
+                    } else {
+                        Color::White
+                    }));
                 }
+                Tag::Paragraph => {}
                 Tag::Heading { level, .. } => {
                     flush_text(&acc, Color::White, max_width, &mut lists, &mut result);
                     acc.clear();
