@@ -3538,10 +3538,11 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
                     .as_deref()
                     .map(|env| format!("key from ${env}"))
                     .unwrap_or_else(|| "no env key".into()),
-                if crate::provider_presets::is_untouched(provider.as_str(), entry) {
-                    ", built-in preset"
-                } else {
-                    ""
+                match crate::provider_presets::find(provider.as_str())
+                    .filter(|_| crate::provider_presets::is_untouched(provider.as_str(), entry))
+                {
+                    Some(preset) => format!(", built-in preset: {}", preset.label),
+                    None => String::new(),
                 }
             ),
         ));

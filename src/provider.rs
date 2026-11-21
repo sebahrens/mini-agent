@@ -3473,6 +3473,7 @@ pub(crate) fn set_cli_fallback_model(model: Option<String>) {
 /// `fallback_model`; a quick-model alias or a model id on the session's
 /// provider. A fallback on another provider is refused with a warning (the
 /// turn's client, credentials and history protocol belong to the primary).
+#[cfg(test)]
 pub(crate) fn resolve_fallback_route(
     cfg: &Config,
     session: &crate::session::Session,
