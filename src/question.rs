@@ -189,9 +189,15 @@ impl QuestionRequired {
     }
 }
 
+/// Answered question batches one user turn may ask.
+pub(crate) const MAX_QUESTION_BATCHES_PER_TURN: u8 = 3;
+
 struct TurnState {
     id: String,
-    asked: bool,
+    /// Question batches charged against this turn's budget.
+    used: u8,
+    /// A claimed batch is awaiting its outcome; only one at a time.
+    in_flight: bool,
     required: Option<QuestionBatch>,
     answers: Vec<Answer>,
 }
@@ -200,7 +206,8 @@ impl Default for TurnState {
     fn default() -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
-            asked: false,
+            used: 0,
+            in_flight: false,
             required: None,
             answers: Vec::new(),
         }
@@ -263,13 +270,40 @@ impl QuestionTurn {
             .clone()
     }
 
+    /// Takes one slot of the turn's question budget for a batch the caller is
+    /// about to ask. One batch may be outstanding at a time, and a turn parked
+    /// on a required question accepts no more.
     pub(crate) fn claim(&self) -> Result<(), &'static str> {
         let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        if state.asked {
-            return Err("Ask at most once per user turn; batch questions in that call");
+        if state.required.is_some() || state.in_flight {
+            return Err(
+                "A clarifying question is already outstanding for this user turn; wait for its answer",
+            );
         }
-        state.asked = true;
+        if state.used >= MAX_QUESTION_BATCHES_PER_TURN {
+            return Err(
+                "Ask limit reached: at most 3 clarifying question batches per user turn; decide with a reasonable low-risk assumption or end the turn",
+            );
+        }
+        state.used += 1;
+        state.in_flight = true;
         Ok(())
+    }
+
+    /// Ends the outstanding batch. A batch the user never saw (transport
+    /// failure) is not charged: its slot is given back.
+    pub(crate) fn finish(&self, charged: bool) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        state.in_flight = false;
+        if !charged {
+            state.used = state.used.saturating_sub(1);
+        }
+    }
+
+    /// Batches still available this turn.
+    pub(crate) fn remaining(&self) -> u8 {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        MAX_QUESTION_BATCHES_PER_TURN.saturating_sub(state.used)
     }
 
     pub(crate) fn require(&self, batch: QuestionBatch) {
@@ -434,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_user_scope_isolation_preserves_the_once_per_turn_claim() {
+    async fn ask_user_scope_isolation_preserves_the_single_outstanding_claim() {
         assert!(QuestionTurn::current().is_none());
         let turn = QuestionTurn::default();
         scope(Some(turn.clone()), async {
@@ -487,6 +521,31 @@ mod tests {
             assert!(turn.claim().is_err());
         })
         .await;
+    }
+
+    #[test]
+    fn ask_user_budget_allows_sequential_batches_and_refunds_unseen_ones() {
+        let turn = QuestionTurn::default();
+        for _ in 0..MAX_QUESTION_BATCHES_PER_TURN {
+            turn.claim().unwrap();
+            turn.finish(true);
+        }
+        assert_eq!(turn.remaining(), 0);
+        assert!(turn.claim().unwrap_err().contains("limit"));
+        let fresh = QuestionTurn::default();
+        fresh.claim().unwrap();
+        fresh.finish(false);
+        assert_eq!(fresh.remaining(), MAX_QUESTION_BATCHES_PER_TURN);
+        fresh.claim().unwrap();
+        fresh.finish(true);
+        assert_eq!(fresh.remaining(), MAX_QUESTION_BATCHES_PER_TURN - 1);
+        fresh.claim().unwrap();
+        fresh.finish(true);
+        fresh.require(batch());
+        assert!(
+            fresh.claim().is_err(),
+            "a parked turn accepts no more questions"
+        );
     }
 
     #[tokio::test]

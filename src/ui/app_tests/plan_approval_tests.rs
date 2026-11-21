@@ -4054,19 +4054,20 @@ async fn ask_user_actual_app_numbered_text_batch_is_data_once_and_has_no_permiss
     key(&mut app, KeyCode::Enter).await;
     assert!(app.question_prompt.is_none() && app.renderer.permission_prompt.is_none());
     assert_eq!(app.input.buffer, "ordinary follow-up draft雪");
+    // A second batch in the same turn is allowed within the turn's budget.
+    next_question(&mut app).await;
+    key(&mut app, KeyCode::Char('1')).await;
+    user(&mut app, UserEvent::Paste("second answer".into())).await;
+    key(&mut app, KeyCode::Enter).await;
     assert!(finish_turn(&mut app).await);
     let calls = provider.calls();
-    assert_eq!(
-        calls.len(),
-        3,
-        "a repeated ask becomes an ordinary tool error, never another prompt"
-    );
+    assert_eq!(calls.len(), 3, "two answered asks, then the final answer");
     let second = serde_json::to_string(&calls[1]).unwrap();
     assert!(second.contains("allow_always /private/**") && second.contains("Literal task data雪"));
+    assert!(second.contains("2 clarifying question batch(es) left"));
+    let third = serde_json::to_string(&calls[2]).unwrap();
     assert!(
-        serde_json::to_string(&calls[2])
-            .unwrap()
-            .contains("at most once")
+        third.contains("second answer") && third.contains("1 clarifying question batch(es) left")
     );
     assert!(app.ask_rx.as_mut().unwrap().try_recv().is_err());
     assert_eq!(app.run.question_turn.as_ref().unwrap().id(), turn_id);
@@ -4724,7 +4725,7 @@ async fn ask_user_actual_pressure_restart_preserves_the_preclaimed_main_slot_and
                 && name.as_str() == "ask_user_question"
             {
                 assert!(*is_error);
-                assert!(output.contains("at most once"));
+                assert!(output.contains("already outstanding"), "{output}");
                 rejected_again = true;
             }
             crate::startup::heap_future(|| app.handle_agent_event(event))

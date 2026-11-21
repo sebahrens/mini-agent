@@ -435,6 +435,50 @@ fn make_tagged_line(line_num: usize, content: &str) -> String {
 }
 
 #[tokio::test]
+async fn test_hashedit_line_one_edit_preserves_a_utf8_bom() {
+    select_edit_system(EditSystem::Hashedit);
+    let tmp = TempFile::new("hash_bom.txt");
+    std::fs::write(tmp.path(), b"\xEF\xBB\xBFfn a() {}\nfn b() {}\n").unwrap();
+    // The CRC and the line tag cover the text without the byte-order mark.
+    let file_crc = crc32_hex(b"fn a() {}\nfn b() {}\n");
+    let result = edit::EditTool::new(None, None)
+        .call(EditArgs {
+            fuzzy: false,
+            path: tmp.path().into(),
+            replace_all: false,
+            block: None,
+            file_crc: Some(file_crc),
+            edits: Some(vec![EditOp {
+                line: Some(make_tagged_line(1, "fn a() {}")),
+                lines: None,
+                text: "fn c() {}".into(),
+            }]),
+        })
+        .await
+        .unwrap();
+    assert!(result.contains("UTF-8 with BOM"), "{result}");
+    assert_eq!(
+        std::fs::read(tmp.path()).unwrap(),
+        b"\xEF\xBB\xBFfn c() {}\nfn b() {}\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_edit_of_line_one_preserves_a_utf8_bom_and_adds_none() {
+    select_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_bom.txt");
+    std::fs::write(tmp.path(), b"\xEF\xBB\xBFalpha\nbeta\n").unwrap();
+    sim_edit(&tmp, "alpha", "ALPHA").await.unwrap();
+    assert_eq!(
+        std::fs::read(tmp.path()).unwrap(),
+        b"\xEF\xBB\xBFALPHA\nbeta\n"
+    );
+    std::fs::write(tmp.path(), b"alpha\nbeta\n").unwrap();
+    sim_edit(&tmp, "alpha", "ALPHA").await.unwrap();
+    assert_eq!(std::fs::read(tmp.path()).unwrap(), b"ALPHA\nbeta\n");
+}
+
+#[tokio::test]
 async fn test_hash_single_line_edit() {
     select_edit_system(EditSystem::Hashedit);
     let tmp = TempFile::new("hash_single.txt");
@@ -818,7 +862,100 @@ async fn test_sim_normalized_match_tabs_vs_spaces_inside_match() {
     assert!(result.contains("whitespace normalization"), "{result}");
     assert_eq!(
         std::fs::read_to_string(tmp.path()).unwrap(),
-        "fn a() {\n    z = 3;\n}\n"
+        "fn a() {\n\tz = 3;\n}\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_tab_indented_makefile_stays_valid() {
+    select_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_make_tabs.txt");
+    std::fs::write(tmp.path(), "all:\n\tgcc a.c\n\tgcc b.c\n").unwrap();
+    let result = sim_edit(
+        &tmp,
+        "    gcc a.c\n    gcc b.c",
+        "    gcc a.c b.c\n        -O2",
+    )
+    .await
+    .unwrap();
+    assert!(result.contains("tab indentation"), "{result}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "all:\n\tgcc a.c b.c\n\t\t-O2\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_exact_tab_search_is_untouched() {
+    select_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_exact_tabs.txt");
+    std::fs::write(tmp.path(), "a\n\tx\n").unwrap();
+    sim_edit(&tmp, "\tx", "\ty").await.unwrap();
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "a\n\ty\n");
+}
+
+#[tokio::test]
+async fn test_sim_tab_match_inside_expanded_tab_is_rejected() {
+    select_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_mid_tab.txt");
+    std::fs::write(tmp.path(), "a\n\tx = 1;\n\ty = 2;\n").unwrap();
+    let err = sim_edit(&tmp, "  x = 1;", "  z")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("tab-indented"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path()).unwrap(),
+        "a\n\tx = 1;\n\ty = 2;\n"
+    );
+}
+
+#[tokio::test]
+async fn test_sim_empty_replace_deletes_whole_lines() {
+    select_edit_system(EditSystem::Similarity);
+    let tmp = TempFile::new("sim_delete.txt");
+    std::fs::write(tmp.path(), "a\nb\nc\n").unwrap();
+    sim_edit(&tmp, "b", "").await.unwrap();
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "a\nc\n");
+
+    std::fs::write(tmp.path(), "a\r\nb\r\nc\r\n").unwrap();
+    sim_edit(&tmp, "b", "").await.unwrap();
+    assert_eq!(std::fs::read(tmp.path()).unwrap(), b"a\r\nc\r\n");
+
+    std::fs::write(tmp.path(), "a\nb\nc").unwrap();
+    sim_edit(&tmp, "c", "").await.unwrap();
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "a\nb");
+
+    std::fs::write(tmp.path(), "ab cd\n").unwrap();
+    sim_edit(&tmp, "b c", "").await.unwrap();
+    assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "ad\n");
+}
+
+#[test]
+fn test_parse_blocks_rejects_missing_replace_marker() {
+    let raw = "<<<<<<< SEARCH\na\n=======\nb\n<<<<<<< SEARCH\nc\n=======\nd\n>>>>>>> REPLACE\n";
+    let err = crate::agent::tools::edit::parse_blocks(raw)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("missing its"), "{err}");
+}
+
+#[test]
+fn test_parse_blocks_rejects_malformed_later_marker() {
+    let ok = "<<<<<<< SEARCH\na\n=======\nb\n>>>>>>> REPLACE\n";
+    for bad in ["<<<<<<< SEARCH \n", "<<<<<< SEARCH\n", "  <<<<<<< SEARCH\n"] {
+        let raw = format!("{ok}{bad}c\n=======\nd\n>>>>>>> REPLACE\n");
+        let err = crate::agent::tools::edit::parse_blocks(&raw)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("looks like a block marker"), "{err}");
+    }
+    let prose = format!("Here you go:\n{ok}\nDone.\n");
+    assert_eq!(
+        crate::agent::tools::edit::parse_blocks(&prose)
+            .unwrap()
+            .len(),
+        1
     );
 }
 
@@ -1422,13 +1559,13 @@ async fn edit_replace_all_includes_exact_and_normalized_unicode_spans() {
             "é keep\n\tvalue = 1; \nunchanged\n\tvalue = 1;  \nend\n",
             "    value = 1;",
             "    value = 2;",
-            "é keep\n    value = 2;\nunchanged\n    value = 2;\nend\n",
+            "é keep\n\tvalue = 2;\nunchanged\n\tvalue = 2;\nend\n",
         ),
         (
             "keep\n    value = 1;\nunchanged\n\tvalue = 1;  \nend\n",
             "    value = 1;",
             "    value = 2;",
-            "keep\n    value = 2;\nunchanged\n    value = 2;\nend\n",
+            "keep\n    value = 2;\nunchanged\n\tvalue = 2;\nend\n",
         ),
         (
             "keep\r\n\té = 1;  \r\n\r\n\r\n\tz = 2;\r\nbetween\r\n    é = 1;\r\n\r\n    z = 2;\r\nend\r\n",

@@ -6,6 +6,9 @@
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TextEncoding {
     Utf8,
+    /// UTF-8 text that starts with the EF BB BF byte-order mark. The mark is
+    /// stripped on decode and re-attached on publication.
+    Utf8Bom,
     Utf16Le,
     Utf16Be,
 }
@@ -14,9 +17,21 @@ impl TextEncoding {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Utf8 => "UTF-8",
+            Self::Utf8Bom => "UTF-8 with BOM",
             Self::Utf16Le => "UTF-16LE with BOM",
             Self::Utf16Be => "UTF-16BE with BOM",
         }
+    }
+}
+
+/// The UTF-8 byte-order mark.
+pub(crate) const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// Bytes after a leading UTF-8 BOM, and whether there was one.
+pub(crate) fn strip_utf8_bom(bytes: &[u8]) -> (&[u8], bool) {
+    match bytes.strip_prefix(&UTF8_BOM) {
+        Some(rest) => (rest, true),
+        None => (bytes, false),
     }
 }
 
@@ -57,6 +72,12 @@ pub(crate) fn decode_utf16_bom(bytes: &[u8]) -> Option<Result<(String, TextEncod
 pub(crate) fn encode(text: &str, encoding: TextEncoding) -> Vec<u8> {
     match encoding {
         TextEncoding::Utf8 => text.as_bytes().to_vec(),
+        TextEncoding::Utf8Bom => {
+            let mut out = Vec::with_capacity(3 + text.len());
+            out.extend_from_slice(&UTF8_BOM);
+            out.extend_from_slice(text.as_bytes());
+            out
+        }
         TextEncoding::Utf16Le | TextEncoding::Utf16Be => {
             let mut out = Vec::with_capacity(2 + text.len() * 2);
             let little = encoding == TextEncoding::Utf16Le;

@@ -109,6 +109,16 @@ fn welcome_header(model: &str, workspace_root: &std::path::Path) -> String {
     )
 }
 
+/// The line number a diff row's gutter shows, when it carries one.
+fn diff_row_number(row: &crate::agent::tools::mutation_diff::DiffRow) -> Option<u32> {
+    use crate::agent::tools::mutation_diff::DiffKind;
+    match row.kind {
+        DiffKind::Delete => row.old_line,
+        DiffKind::Add | DiffKind::Context => row.new_line,
+        DiffKind::Hunk | DiffKind::Notice => None,
+    }
+}
+
 /// Append a bounded historical mutation preview without opening its path.
 /// Rows contain inert text; semantic colors are renderer-owned, never ANSI
 /// supplied by files/model output. The ordinary result text limit is separate.
@@ -140,6 +150,16 @@ pub(crate) fn push_mutation_diff(
             "Imported recorded mutation preview (not current file state)",
         );
     }
+    // Right-aligned line-number gutter: the new line for added and context
+    // rows, the old line for deleted rows. Rows stored without numbers (older
+    // sessions) and non-code rows render without a gutter, as before.
+    let gutter_width = diff
+        .rows
+        .iter()
+        .take(limit)
+        .filter_map(diff_row_number)
+        .max()
+        .map_or(0, |max| max.to_string().len());
     feed.place_rows_after_anchor(
         anchor,
         diff.rows.iter().take(limit).map(|row| {
@@ -150,7 +170,22 @@ pub(crate) fn push_mutation_diff(
                 DiffKind::Hunk => (BlockStyle::DiffHunk, ""),
                 DiffKind::Notice => (BlockStyle::ToolResult, ""),
             };
-            (style, format!("{prefix}{}", sanitize_for_review(&row.text)))
+            let gutter = match diff_row_number(row) {
+                Some(number) => format!("{number:>gutter_width$} "),
+                None if gutter_width > 0
+                    && matches!(
+                        row.kind,
+                        DiffKind::Add | DiffKind::Delete | DiffKind::Context
+                    ) =>
+                {
+                    " ".repeat(gutter_width + 1)
+                }
+                None => String::new(),
+            };
+            (
+                style,
+                format!("{gutter}{prefix}{}", sanitize_for_review(&row.text)),
+            )
         }),
     );
     let omitted = diff
@@ -1191,12 +1226,15 @@ mod mutation_preview_tests {
         assert!(text.find("+newα").unwrap() < text.find("call b").unwrap());
         assert!(!text.contains("\x1b") && !text.contains("ZXZpbA=="));
         assert!(
-            (0..lines.len()).any(|index| lines[index].text.starts_with("+newα")
-                && lines[index].color == Color::Green)
+            (0..lines.len())
+                .any(|index| lines[index].text.contains("+newα")
+                    && lines[index].color == Color::Green)
         );
-        assert!((0..lines.len()).any(
-            |index| lines[index].text.starts_with("-old🙂") && lines[index].color == Color::Red
-        ));
+        assert!(
+            (0..lines.len())
+                .any(|index| lines[index].text.contains("-old🙂")
+                    && lines[index].color == Color::Red)
+        );
         assert!(
             (0..lines.len())
                 .any(|index| lines[index].text.starts_with("@@")

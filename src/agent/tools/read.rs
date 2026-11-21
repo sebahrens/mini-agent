@@ -84,6 +84,22 @@ fn not_utf8(path: &str) -> ToolError {
     ))
 }
 
+/// The first bytes of a file that sniff as binary, as in grep: a NUL byte in
+/// the first 8 KiB of a file without a UTF-16 BOM.
+const NUL_SNIFF_BYTES: u64 = 8192;
+
+fn binary_nul(path: &str, utf16_like: bool) -> ToolError {
+    if utf16_like {
+        ToolError::Msg(format!(
+            "Cannot read '{path}' as text: it contains NUL bytes in a pattern typical of UTF-16 text without a byte-order mark. Convert it first (for example `iconv -f UTF-16LE -t UTF-8`) with the shell tool."
+        ))
+    } else {
+        ToolError::Msg(format!(
+            "Cannot read '{path}' as text: it contains NUL bytes, so it looks like a binary file. Use the shell tool with `strings`, `xxd`, or another binary-aware command to inspect it."
+        ))
+    }
+}
+
 fn excerpt_cap_exceeded(cap: u64) -> ToolError {
     ToolError::Msg(format!(
         "Requested text window exceeds the {cap} byte read output cap. Re-call with a smaller limit or narrower offset/limit range; for very long lines, use character_offset/character_limit to select bounded Unicode characters. For non-text data use a binary-aware tool."
@@ -738,6 +754,10 @@ impl ReadTool {
                 reader.fill_buf().await?,
                 [0xFF, 0xFE, ..] | [0xFE, 0xFF, ..]
             );
+        // A UTF-8 BOM is not text: it is skipped here (so line 1, its hashedit
+        // tag and the file CRC cover only real content), reported in a note,
+        // and re-attached by edit and write.
+        let mut utf8_bom = false;
         let (mut reader, text_len, decoded_from): (
             std::pin::Pin<Box<dyn tokio::io::AsyncBufRead + Send>>,
             u64,
@@ -770,10 +790,28 @@ impl ReadTool {
             // The editor holds this file: serve its live text (unsaved changes
             // included). The path already passed the workspace, symlink and
             // permission checks above; the client only supplies its text.
+            let text = match text.strip_prefix('\u{feff}') {
+                Some(rest) => {
+                    utf8_bom = true;
+                    rest.to_string()
+                }
+                None => text,
+            };
             let len = text.len() as u64;
             (Box::pin(std::io::Cursor::new(text.into_bytes())), len, None)
         } else {
-            (Box::pin(reader), metadata.len(), None)
+            let mut len = metadata.len();
+            if metadata.is_file()
+                && reader
+                    .fill_buf()
+                    .await?
+                    .starts_with(&super::text_encoding::UTF8_BOM)
+            {
+                reader.consume(super::text_encoding::UTF8_BOM.len());
+                len = len.saturating_sub(super::text_encoding::UTF8_BOM.len() as u64);
+                utf8_bom = true;
+            }
+            (Box::pin(reader), len, None)
         };
         if character_window {
             if !metadata.is_file() {
@@ -883,6 +921,9 @@ impl ReadTool {
         let mut file_invalid_bytes = 0_u64;
         let mut window_invalid_bytes = 0_u64;
         let mut saw_nul = false;
+        let mut sniffed_nul = false;
+        let mut sniffed_utf16_like = false;
+        let mut sniffed_bytes = 0_u64;
         let mut scanned_bytes = 0_u64;
         // Lines are consumed in bounded chunks: an unselected or oversized line
         // is scanned without ever being retained, so a single arbitrarily long
@@ -932,6 +973,22 @@ impl ReadTool {
                 }
                 if file_invalid_bytes > 0 && body.contains(&0) {
                     saw_nul = true;
+                }
+                if sniffed_bytes < NUL_SNIFF_BYTES {
+                    let take = ((NUL_SNIFF_BYTES - sniffed_bytes) as usize).min(body.len());
+                    let head = &body[..take];
+                    let nuls = head.iter().filter(|byte| **byte == 0).count() as u64;
+                    if nuls > 0 {
+                        sniffed_nul = true;
+                        // Alternating NULs: at least a quarter of the sniffed bytes.
+                        if nuls * 4 >= take as u64 {
+                            sniffed_utf16_like = true;
+                        }
+                    }
+                    sniffed_bytes += take as u64 + 1;
+                    if sniffed_nul && !utf16_bom && file_invalid_bytes == 0 {
+                        return Err(binary_nul(&path, sniffed_utf16_like));
+                    }
                 }
                 // A carriage return at the end of a chunk is held back until the
                 // next byte decides whether it belongs to a CRLF terminator.
@@ -1179,6 +1236,11 @@ impl ReadTool {
                 "{info}\n\n[decoded from {encoding}; edit writes changes back in this encoding]"
             ),
             None => info,
+        };
+        let info = if utf8_bom {
+            format!("{info}\n\n[file starts with a UTF-8 BOM; edit and write preserve it]")
+        } else {
+            info
         };
         let info = match coaching {
             Some(msg) => format!("{}\n\n{}", msg, info),
@@ -1623,6 +1685,40 @@ mod tests {
 
         assert!(error.contains("explicit offset and/or limit"), "{error}");
         std::fs::remove_file(path).unwrap();
+    }
+
+    // mini-agent-nvnkx.25
+    #[tokio::test]
+    async fn nul_bytes_in_valid_utf8_are_binary_unless_utf16_bom() {
+        let dir =
+            std::env::temp_dir().join(format!("mini-agent-read-nul-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = ReadTool::new(None, None, None, 100);
+        let args = |path: &std::path::Path| ReadArgs {
+            pages: None,
+            raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
+            path: path.to_string_lossy().into_owned(),
+            offset: None,
+            limit: None,
+        };
+        let interleaved = dir.join("utf16-no-bom");
+        std::fs::write(&interleaved, b"a\0b\0c\0\n").unwrap();
+        let error = tool.call(args(&interleaved)).await.unwrap_err().to_string();
+        assert!(error.contains("NUL") && error.contains("iconv"), "{error}");
+        let zeros = dir.join("zeros");
+        std::fs::write(&zeros, vec![0u8; 64 * 1024]).unwrap();
+        let error = tool.call(args(&zeros)).await.unwrap_err().to_string();
+        assert!(error.contains("NUL"), "{error}");
+        let bom = dir.join("utf16-bom");
+        std::fs::write(&bom, b"\xFF\xFEh\0i\0\n\0").unwrap();
+        assert!(tool.call(args(&bom)).await.unwrap().contains("hi"));
+        let latin1 = dir.join("latin1");
+        std::fs::write(&latin1, b"caf\xe9 au lait\nsecond line\n").unwrap();
+        let shown = tool.call(args(&latin1)).await.unwrap();
+        assert!(shown.contains("invalid UTF-8"), "{shown}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]

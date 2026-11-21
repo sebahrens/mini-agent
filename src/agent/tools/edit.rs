@@ -118,6 +118,19 @@ const LITERAL_SAFE_BLOCK_MARKERS: BlockMarkers = BlockMarkers {
     replace: ">>>>>>>>>>> REPLACE",
 };
 
+/// A non-blank line between blocks that resembles a marker (wrong width,
+/// stray indent or text) is rejected instead of silently dropping the block
+/// it was meant to open.
+fn looks_like_marker_attempt(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty()
+        && (t.starts_with("<<<<")
+            || t.starts_with("====")
+            || t.starts_with(">>>>")
+            || t.contains("SEARCH")
+            || t.contains("REPLACE"))
+}
+
 pub(crate) fn parse_blocks(raw: &str) -> Result<Vec<EditBlock>, ToolError> {
     let mut blocks = Vec::new();
     let mut markers: Option<BlockMarkers> = None;
@@ -138,11 +151,29 @@ pub(crate) fn parse_blocks(raw: &str) -> Result<Vec<EditBlock>, ToolError> {
                 search_lines.clear();
                 replace_lines.clear();
                 phase = 1;
+            } else if looks_like_marker_attempt(line) {
+                return Err(ToolError::Msg(format!(
+                    "Malformed SEARCH/REPLACE input: line `{}` looks like a block marker but is not exactly `{}` (or the 11-character `{}`). Nothing was applied; fix the marker and resend.",
+                    line.chars().take(60).collect::<String>(),
+                    STANDARD_BLOCK_MARKERS.search,
+                    LITERAL_SAFE_BLOCK_MARKERS.search
+                )));
             }
             continue;
         }
 
         let active = markers.expect("active block markers");
+        if (phase == 1 || phase == 2)
+            && line == STANDARD_BLOCK_MARKERS.search
+            && active.search == STANDARD_BLOCK_MARKERS.search
+        {
+            return Err(ToolError::Msg(format!(
+                "Block {} is missing its {} marker before the next {} line; use the 11-character literal-safe markers (<<<<<<<<<<< SEARCH / =========== / >>>>>>>>>>> REPLACE) if the content really contains marker lines. Nothing was applied.",
+                blocks.len() + 1,
+                STANDARD_BLOCK_MARKERS.replace,
+                STANDARD_BLOCK_MARKERS.search
+            )));
+        }
         if phase == 1 && line == active.separator {
             phase = 2;
         } else if phase == 2 && line == active.replace {
@@ -729,6 +760,10 @@ async fn handle_similarity(
         byte_end: usize,
         replace: String,
         note: String,
+        /// Matched through normalization or fuzzy matching, so the source
+        /// region's leading whitespace may differ from the SEARCH text.
+        lenient: bool,
+        search: String,
     }
 
     let mut resolved: Vec<ResolvedSim> = Vec::new();
@@ -787,7 +822,9 @@ async fn handle_similarity(
                         byte_start: start,
                         byte_end: end,
                         replace: replace.clone(),
+                        lenient: !note.is_empty(),
                         note,
+                        search: search.clone(),
                     });
                 }
                 continue;
@@ -843,6 +880,8 @@ async fn handle_similarity(
                         byte_end: pos + search.len(),
                         replace: replace.clone(),
                         note: String::new(),
+                        lenient: false,
+                        search: String::new(),
                     });
                 }
             }
@@ -851,6 +890,8 @@ async fn handle_similarity(
                     byte_start: start,
                     byte_end: end,
                     replace: replace.clone(),
+                    lenient: true,
+                    search: search.clone(),
                     note: if disclose_source {
                         format!(
                             "matched after whitespace normalization; replaced region:\n{}",
@@ -885,6 +926,8 @@ async fn handle_similarity(
                     byte_start: start,
                     byte_end: end,
                     replace: replace.clone(),
+                    lenient: true,
+                    search: search.clone(),
                     note: if disclose_source {
                         format!(
                             "fuzzy match, {:.0}% similarity; replaced region:\n{}",
@@ -948,14 +991,168 @@ async fn handle_similarity(
     let mut notes = Vec::new();
     let mut ranges = Vec::new();
 
-    for rb in &resolved {
-        if !rb.note.is_empty() {
-            notes.push(rb.note.clone());
+    for (index, rb) in resolved.iter().enumerate() {
+        let mut replace = rb.replace.clone();
+        let mut note = rb.note.clone();
+        if rb.lenient {
+            match restore_tab_indentation(content, rb.byte_start, rb.byte_end, &rb.search, &replace)
+            {
+                Ok(Some(retabbed)) => {
+                    replace = retabbed;
+                    if !note.is_empty() {
+                        note.push_str("; ");
+                    }
+                    note.push_str("restored tab indentation in the replacement");
+                }
+                Ok(None) => {}
+                Err(message) => {
+                    return Err(ToolError::Msg(format!(
+                        "{message} (match {} of {}). No edits were applied.",
+                        index + 1,
+                        resolved.len()
+                    )));
+                }
+            }
         }
-        ranges.push((rb.byte_start, rb.byte_end, rb.replace.clone()));
+        let (start, end) = if replace.is_empty() {
+            whole_line_deletion_range(content, rb.byte_start, rb.byte_end)
+        } else {
+            (rb.byte_start, rb.byte_end)
+        };
+        if !note.is_empty() {
+            notes.push(note);
+        }
+        ranges.push((start, end, replace));
     }
 
     Ok((notes, ranges))
+}
+
+/// When a deletion (empty REPLACE) covers whole lines, widen the range over one
+/// line terminator so no blank line is left behind. A deleted unterminated last
+/// line takes the preceding terminator instead. Mid-line ranges are unchanged.
+fn whole_line_deletion_range(content: &str, start: usize, end: usize) -> (usize, usize) {
+    let bytes = content.as_bytes();
+    if start >= end || end > bytes.len() {
+        return (start, end);
+    }
+    let at_line_start = start == 0 || bytes[start - 1] == b'\n';
+    let at_line_end = end == bytes.len()
+        || bytes[end] == b'\n'
+        || (bytes[end] == b'\r' && bytes.get(end + 1) == Some(&b'\n'));
+    if !(at_line_start && at_line_end) {
+        return (start, end);
+    }
+    if end < bytes.len() {
+        let terminator = if bytes[end] == b'\r' { 2 } else { 1 };
+        return (start, end + terminator);
+    }
+    // Unterminated last line: remove the terminator that precedes it.
+    if start == 0 {
+        return (start, end);
+    }
+    let mut new_start = start - 1;
+    if new_start > 0 && bytes[new_start - 1] == b'\r' {
+        new_start -= 1;
+    }
+    (new_start, end)
+}
+
+fn leading_whitespace(line: &str) -> &str {
+    let trimmed = line.trim_start_matches([' ', '\t']);
+    &line[..line.len() - trimmed.len()]
+}
+
+fn expanded_width(ws: &str) -> usize {
+    ws.chars().map(|c| if c == '\t' { 4 } else { 1 }).sum()
+}
+
+/// A SEARCH written with spaces can match tab-indented source through the
+/// normalizer, which expands each tab to four spaces. Translate the
+/// replacement's leading four-space runs back to tabs so the file keeps its
+/// indentation style; fail when the mapping would not be uniform.
+fn restore_tab_indentation(
+    content: &str,
+    start: usize,
+    end: usize,
+    search: &str,
+    replace: &str,
+) -> Result<Option<String>, String> {
+    let matched = &content[start..end];
+    let source_from_line_start = start == 0 || content.as_bytes()[start - 1] == b'\n';
+    let skip = usize::from(!source_from_line_start);
+    let source_lines: Vec<&str> = matched
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .skip(skip)
+        .collect();
+    let search_lines: Vec<&str> = search
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .skip(skip)
+        .collect();
+    let source_has_tab = source_lines
+        .iter()
+        .any(|l| leading_whitespace(l).contains('\t'));
+    if !source_has_tab {
+        return Ok(None);
+    }
+    if search_lines
+        .iter()
+        .any(|l| leading_whitespace(l).contains('\t'))
+    {
+        return Ok(None); // SEARCH used real tabs; nothing was translated.
+    }
+    let tab_message =
+        "the matched region is tab-indented; retry with real tab characters in SEARCH and REPLACE";
+    // Every non-blank matched source line must use tabs, and paired lines
+    // must agree on their indentation width (otherwise the match started
+    // inside an expanded tab).
+    for line in source_lines.iter().filter(|l| !l.trim().is_empty()) {
+        let ws = leading_whitespace(line);
+        if !ws.is_empty() && !ws.contains('\t') {
+            return Err(format!(
+                "indentation of the matched region mixes tabs and spaces; {tab_message}"
+            ));
+        }
+    }
+    if source_lines.len() == search_lines.len() {
+        for (source, wanted) in source_lines.iter().zip(&search_lines) {
+            if source.trim().is_empty() {
+                continue;
+            }
+            if expanded_width(leading_whitespace(source))
+                != expanded_width(leading_whitespace(wanted))
+            {
+                return Err(tab_message.to_string());
+            }
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for (index, line) in replace.split('\n').enumerate() {
+        let (body, cr) = match line.strip_suffix('\r') {
+            Some(b) => (b, "\r"),
+            None => (line, ""),
+        };
+        if index < skip {
+            out.push(line.to_string());
+            continue;
+        }
+        let spaces = body.len() - body.trim_start_matches(' ').len();
+        let rest = &body[spaces..];
+        if spaces >= 4 && !rest.starts_with('\t') {
+            out.push(format!(
+                "{}{}{}{cr}",
+                "\t".repeat(spaces / 4),
+                " ".repeat(spaces % 4),
+                rest
+            ));
+        } else {
+            out.push(line.to_string());
+        }
+    }
+    let retabbed = out.join("\n");
+    Ok((retabbed != replace).then_some(retabbed))
 }
 
 fn final_edit_spans(ranges: &[(usize, usize, String)]) -> Vec<(usize, usize)> {
@@ -1333,7 +1530,7 @@ impl Tool for EditTool {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file (relative or absolute)" },
-                    "block": { "type": "string", "description": "One or more SEARCH/REPLACE blocks. Markers must begin at column 0. Standard form:\n<<<<<<< SEARCH\nexisting code to find\n=======\nreplacement code\n>>>>>>> REPLACE\n\nIf searched or replacement content contains any standard marker as a full line, use literal-safe markers instead:\n<<<<<<<<<<< SEARCH\ncontent including <<<<<<< SEARCH or =======\n===========\nreplacement including >>>>>>> REPLACE\n>>>>>>>>>>> REPLACE\n\nInclude multiple blocks for separate edits to the same file." },
+                    "block": { "type": "string", "description": "One or more SEARCH/REPLACE blocks. Markers must begin at column 0. Standard form:\n<<<<<<< SEARCH\nexisting code to find\n=======\nreplacement code\n>>>>>>> REPLACE\n\nIf searched or replacement content contains any standard marker as a full line, use literal-safe markers instead:\n<<<<<<<<<<< SEARCH\ncontent including <<<<<<< SEARCH or =======\n===========\nreplacement including >>>>>>> REPLACE\n>>>>>>>>>>> REPLACE\n\nInclude multiple blocks for separate edits to the same file. An empty REPLACE section deletes the matched whole lines, including their line terminator. A block whose markers are malformed, or whose REPLACE marker is missing, rejects the whole call." },
                     "replace_all": { "type": "boolean", "default": false, "description": "Replace all exact non-overlapping occurrences and disjoint whitespace-normalized variants of each SEARCH block. Overlapping normalized ranges are rejected. Cannot combine with fuzzy. When false, each SEARCH block must identify one unique target." },
                     "fuzzy": { "type": "boolean", "default": false, "description": "Explicitly allow one unique approximate match at >=85% similarity when exact and whitespace-normalized matching fail. Otherwise return a failure; with existing read permission, include a preview so exact text can be copied. Cannot combine with replace_all; lower-confidence and ambiguous matches still fail." }
                 },
@@ -1531,7 +1728,9 @@ impl EditTool {
         // first, then bound the read itself so a file growing after the stat
         // cannot allocate past the budget in the unsandboxed parent.
         let limit = self.max_text_file_size;
-        let recorded = file.metadata().await?.len();
+        let file_metadata = file.metadata().await?;
+        let recorded = file_metadata.len();
+        let hard_link_note = super::hard_link_note(&file_metadata);
         if recorded > limit {
             return Err(file_too_large(&expanded, recorded, limit));
         }
@@ -1570,7 +1769,14 @@ impl EditTool {
         // A UTF-16 file announced by its BOM is decoded strictly and written
         // back in the same encoding; its raw bytes are the checkpoint preimage.
         use super::text_encoding::{TextEncoding, decode_utf16_bom};
+        let bom_preimage = bytes
+            .starts_with(&super::text_encoding::UTF8_BOM)
+            .then(|| std::sync::Arc::<[u8]>::from(&bytes[..]));
         let (content, encoding, raw_preimage) = match String::from_utf8(bytes) {
+            Ok(mut text) if bom_preimage.is_some() => {
+                text.drain(..'\u{feff}'.len_utf8());
+                (text, TextEncoding::Utf8Bom, bom_preimage)
+            }
             Ok(text) => (text, TextEncoding::Utf8, None),
             Err(e) => {
                 let offset = e.utf8_error().valid_up_to();
@@ -1844,11 +2050,16 @@ impl EditTool {
         for note in &notes {
             result.push_str(&format!("\n  Note: {}", note));
         }
+        if client_edit.is_none()
+            && let Some(note) = &hard_link_note
+        {
+            result.push_str(&format!("\n  Note: {note}"));
+        }
         let private_fallback = formatted.as_ref().map(|formatted| {
             let mut safe = result.clone();
             safe.push_str(&replacement_excerpts(&ranges));
             safe.push('\n');
-            safe.push_str(formatted.status);
+            safe.push_str(&formatted.status);
             if let Some(coaching) = &coaching {
                 safe = format!("{coaching}\n\n{safe}");
             }
@@ -1857,7 +2068,7 @@ impl EditTool {
         result.push_str(&excerpts);
         if let Some(formatted) = &formatted {
             result.push('\n');
-            result.push_str(formatted.status);
+            result.push_str(&formatted.status);
         }
         if let Some(msg) = coaching {
             result = format!("{}\n\n{}", msg, result);

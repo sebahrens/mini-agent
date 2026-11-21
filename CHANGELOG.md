@@ -16,6 +16,12 @@ Notable changes to mini-agent are documented in this file. The format follows
 - Persona frontmatter `background: true` (delegations detach as background tasks), `memory: user|project|local` (private notes directory injected at start and writable through an `agent_memory` tool) and `hooks:` (scoped to the child's tool calls) are now implemented; memory and hooks are opt-in via `[subagents] agent_memory` / `agent_hooks` (mini-agent-scu2y).
 - Skills run with `/<name> args` now substitute `$ARGUMENTS`, `$ARGUMENTS[N]`, `$N` and `${CLAUDE_SKILL_DIR}`, rewrite ``!`cmd` `` spans into shell-tool instructions (`skills_shell_placeholders`), and honour `context: fork` with `agent:` by delegating the body to one `task` child (mini-agent-h7wxv).
 - Skill frontmatter `model` (forked skills; the `task` tool takes a per-call `model` limited to configured `[quick_models]` aliases and never overrides a persona-pinned model) and `paths` (automatic selection only when the request names a matching file); `effort` and `hooks` now report a reason (mini-agent-h7wxv).
+- Added: a file the agent just created or overwrote with `write` can be overwritten again without a read; an external change, a formatter rewrite or an editor-held write still requires one (mini-agent-nvnkx.24).
+- Added: `todo_write` items may omit `priority` (default `medium`) (mini-agent-nvnkx.31).
+- Added: `ask_user_question` allows three question batches per user turn, one at a time, and reports the remaining budget; a batch that never reached the user is not charged (mini-agent-nvnkx.30).
+- Added: edit/write diff previews carry a line-number gutter (old line for deletions, new line otherwise); stored previews without numbers render as before (mini-agent-nvnkx.257, intra-line highlighting not yet).
+- Added: replacing a file keeps its group and extended attributes (ACLs on Linux) and tells the model when other hard links keep the previous content (mini-agent-nvnkx.193).
+- Added: a failed format-after-edit command reports its exit status or signal to the model, logs and notifies the user with a stderr tail once per extension, and is skipped after three consecutive failures (mini-agent-nvnkx.246).
 
 ### Fixed
 
@@ -98,6 +104,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
   `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
   verification (mini-agent-0cshc).
+- SEARCH/REPLACE input with a missing REPLACE marker or a malformed later marker is rejected whole instead of writing marker lines or dropping a block (mini-agent-nvnkx.20).
+- An empty REPLACE section deletes whole lines instead of leaving a blank line (mini-agent-nvnkx.21).
+- A space-indented SEARCH matching tab-indented source keeps the file's tab indentation in the replacement, or fails when the mapping is not uniform (mini-agent-nvnkx.22).
+- A UTF-8 byte-order mark is preserved across read, hashedit/similarity edits of line 1 and write overwrite (mini-agent-nvnkx.23).
+- `read` treats NUL bytes in the first 8 KiB of an otherwise valid UTF-8 file as binary, like `grep` (mini-agent-nvnkx.25).
+- Diff previews use a linear-space Myers diff and split distant changes into hunks, so large rewrites no longer fall back to a coarse delete/re-add preview; the input cap is 16 MiB (mini-agent-nvnkx.247).
 
 ### Added
 

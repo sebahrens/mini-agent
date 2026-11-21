@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 
 pub(crate) const MAX_DIFF_LINES: usize = 1_000;
 pub(crate) const MAX_DIFF_BYTES: usize = 64 * 1024;
-pub(crate) const MAX_INPUT_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) const MAX_INPUT_LINES: usize = 100_000;
 pub(crate) const MAX_RANGES: usize = 128;
 const MAX_ROW_CHARS: usize = 500;
@@ -50,6 +50,13 @@ pub(crate) enum DiffKind {
 pub(crate) struct DiffRow {
     pub kind: DiffKind,
     pub text: String,
+    /// 1-based line in the old file (delete and context rows). Absent in rows
+    /// stored by earlier versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_line: Option<u32>,
+    /// 1-based line in the new file (add and context rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_line: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -166,6 +173,99 @@ fn line_identities<'a>(old: &[Line<'a>], new: &[Line<'a>]) -> (Vec<u32>, Vec<u32
     )
 }
 
+/// Work (line comparisons and diagonals visited) the line matching may spend
+/// on one preview.
+const MAX_MATCHING_WORK: usize = 40_000_000;
+/// Largest edit distance the matching explores. Beyond it the preview falls
+/// back to showing the core as deleted and re-added.
+const MAX_EDIT_DISTANCE: usize = 1_500;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EditOp {
+    Equal,
+    Delete,
+    Insert,
+}
+
+/// Myers O(ND) shortest edit script between two interned line sequences.
+/// `None` when the edit distance exceeds [`MAX_EDIT_DISTANCE`] or `budget`
+/// (shared across a preview, decremented by the work done) runs out.
+fn edit_script(old: &[u32], new: &[u32], budget: &mut usize) -> Option<Vec<EditOp>> {
+    let (n, m) = (old.len() as i64, new.len() as i64);
+    let max_d = (n + m).min(MAX_EDIT_DISTANCE as i64);
+    let offset = max_d + 1;
+    let mut v = vec![0i64; (2 * max_d + 3) as usize];
+    // `trace[d]` is the diagonal frontier before round `d`, restricted to the
+    // diagonals that round can read (-d-1..=d+1): O(D^2) memory in total.
+    let mut trace: Vec<Vec<i64>> = Vec::new();
+    let mut work = 0usize;
+    let mut found = None;
+    'rounds: for d in 0..=max_d {
+        trace.push(v[(offset - d - 1) as usize..=(offset + d + 1) as usize].to_vec());
+        let mut k = -d;
+        while k <= d {
+            let idx = (offset + k) as usize;
+            let mut x = if k == -d || (k != d && v[idx - 1] < v[idx + 1]) {
+                v[idx + 1]
+            } else {
+                v[idx - 1] + 1
+            };
+            let mut y = x - k;
+            while x < n && y < m && old[x as usize] == new[y as usize] {
+                x += 1;
+                y += 1;
+                work += 1;
+            }
+            work += 1;
+            v[idx] = x;
+            if x >= n && y >= m {
+                found = Some(d);
+                break 'rounds;
+            }
+            k += 2;
+        }
+        if work > *budget {
+            return None;
+        }
+    }
+    *budget = budget.saturating_sub(work);
+    let d_final = found?;
+    let mut ops = Vec::new();
+    let (mut x, mut y) = (n, m);
+    for d in (0..=d_final).rev() {
+        let (prev_x, prev_y) = if d == 0 {
+            (0, 0)
+        } else {
+            let frontier = &trace[d as usize];
+            let at = |k: i64| frontier[(k + d + 1) as usize];
+            let k = x - y;
+            let prev_k = if k == -d || (k != d && at(k - 1) < at(k + 1)) {
+                k + 1
+            } else {
+                k - 1
+            };
+            let px = at(prev_k);
+            (px, px - prev_k)
+        };
+        while x > prev_x && y > prev_y {
+            ops.push(EditOp::Equal);
+            x -= 1;
+            y -= 1;
+        }
+        if d > 0 {
+            ops.push(if x == prev_x {
+                EditOp::Insert
+            } else {
+                EditOp::Delete
+            });
+            x = prev_x;
+            y = prev_y;
+        }
+    }
+    ops.reverse();
+    Some(ops)
+}
+
 fn display_line(text: &str) -> &str {
     let without_lf = text.strip_suffix('\n').unwrap_or(text);
     if text.ends_with("\r\n") {
@@ -268,7 +368,7 @@ impl MutationDiff {
         };
         let mut total = 0usize;
         let mut retained_bytes = 0;
-        let mut row = |kind, text: &str| {
+        let mut row_at = |kind, text: &str, old_line: Option<usize>, new_line: Option<usize>| {
             total += 1;
             if result.rows.len() >= options.max_lines || retained_bytes >= MAX_DIFF_BYTES {
                 return;
@@ -296,21 +396,30 @@ impl MutationDiff {
                 result.rows.push(DiffRow {
                     kind,
                     text: clipped,
+                    old_line: old_line.and_then(|n| u32::try_from(n).ok()),
+                    new_line: new_line.and_then(|n| u32::try_from(n).ok()),
                 });
             }
         };
-        row(
+        row_at(
             DiffKind::Notice,
             &format!("--- {}", if before.is_none() { "/dev/null" } else { path }),
+            None,
+            None,
         );
-        row(DiffKind::Notice, &format!("+++ {path}"));
+        row_at(DiffKind::Notice, &format!("+++ {path}"), None, None);
         if before.is_some() && old != after && eq_ignoring_crlf(old, after) {
-            row(DiffKind::Notice, "Line endings changed (CRLF/LF)");
+            row_at(
+                DiffKind::Notice,
+                "Line endings changed (CRLF/LF)",
+                None,
+                None,
+            );
         }
         if result.content_unchanged {
-            row(DiffKind::Notice, "No content change");
+            row_at(DiffKind::Notice, "No content change", None, None);
         } else if old.is_empty() && after.is_empty() {
-            row(DiffKind::Notice, "Created empty file");
+            row_at(DiffKind::Notice, "Created empty file", None, None);
         } else {
             let mut windows: Vec<(usize, usize, usize, usize)> = Vec::new();
             for range in &result.ranges {
@@ -335,7 +444,7 @@ impl MutationDiff {
                     windows.push((os, oe, ns, ne));
                 }
             }
-            let mut matching_budget = 2_000_000usize;
+            let mut matching_budget = MAX_MATCHING_WORK;
             for (mut os, mut oe, mut ns, mut ne) in windows {
                 let (mut prefix, mut suffix) = (0, 0);
                 while os + prefix < oe
@@ -358,87 +467,127 @@ impl MutationDiff {
                 ne -= trim_suffix;
                 prefix -= trim_prefix;
                 suffix -= trim_suffix;
-                row(
-                    DiffKind::Hunk,
-                    &format!(
-                        "@@ -{},{} +{},{} @@",
-                        if oe == os { os } else { os + 1 },
-                        oe - os,
-                        if ne == ns { ns } else { ns + 1 },
-                        ne - ns
-                    ),
-                );
                 let old_core = &old_lines[os + prefix..oe - suffix];
                 let new_core = &new_lines[ns + prefix..ne - suffix];
-                for line in &old_lines[os..os + prefix] {
-                    row(DiffKind::Context, display_line(line.text));
-                }
-                let cells = old_core
-                    .len()
-                    .saturating_add(1)
-                    .saturating_mul(new_core.len().saturating_add(1));
-                if !old_core.is_empty() && !new_core.is_empty() && cells <= matching_budget {
-                    matching_budget -= cells;
-                    let width = new_core.len() + 1;
-                    let mut matches = vec![0u32; cells];
-                    for i in (0..old_core.len()).rev() {
-                        for j in (0..new_core.len()).rev() {
-                            matches[i * width + j] =
-                                if old_ids[os + prefix + i] == new_ids[ns + prefix + j] {
-                                    matches[(i + 1) * width + j + 1] + 1
-                                } else {
-                                    matches[(i + 1) * width + j].max(matches[i * width + j + 1])
-                                };
-                        }
-                    }
-                    let (mut i, mut j) = (0, 0);
-                    while i < old_core.len() || j < new_core.len() {
-                        if i < old_core.len()
-                            && j < new_core.len()
-                            && old_ids[os + prefix + i] == new_ids[ns + prefix + j]
-                        {
-                            row(DiffKind::Context, display_line(old_core[i].text));
-                            i += 1;
-                            j += 1;
-                        } else if j == new_core.len()
-                            || (i < old_core.len()
-                                && matches[(i + 1) * width + j] >= matches[i * width + j + 1])
-                        {
-                            row(DiffKind::Delete, display_line(old_core[i].text));
-                            if !old_core[i].text.ends_with('\n') {
-                                row(DiffKind::Notice, "No newline at end of old file");
-                            }
-                            i += 1;
-                        } else {
-                            row(DiffKind::Add, display_line(new_core[j].text));
-                            if !new_core[j].text.ends_with('\n') {
-                                row(DiffKind::Notice, "No newline at end of new file");
-                            }
-                            j += 1;
-                        }
-                    }
+                let (co, cn) = (os + prefix, ns + prefix);
+                let script = if !old_core.is_empty() && !new_core.is_empty() {
+                    edit_script(
+                        &old_ids[co..co + old_core.len()],
+                        &new_ids[cn..cn + new_core.len()],
+                        &mut matching_budget,
+                    )
                 } else {
-                    if !old_core.is_empty() && !new_core.is_empty() {
-                        row(
+                    None
+                };
+                let coarse = script.is_none() && !old_core.is_empty() && !new_core.is_empty();
+                let mut ops = vec![EditOp::Equal; prefix];
+                match script {
+                    Some(script) => ops.extend(script),
+                    None => {
+                        ops.extend(std::iter::repeat_n(EditOp::Delete, old_core.len()));
+                        ops.extend(std::iter::repeat_n(EditOp::Insert, new_core.len()));
+                    }
+                }
+                ops.extend(std::iter::repeat_n(EditOp::Equal, suffix));
+                // Old/new line index reached before each op.
+                let mut positions = Vec::with_capacity(ops.len() + 1);
+                let (mut i, mut j) = (os, ns);
+                for op in &ops {
+                    positions.push((i, j));
+                    match op {
+                        EditOp::Equal => (i, j) = (i + 1, j + 1),
+                        EditOp::Delete => i += 1,
+                        EditOp::Insert => j += 1,
+                    }
+                }
+                positions.push((i, j));
+                // Hunks: changes closer together than two context windows
+                // share a hunk; longer unchanged runs are elided.
+                let changes: Vec<usize> = ops
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, op)| **op != EditOp::Equal)
+                    .map(|(index, _)| index)
+                    .collect();
+                let mut announced_coarse = false;
+                let mut group = 0;
+                while group < changes.len() {
+                    let mut last = group;
+                    while last + 1 < changes.len()
+                        && changes[last + 1] - changes[last] - 1 <= 2 * options.context
+                    {
+                        last += 1;
+                    }
+                    let first_op = changes[group].saturating_sub(options.context);
+                    let last_op = (changes[last] + 1 + options.context).min(ops.len());
+                    let ((hos, hns), (hoe, hne)) = (positions[first_op], positions[last_op]);
+                    row_at(
+                        DiffKind::Hunk,
+                        &format!(
+                            "@@ -{},{} +{},{} @@",
+                            if hoe == hos { hos } else { hos + 1 },
+                            hoe - hos,
+                            if hne == hns { hns } else { hns + 1 },
+                            hne - hns
+                        ),
+                        None,
+                        None,
+                    );
+                    if coarse && !announced_coarse {
+                        announced_coarse = true;
+                        row_at(
                             DiffKind::Notice,
                             "Coarse replacement preview: line-matching work limit reached",
+                            None,
+                            None,
                         );
                     }
-                    for line in old_core {
-                        row(DiffKind::Delete, display_line(line.text));
-                        if !line.text.ends_with('\n') {
-                            row(DiffKind::Notice, "No newline at end of old file");
+                    for index in first_op..last_op {
+                        let (oi, ni) = positions[index];
+                        match ops[index] {
+                            EditOp::Equal => {
+                                row_at(
+                                    DiffKind::Context,
+                                    display_line(old_lines[oi].text),
+                                    Some(oi + 1),
+                                    Some(ni + 1),
+                                );
+                            }
+                            EditOp::Delete => {
+                                row_at(
+                                    DiffKind::Delete,
+                                    display_line(old_lines[oi].text),
+                                    Some(oi + 1),
+                                    None,
+                                );
+                                if !old_lines[oi].text.ends_with('\n') {
+                                    row_at(
+                                        DiffKind::Notice,
+                                        "No newline at end of old file",
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
+                            EditOp::Insert => {
+                                row_at(
+                                    DiffKind::Add,
+                                    display_line(new_lines[ni].text),
+                                    None,
+                                    Some(ni + 1),
+                                );
+                                if !new_lines[ni].text.ends_with('\n') {
+                                    row_at(
+                                        DiffKind::Notice,
+                                        "No newline at end of new file",
+                                        None,
+                                        None,
+                                    );
+                                }
+                            }
                         }
                     }
-                    for line in new_core {
-                        row(DiffKind::Add, display_line(line.text));
-                        if !line.text.ends_with('\n') {
-                            row(DiffKind::Notice, "No newline at end of new file");
-                        }
-                    }
-                }
-                for line in &new_lines[ne - suffix..ne] {
-                    row(DiffKind::Context, display_line(line.text));
+                    group = last + 1;
                 }
             }
         }
@@ -830,6 +979,110 @@ mod tests {
     }
 
     #[test]
+    fn edit_script_is_a_valid_minimal_script() {
+        let cases: [(&[u32], &[u32]); 6] = [
+            (&[1, 2, 3], &[1, 2, 3]),
+            (&[1, 2, 3], &[4, 5]),
+            (&[1, 2, 3, 4, 5], &[2, 3, 9, 5, 6]),
+            (&[], &[1, 2]),
+            (&[1, 1, 2, 1], &[1, 2, 1, 1]),
+            (&[7, 8], &[]),
+        ];
+        for (old, new) in cases {
+            let mut budget = MAX_MATCHING_WORK;
+            let script = edit_script(old, new, &mut budget).unwrap();
+            let (mut i, mut j) = (0, 0);
+            for op in &script {
+                match op {
+                    EditOp::Equal => {
+                        assert_eq!(old[i], new[j]);
+                        i += 1;
+                        j += 1;
+                    }
+                    EditOp::Delete => i += 1,
+                    EditOp::Insert => j += 1,
+                }
+            }
+            assert_eq!((i, j), (old.len(), new.len()), "{old:?} {new:?}");
+        }
+        let mut budget = MAX_MATCHING_WORK;
+        let script = edit_script(&[1, 2, 3, 4, 5], &[2, 3, 9, 5, 6], &mut budget).unwrap();
+        assert_eq!(script.iter().filter(|op| **op != EditOp::Equal).count(), 4);
+    }
+
+    #[test]
+    fn large_replacement_with_distant_changes_gets_a_real_preview() {
+        let before: String = (0..3000).map(|i| format!("line {i}\n")).collect();
+        let after = before
+            .replace("line 5\n", "changed 5\n")
+            .replace("line 2990\n", "changed 2990\n");
+        let diff =
+            MutationDiff::replacement("big.txt", Some(&before), &after, DiffOptions::default())
+                .unwrap();
+        let hunks = diff
+            .rows
+            .iter()
+            .filter(|row| row.kind == DiffKind::Hunk)
+            .count();
+        assert_eq!(hunks, 2, "two small changes far apart");
+        assert!(diff.rows.iter().all(|row| !row.text.contains("Coarse")));
+        let deleted: Vec<_> = diff
+            .rows
+            .iter()
+            .filter(|row| row.kind == DiffKind::Delete)
+            .map(|row| (row.text.as_str(), row.old_line))
+            .collect();
+        assert_eq!(deleted, [("line 5", Some(6)), ("line 2990", Some(2991))]);
+        let added: Vec<_> = diff
+            .rows
+            .iter()
+            .filter(|row| row.kind == DiffKind::Add)
+            .map(|row| (row.text.as_str(), row.new_line))
+            .collect();
+        assert_eq!(
+            added,
+            [("changed 5", Some(6)), ("changed 2990", Some(2991))]
+        );
+    }
+
+    #[test]
+    fn multi_megabyte_file_with_one_applied_range_keeps_its_hunk() {
+        let before = format!(
+            "{}tail\n",
+            "a fairly long filler line of text\n".repeat(90_000)
+        );
+        assert!(before.len() > 2 * 1024 * 1024 && before.len() < MAX_INPUT_BYTES);
+        let at = before.find("tail").unwrap();
+        let after = before.replace("tail", "TAIL");
+        let diff = MutationDiff::build(
+            "big.log",
+            Some(&before),
+            &after,
+            vec![AppliedRange {
+                before_start: at,
+                before_end: at + 4,
+                after_start: at,
+                after_end: at + 4,
+            }],
+            DiffOptions::default(),
+        )
+        .unwrap();
+        assert!(diff.bounded());
+        assert!(
+            diff.rows
+                .iter()
+                .any(|row| row.kind == DiffKind::Add && row.text == "TAIL")
+        );
+    }
+
+    #[test]
+    fn rows_stored_without_line_numbers_still_load() {
+        let row: DiffRow = serde_json::from_str(r#"{"kind":"add","text":"x"}"#).unwrap();
+        assert_eq!((row.old_line, row.new_line), (None, None));
+        assert!(!serde_json::to_string(&row).unwrap().contains("line"));
+    }
+
+    #[test]
     fn matching_work_and_config_are_bounded_without_claiming_minimality() {
         let before = "old\n".repeat(2000);
         let after = "new\n".repeat(2000);
@@ -1184,7 +1437,7 @@ mod tests {
                     "",
                     false,
                     false,
-                    "PRIVATE_NEIGHBOR\n\n",
+                    "PRIVATE_NEIGHBOR\n",
                 ),
                 (
                     "PRIVATE_NEIGHBOR\n\tvalue = 100;\n",

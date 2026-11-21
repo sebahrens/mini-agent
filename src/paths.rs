@@ -853,7 +853,8 @@ impl WorkspaceBinding {
         {
             return Err(crate::fs::stale_content_error(&path));
         }
-        drop(current);
+        // Kept open so the replacement can inherit its owner and attributes.
+        let original = current;
         let temp = sibling_temp_name(&name);
         let result = (|| {
             let mut options = cap_std::fs::OpenOptions::new();
@@ -871,8 +872,14 @@ impl WorkspaceBinding {
             file.flush()?;
             let file = file.into_std();
             if !private {
+                // Best effort: ownership and extended attributes (ACLs on
+                // Linux, Finder tags and provenance on macOS) follow the
+                // content; the mode is applied last because chown clears
+                // set-id bits.
+                copy_file_identity(&original, &file);
                 file.set_permissions(expected.permissions())?;
             }
+            drop(original);
             let replacement_metadata = crate::fs::checked_file_metadata(&file)?;
             drop(file);
             let current = open_file_no_follow(&parent, &name)?;
@@ -1357,6 +1364,126 @@ fn entry_matches_regular_file(
     Ok(crate::fs::ensure_same_file(Path::new("workspace replacement"), expected, &current).is_ok())
 }
 
+/// Copies the owner group (and the owner when permitted) and every extended
+/// attribute from `source` onto `target`, ignoring failures: a filesystem
+/// without xattrs, or an attribute this process may not set, never blocks an
+/// edit. Hard links are not preserved by the atomic exchange; callers report
+/// that from the link count they already hold.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub(crate) fn copy_file_identity(source: &std::fs::File, target: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let (source_fd, target_fd) = (source.as_raw_fd(), target.as_raw_fd());
+    if let Ok(metadata) = source.metadata() {
+        let none = libc::uid_t::MAX;
+        // SAFETY: both descriptors are open for the duration of the call.
+        let owner_and_group = unsafe { libc::fchown(target_fd, metadata.uid(), metadata.gid()) };
+        if owner_and_group != 0 {
+            // Only root may give a file away; the group is usually allowed.
+            // SAFETY: as above.
+            unsafe { libc::fchown(target_fd, none, metadata.gid()) };
+        }
+    }
+    copy_xattrs(source_fd, target_fd);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn copy_file_identity(_source: &std::fs::File, _target: &std::fs::File) {}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(unsafe_code)]
+fn copy_xattrs(source: std::os::fd::RawFd, target: std::os::fd::RawFd) {
+    #[cfg(target_os = "macos")]
+    unsafe fn list(fd: i32, buffer: *mut libc::c_char, size: usize) -> isize {
+        unsafe { libc::flistxattr(fd, buffer, size, 0) }
+    }
+    #[cfg(target_os = "linux")]
+    unsafe fn list(fd: i32, buffer: *mut libc::c_char, size: usize) -> isize {
+        unsafe { libc::flistxattr(fd, buffer, size) }
+    }
+    #[cfg(target_os = "macos")]
+    unsafe fn get(
+        fd: i32,
+        name: *const libc::c_char,
+        value: *mut libc::c_void,
+        size: usize,
+    ) -> isize {
+        unsafe { libc::fgetxattr(fd, name, value, size, 0, 0) }
+    }
+    #[cfg(target_os = "linux")]
+    unsafe fn get(
+        fd: i32,
+        name: *const libc::c_char,
+        value: *mut libc::c_void,
+        size: usize,
+    ) -> isize {
+        unsafe { libc::fgetxattr(fd, name, value, size) }
+    }
+    #[cfg(target_os = "macos")]
+    unsafe fn set(
+        fd: i32,
+        name: *const libc::c_char,
+        value: *const libc::c_void,
+        size: usize,
+    ) -> i32 {
+        unsafe { libc::fsetxattr(fd, name, value, size, 0, 0) }
+    }
+    #[cfg(target_os = "linux")]
+    unsafe fn set(
+        fd: i32,
+        name: *const libc::c_char,
+        value: *const libc::c_void,
+        size: usize,
+    ) -> i32 {
+        unsafe { libc::fsetxattr(fd, name, value, size, 0) }
+    }
+
+    // Names change between the size query and the read only if another
+    // process races the edit; a short or failed read just copies less.
+    // SAFETY (all calls): the descriptors are open and the buffers are sized
+    // by the preceding query.
+    let size = unsafe { list(source, std::ptr::null_mut(), 0) };
+    if size <= 0 || size > 1 << 20 {
+        return;
+    }
+    let mut names = vec![0u8; size as usize];
+    let size = unsafe { list(source, names.as_mut_ptr().cast(), names.len()) };
+    if size <= 0 {
+        return;
+    }
+    names.truncate(size as usize);
+    for name in names
+        .split(|byte| *byte == 0)
+        .filter(|name| !name.is_empty())
+    {
+        let Ok(name) = std::ffi::CString::new(name) else {
+            continue;
+        };
+        let length = unsafe { get(source, name.as_ptr(), std::ptr::null_mut(), 0) };
+        if !(0..=1 << 20).contains(&length) {
+            continue;
+        }
+        let mut value = vec![0u8; length as usize];
+        let read = unsafe {
+            get(
+                source,
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                value.len(),
+            )
+        };
+        if read < 0 {
+            continue;
+        }
+        value.truncate(read as usize);
+        let _ = unsafe { set(target, name.as_ptr(), value.as_ptr().cast(), value.len()) };
+    }
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn copy_xattrs(_source: std::os::fd::RawFd, _target: std::os::fd::RawFd) {}
+
 fn open_file_no_follow(directory: &cap_std::fs::Dir, name: &OsStr) -> io::Result<std::fs::File> {
     open_file_no_follow_impl(directory, name, false)
 }
@@ -1755,6 +1882,104 @@ mod workspace_binding_tests {
             "concurrent user change",
             "the newer user contents must survive"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[allow(unsafe_code)]
+    #[test]
+    fn guarded_replacement_keeps_extended_attributes() {
+        use std::os::fd::AsRawFd;
+        let root = temp_root("xattr-copy");
+        let target = root.join("file.txt");
+        std::fs::write(&target, "old").unwrap();
+        let name = std::ffi::CString::new("user.mini_agent_test").unwrap();
+        let file = std::fs::File::open(&target).unwrap();
+        #[cfg(target_os = "macos")]
+        let set = unsafe {
+            libc::fsetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                b"v1".as_ptr().cast(),
+                2,
+                0,
+                0,
+            )
+        };
+        #[cfg(target_os = "linux")]
+        let set = unsafe {
+            libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), b"v1".as_ptr().cast(), 2, 0)
+        };
+        drop(file);
+        if set != 0 {
+            // The temp filesystem has no user xattrs (for example tmpfs).
+            std::fs::remove_dir_all(root).unwrap();
+            return;
+        }
+        let binding = WorkspaceBinding::capture(&root).unwrap();
+        let opened = binding.open_relative(Path::new("file.txt")).unwrap();
+        let expected = crate::fs::checked_file_metadata(&opened).unwrap();
+        drop(opened);
+        binding
+            .replace_relative_atomic_expecting(
+                Path::new("file.txt"),
+                b"new",
+                &expected,
+                &crate::fs::ContentDigest::of(b"old"),
+            )
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        let file = std::fs::File::open(&target).unwrap();
+        let mut value = [0u8; 8];
+        #[cfg(target_os = "macos")]
+        let read = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                8,
+                0,
+                0,
+            )
+        };
+        #[cfg(target_os = "linux")]
+        let read = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                name.as_ptr(),
+                value.as_mut_ptr().cast(),
+                8,
+            )
+        };
+        assert_eq!(read, 2, "the attribute survives the replacement");
+        assert_eq!(&value[..2], b"v1");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_replacement_preserves_group_and_mode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = temp_root("group-copy");
+        let target = root.join("file.txt");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&target).unwrap();
+        let binding = WorkspaceBinding::capture(&root).unwrap();
+        let opened = binding.open_relative(Path::new("file.txt")).unwrap();
+        let expected = crate::fs::checked_file_metadata(&opened).unwrap();
+        drop(opened);
+        binding
+            .replace_relative_atomic_expecting(
+                Path::new("file.txt"),
+                b"new",
+                &expected,
+                &crate::fs::ContentDigest::of(b"old"),
+            )
+            .unwrap();
+        let after = std::fs::metadata(&target).unwrap();
+        assert_eq!(after.gid(), before.gid());
+        assert_eq!(after.permissions().mode() & 0o777, 0o640);
         std::fs::remove_dir_all(root).unwrap();
     }
 

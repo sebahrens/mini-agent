@@ -331,6 +331,10 @@ impl WriteTool {
             let mut created = false;
             let mut checkpoint;
             let mut digests = None;
+            let mut keep_bom = false;
+            let mut bom_file = false;
+            let mut hard_link_note = None;
+            let mut client_written = false;
             // Open, stat and read run on the blocking pool; the decision logic stays here.
             enum Probe {
                 Exists,
@@ -403,7 +407,16 @@ impl WriteTool {
                                 Some((std::sync::Arc::clone(client), client_path, text));
                         }
                     }
-                    let (crc, lines) = full_text_fingerprint(&current)?;
+                    // A UTF-8 BOM is not text: the read tool skips it, so the
+                    // fingerprint covers the bytes after it and the mark is
+                    // re-attached to the replacement.
+                    let (text_bytes, had_bom) = super::text_encoding::strip_utf8_bom(&current);
+                    bom_file = had_bom;
+                    if client_overwrite.is_none() {
+                        hard_link_note = super::hard_link_note(&metadata);
+                    }
+                    keep_bom = had_bom && !args.content.starts_with('\u{feff}');
+                    let (crc, lines) = full_text_fingerprint(text_bytes)?;
                     if !self
                         .read_tracker
                         .permits_full_overwrite(&expanded, &metadata, crc, lines)
@@ -417,10 +430,16 @@ impl WriteTool {
                     let base = crate::fs::ContentDigest::of(&current);
                     // One shared copy of the preimage serves both the checkpoint
                     // and the diff preview; `current` is dropped after the copy.
+                    let (text_bytes, had_bom) = super::text_encoding::strip_utf8_bom(&current);
                     let shared: std::sync::Arc<str> = std::sync::Arc::from(
-                        std::str::from_utf8(&current)
+                        std::str::from_utf8(text_bytes)
                             .expect("full text fingerprint validates UTF-8"),
                     );
+                    let raw_preimage: std::sync::Arc<[u8]> = if had_bom {
+                        std::sync::Arc::from(&current[..])
+                    } else {
+                        std::sync::Arc::from(std::sync::Arc::clone(&shared))
+                    };
                     drop(current);
                     if self.diff_options.max_lines > 0
                         && shared.len() <= super::mutation_diff::MAX_INPUT_BYTES
@@ -432,7 +451,7 @@ impl WriteTool {
                         workspace,
                         relative,
                         Some(crate::session::file_checkpoints::Preimage::new(
-                            std::sync::Arc::<[u8]>::from(shared),
+                            raw_preimage,
                             &base,
                         )),
                         super::mutation_diff::preimage_allowed(&self.permission, &expanded, true),
@@ -440,6 +459,7 @@ impl WriteTool {
                     .await;
                     digests = Some(base);
                     if let Some((client, client_path, before)) = &client_overwrite {
+                        client_written = true;
                         super::client_fs::write_client_text(
                             client,
                             client_path,
@@ -458,11 +478,21 @@ impl WriteTool {
                         // Move the content through the blocking publication and take
                         // it back instead of copying it.
                         let content = std::mem::take(&mut args.content);
+                        let bom = keep_bom;
                         let (published, content) =
                             crate::agent::runner::spawn_blocking_scoped(move || {
+                                let with_bom;
+                                let bytes = if bom {
+                                    with_bom =
+                                        [&super::text_encoding::UTF8_BOM[..], content.as_bytes()]
+                                            .concat();
+                                    &with_bom[..]
+                                } else {
+                                    content.as_bytes()
+                                };
                                 let published = workspace.replace_relative_atomic_expecting(
                                     &owned_relative,
-                                    content.as_bytes(),
+                                    bytes,
                                     &expected,
                                     &base,
                                 );
@@ -505,13 +535,24 @@ impl WriteTool {
                 }
             }
             crate::session::file_checkpoints::published();
-            let after_digest = crate::fs::ContentDigest::of(args.content.as_bytes());
+            let (after_digest, written_len) = if keep_bom {
+                let published =
+                    [&super::text_encoding::UTF8_BOM[..], args.content.as_bytes()].concat();
+                (crate::fs::ContentDigest::of(&published), published.len())
+            } else {
+                (
+                    crate::fs::ContentDigest::of(args.content.as_bytes()),
+                    args.content.len(),
+                )
+            };
             if let Some(checkpoint) = &mut checkpoint {
-                checkpoint.committed(&after_digest, args.content.len());
+                checkpoint.committed(&after_digest, written_len);
             }
             self.read_tracker.untrack_read_path(&expanded);
             let formatted = match &self.formatter {
-                Some(formatter) => {
+                // The formatter checks the file bytes against the text it is
+                // given; a file that keeps a BOM is left as written.
+                Some(formatter) if !keep_bom => {
                     crate::startup::heap_future(|| {
                         formatter.run(
                             &requested,
@@ -524,7 +565,7 @@ impl WriteTool {
                     })
                     .await
                 }
-                None => None,
+                _ => None,
             };
             let final_content = match &formatted {
                 Some(formatted) => formatted.content.as_deref(),
@@ -537,9 +578,32 @@ impl WriteTool {
             }
             // Unformatted output is exactly the bytes already digested above.
             let unformatted = formatted.is_none();
+            let digest_exact = unformatted && !bom_file;
+            // The model supplied exactly these bytes, so it has "seen" the
+            // file: a following overwrite needs no read. A formatter rewrite
+            // or an editor-held (client) write invalidates that knowledge.
+            if unformatted
+                && !client_written
+                && let Ok((crc, lines)) = full_text_fingerprint(args.content.as_bytes())
+            {
+                let reopened = {
+                    let workspace = std::sync::Arc::clone(workspace);
+                    let relative = relative.to_path_buf();
+                    crate::agent::runner::spawn_blocking_scoped(move || {
+                        workspace
+                            .open_relative(&relative)
+                            .and_then(|file| file.metadata())
+                    })
+                    .await
+                };
+                if let Ok(Ok(metadata)) = reopened {
+                    self.read_tracker
+                        .record_authored_full_text(&expanded, &metadata, crc, lines);
+                }
+            }
             let mut diff = if created {
                 final_content.and_then(|content| {
-                    if unformatted {
+                    if digest_exact {
                         MutationDiff::replacement_with_digests(
                             &expanded,
                             None,
@@ -557,7 +621,7 @@ impl WriteTool {
                     .as_deref()
                     .zip(final_content)
                     .and_then(|(before, content)| {
-                        if unformatted {
+                        if digest_exact {
                             MutationDiff::replacement_with_digests(
                                 &expanded,
                                 Some(before),
@@ -577,12 +641,15 @@ impl WriteTool {
                     })
             };
             let mut result = format!("Written {} bytes to {}", bytes, expanded);
+            if let Some(note) = &hard_link_note {
+                result.push_str(&format!("\n  Note: {note}"));
+            }
             if let Some(msg) = coaching {
                 result = format!("{}\n\n{}", msg, result);
             }
             if let Some(formatted) = &formatted {
                 result.push('\n');
-                result.push_str(formatted.status);
+                result.push_str(&formatted.status);
             }
             let private_fallback = formatted.as_ref().map(|_| result.clone());
             #[cfg(feature = "lsp")]
@@ -641,6 +708,7 @@ impl WriteTool {
             instructions.before_mutation(path, extensions).await?;
         }
         let mut preview_before = None;
+        let mut keep_bom = false;
         let existing = if path.exists() {
             tracing::debug!("tool write file exists: path={}", expanded);
             if !args.overwrite {
@@ -661,7 +729,9 @@ impl WriteTool {
                 &expanded,
             )
             .await?;
-            let (crc, lines) = full_text_fingerprint(&current)?;
+            let (text_bytes, had_bom) = super::text_encoding::strip_utf8_bom(&current);
+            keep_bom = had_bom && !args.content.starts_with('\u{feff}');
+            let (crc, lines) = full_text_fingerprint(text_bytes)?;
             if !self.read_tracker.permits_full_overwrite(
                 &path.to_string_lossy(),
                 &metadata,
@@ -683,7 +753,7 @@ impl WriteTool {
                 )
             {
                 preview_before = Some(
-                    std::str::from_utf8(&current)
+                    std::str::from_utf8(text_bytes)
                         .expect("full text fingerprint validates UTF-8")
                         .to_owned(),
                 );
@@ -712,7 +782,14 @@ impl WriteTool {
         let created = existing.is_none();
         crate::session::file_checkpoints::skipped();
         if let Some(base) = existing {
-            crate::fs::atomic_write_resolved_expecting(path, &args.content, approved_parent, base)
+            let published;
+            let content: &str = if keep_bom {
+                published = format!("\u{feff}{}", args.content);
+                &published
+            } else {
+                &args.content
+            };
+            crate::fs::atomic_write_resolved_expecting(path, content, approved_parent, base)
                 .await?;
         } else {
             crate::fs::atomic_create_resolved_checked(path, &args.content, approved_parent)
@@ -722,7 +799,7 @@ impl WriteTool {
         crate::session::file_checkpoints::published();
         self.read_tracker.untrack_read_path(&path.to_string_lossy());
         let formatted = match &self.formatter {
-            Some(formatter) => {
+            Some(formatter) if !keep_bom => {
                 crate::startup::heap_future(|| {
                     formatter.run(
                         path,
@@ -735,7 +812,7 @@ impl WriteTool {
                 })
                 .await
             }
-            None => None,
+            _ => None,
         };
         let final_content = match &formatted {
             Some(formatted) => formatted.content.as_deref(),
@@ -766,7 +843,7 @@ impl WriteTool {
 
         if let Some(formatted) = &formatted {
             result.push('\n');
-            result.push_str(formatted.status);
+            result.push_str(&formatted.status);
         }
         let private_fallback = formatted.as_ref().map(|_| result.clone());
         #[cfg(feature = "lsp")]
@@ -918,6 +995,151 @@ mod tests {
             .unwrap();
 
         assert_eq!(std::fs::read_to_string(target).unwrap(), "replacement\n");
+    }
+
+    fn rd(path: &str) -> ReadArgs {
+        ReadArgs {
+            pages: None,
+            raw_notebook: false,
+            character_offset: None,
+            character_limit: None,
+            path: path.into(),
+            offset: None,
+            limit: None,
+        }
+    }
+
+    fn wr(path: &str, content: &str) -> WriteArgs {
+        WriteArgs {
+            path: path.into(),
+            content: content.into(),
+            overwrite: true,
+        }
+    }
+
+    // mini-agent-nvnkx.24
+    #[tokio::test]
+    async fn a_file_the_agent_just_wrote_can_be_overwritten_without_a_read() {
+        let temp = TempDir::new("write-own-overwrite");
+        let tracker = ReadTracker::new(true);
+        let write = WriteTool::new_with_tracker(None, None, None, tracker.clone())
+            .with_workspace(temp.path());
+        let create = WriteArgs {
+            path: "own.txt".into(),
+            content: "one\ntwo\n".into(),
+            overwrite: false,
+        };
+        write.call(create).await.unwrap();
+        write.call(wr("own.txt", "three\n")).await.unwrap();
+        write.call(wr("own.txt", "four\nfive\n")).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("own.txt")).unwrap(),
+            "four\nfive\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_external_change_after_own_write_still_requires_a_read() {
+        let temp = TempDir::new("write-own-external");
+        let tracker = ReadTracker::new(true);
+        let write =
+            WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(temp.path());
+        write
+            .call(WriteArgs {
+                path: "own.txt".into(),
+                content: "one\n".into(),
+                overwrite: false,
+            })
+            .await
+            .unwrap();
+        // Same length, so only the content CRC can tell.
+        std::fs::write(temp.path().join("own.txt"), "two\n").unwrap();
+        let error = write
+            .call(wr("own.txt", "three\n"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("complete current read"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("own.txt")).unwrap(),
+            "two\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_formatter_rewrite_keeps_the_read_requirement_after_own_write() {
+        let temp = TempDir::new("write-own-formatter");
+        let formatter = crate::agent::tools::format_after_edit::FormatAfterEdit::new(
+            &std::collections::BTreeMap::from([("txt".into(), "true \"{file}\"".into())]),
+            crate::sandbox::Sandbox::new(false, "bwrap"),
+        );
+        let write = WriteTool::new_with_tracker(None, None, None, ReadTracker::new(true))
+            .with_workspace(temp.path())
+            .with_formatter(formatter);
+        write
+            .call(WriteArgs {
+                path: "own.txt".into(),
+                content: "one\n".into(),
+                overwrite: false,
+            })
+            .await
+            .unwrap();
+        let error = write
+            .call(wr("own.txt", "two\n"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("complete current read"), "{error}");
+    }
+
+    // mini-agent-nvnkx.193
+    #[tokio::test]
+    async fn overwrite_of_a_hard_linked_file_says_the_other_names_keep_old_content() {
+        let temp = TempDir::new("write-hardlink");
+        let target = temp.path().join("a.txt");
+        std::fs::write(&target, "old\n").unwrap();
+        std::fs::hard_link(&target, temp.path().join("b.txt")).unwrap();
+        let tracker = ReadTracker::new(true);
+        let read = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
+            .with_workspace(temp.path());
+        let write =
+            WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(temp.path());
+        read.call(rd("a.txt")).await.unwrap();
+        let output = write.call(wr("a.txt", "new\n")).await.unwrap();
+        assert!(output.contains("2 hard links"), "{output}");
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new\n");
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("b.txt")).unwrap(),
+            "old\n"
+        );
+    }
+
+    // mini-agent-nvnkx.23
+    #[tokio::test]
+    async fn overwrite_keeps_a_utf8_bom_and_never_adds_one() {
+        let temp = TempDir::new("write-bom");
+        let tracker = ReadTracker::new(true);
+        let read = ReadTool::new_with_tracker(None, None, None, 100, tracker.clone())
+            .with_workspace(temp.path());
+        let write =
+            WriteTool::new_with_tracker(None, None, None, tracker).with_workspace(temp.path());
+        let with_bom = temp.path().join("bom.cs");
+        std::fs::write(&with_bom, b"\xEF\xBB\xBFclass A {}\n").unwrap();
+        let shown = read.call(rd("bom.cs")).await.unwrap();
+        assert!(!shown.contains('\u{feff}'), "{shown}");
+        assert!(shown.contains("UTF-8 BOM"), "{shown}");
+        write.call(wr("bom.cs", "class B {}\n")).await.unwrap();
+        assert_eq!(
+            std::fs::read(&with_bom).unwrap(),
+            b"\xEF\xBB\xBFclass B {}\n"
+        );
+
+        let plain = temp.path().join("plain.cs");
+        std::fs::write(&plain, "class A {}\n").unwrap();
+        let shown = read.call(rd("plain.cs")).await.unwrap();
+        assert!(!shown.contains("UTF-8 BOM"), "{shown}");
+        write.call(wr("plain.cs", "class B {}\n")).await.unwrap();
+        assert_eq!(std::fs::read(&plain).unwrap(), b"class B {}\n");
     }
 
     #[tokio::test]

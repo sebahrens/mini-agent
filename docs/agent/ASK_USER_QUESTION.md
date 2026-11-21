@@ -3,10 +3,14 @@
 `ask_user_question` asks the user for missing task information. It is available
 only to the ordinary main agent when tools are enabled and the tool allowlist
 includes it. Children, side questions, advisors and format repairs cannot use
-this clarification channel. Ask at most once in a user turn, batching missing
-choices in that call; transport retries, context relief, generated phases and
-automatic goal rounds preserve that slot. New submitted user text or approval to
-execute a reviewed plan starts a fresh slot.
+this clarification channel. A user turn has a budget of three question
+batches, asked one at a time (batch related questions in one call); the tool
+result reports how many remain. A batch that never reached the user (the
+transport failed or the reply channel closed) is not charged, and a turn parked
+on a pending question accepts no more. Transport retries, context relief,
+generated phases and automatic goal rounds share the turn's budget. New
+submitted user text or approval to execute a reviewed plan starts a fresh
+budget.
 
 Use either `{question, options?, allow_free_text?}` or
 `{questions: [{question, options?, allow_free_text?}, ...]}`. Each option has

@@ -551,6 +551,34 @@ composition is close to the SEARCH text (heavily repetitive or generated
 files) can exhaust it; the error then says that no closest-match suggestion
 was computed.
 
+SEARCH/REPLACE input is validated as a whole before anything is written: a
+standard SEARCH marker inside an unfinished block (a missing REPLACE marker), or a
+non-blank line between blocks that looks like a marker but is not exact
+(`<<<<<< SEARCH`, a trailing space, an indent), rejects the call with the line
+named. An empty REPLACE section deletes the matched whole lines together with
+their line terminator (an unterminated last line takes the preceding one), while
+a match inside a line is replaced in place. When a space-indented SEARCH matches
+a tab-indented region through whitespace normalization, the replacement's
+leading four-space runs are written back as tabs; if the matched region mixes
+tabs and spaces, or the match starts inside an expanded tab, the call fails and
+asks for real tabs. A file that starts with a UTF-8 byte-order mark is read
+without it (a note says so; tags and the file CRC cover the text after it), and
+`edit` and `write` with `overwrite: true` put it back; post-edit formatters are
+skipped for such files. `read` refuses files with a NUL byte in their first
+8 KiB (as `grep` does) unless they carry a UTF-16 BOM; interleaved NULs get an
+`iconv` hint. A file the agent has just created or overwritten with `write` can
+be overwritten again without a `read` (the model supplied those exact bytes);
+an external change, a formatter rewrite, an editor-held file or an `edit` still
+require a fresh complete read. Replacing a file keeps its group, extended
+attributes and (on Linux) ACLs; other hard links keep the previous content and
+the result says so. A failed format-after-edit command reports its exit status
+or signal to the model (never its output), tells the user the stderr tail once
+per extension (log and notice sink), and is skipped for that extension after
+three consecutive failures in a session. `todo_write` items may omit
+`priority` (default `medium`). `ask_user_question` allows three question
+batches per user turn, one outstanding at a time; a batch that never reached
+the user is not charged.
+
 SEARCH/REPLACE edits require a unique match, including occurrences that overlap
 in the original or whitespace-normalized text. For example, `aba` is ambiguous
 in `ababa`; add context to select the intended occurrence. With `replace_all`,
