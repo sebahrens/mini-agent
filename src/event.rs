@@ -175,6 +175,7 @@ pub enum AgentEvent {
         args: serde_json::Value,
         /// Internal id of the outer `task` call this child call belongs to,
         /// when the emitting task could tell (display attribution only).
+        #[cfg_attr(not(feature = "acp"), allow(dead_code))]
         outer: Option<CompactString>,
     },
     #[cfg(feature = "subagents")]
@@ -182,6 +183,7 @@ pub enum AgentEvent {
         agent_type: CompactString,
         source: CompactString,
         /// Internal id of the outer `task` call, when known.
+        #[cfg_attr(not(feature = "acp"), allow(dead_code))]
         outer: Option<CompactString>,
     },
     /// A terminal failure, with the canonical messages for work that already
@@ -333,6 +335,8 @@ pub enum UserEvent {
     ScrollPageDown,
     Resize,
     Paste(String),
+    // Sent only from the non-test opener; tests construct it directly.
+    #[cfg_attr(test, allow(dead_code))]
     LinkOpenFailed(String),
     /// A background `/share confirm` upload finished: the gist URL or the error.
     #[cfg(feature = "export")]

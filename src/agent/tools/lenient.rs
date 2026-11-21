@@ -171,6 +171,7 @@ pub(crate) fn auto_background_flag<'de, D: Deserializer<'de>>(
     boolean(deserializer, "auto_background")
 }
 
+#[cfg(feature = "lsp")]
 pub(crate) fn full_text_flag<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<bool>, D::Error> {
@@ -207,13 +208,21 @@ integer_field!(character_limit_usize, "character_limit", usize);
 integer_field!(max_results_u64, "max_results", u64);
 integer_field!(since_u64, "since", u64);
 integer_field!(timeout_ms_u64, "timeout_ms", u64);
+#[cfg(feature = "lsp")]
 integer_field!(wait_ms_u64, "wait_ms", u64);
+#[cfg(feature = "lsp")]
 integer_field!(line_u32, "line", u32);
+#[cfg(feature = "lsp")]
 integer_field!(column_u32, "column", u32);
+#[cfg(feature = "lsp")]
 integer_field!(end_line_u32, "end_line", u32);
+#[cfg(feature = "lsp")]
 integer_field!(end_column_u32, "end_column", u32);
+#[cfg(feature = "lsp")]
 integer_field!(action_u32, "action", u32);
+#[cfg(feature = "lsp")]
 integer_field!(edit_usize, "edit", usize);
+#[cfg(feature = "lsp")]
 integer_field!(text_offset_usize, "text_offset", usize);
 integer_field!(cell_index_usize, "cell_index", usize);
 

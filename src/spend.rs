@@ -1022,6 +1022,7 @@ impl Account {
     pub(crate) fn admit_effect(&self) -> anyhow::Result<()> {
         self.admit_effect_reason().map_err(Into::into)
     }
+    #[cfg(any(test, feature = "acp"))]
     pub(crate) fn admit(&self, prices: PriceSnapshot) -> anyhow::Result<()> {
         self.admit_reason(prices).map_err(Into::into)
     }

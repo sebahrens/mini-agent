@@ -2026,11 +2026,11 @@ fn changed_file(
 /// Subagents install this (the parent's [`MutationDiffHook`] also forwards
 /// diffs to the interactive event sink, which a child must not do), so edits
 /// made by a write persona fire the same hook as the parent's own.
-#[cfg(feature = "hooks")]
+#[cfg(all(feature = "hooks", feature = "subagents"))]
 #[derive(Clone, Copy)]
 pub(crate) struct FileChangedHook;
 
-#[cfg(feature = "hooks")]
+#[cfg(all(feature = "hooks", feature = "subagents"))]
 impl<M: rig::completion::CompletionModel> rig::agent::AgentHook<M> for FileChangedHook {
     async fn on_event(
         &self,

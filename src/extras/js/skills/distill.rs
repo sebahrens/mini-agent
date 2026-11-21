@@ -1086,6 +1086,7 @@ mod tests {
                     output: CompactString::new("6"),
                     images: Vec::new(),
                     artifact_path: None,
+                    is_error: false,
                 }),
             ),
         ]
@@ -1182,6 +1183,7 @@ mod tests {
                 output: CompactString::new("6"),
                 images: Vec::new(),
                 artifact_path: None,
+                is_error: false,
             }),
         )];
         assert_eq!(

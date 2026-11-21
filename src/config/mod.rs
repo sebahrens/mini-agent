@@ -2032,6 +2032,7 @@ impl Config {
         self.auto_update_prompts
     }
 
+    #[cfg(feature = "archmd")]
     pub fn resolve_architecture_prompt(&self) -> bool {
         self.architecture_prompt.unwrap_or(true)
     }

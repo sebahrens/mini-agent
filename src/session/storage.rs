@@ -173,7 +173,11 @@ pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<Str
 #[derive(Debug)]
 pub(crate) enum ExactLoadRefusal {
     /// The session was saved for a different workspace (the saved label).
-    WorkspaceMismatch { saved: String },
+    WorkspaceMismatch {
+        // Read by the ACP load-failure report only.
+        #[cfg_attr(not(feature = "acp"), allow(dead_code))]
+        saved: String,
+    },
     /// The file is not a session this build can read.
     Incompatible,
     /// The file holds a different session than the requested id.
