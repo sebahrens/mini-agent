@@ -86,6 +86,9 @@ pub enum PauseReason {
     UnknownStatusOnLoad,
     /// The user parked it: `/goal pause`, or an interrupt they asked for.
     UserRequested,
+    /// A goal check timed out or could not start, repeatedly: a configuration
+    /// problem the worker cannot fix by editing code.
+    CheckUnavailable,
 }
 
 impl PauseReason {
@@ -98,6 +101,7 @@ impl PauseReason {
             Self::RoundFailure => "consecutive agent runs failed",
             Self::UnknownStatusOnLoad => "the stored goal status is not recognized",
             Self::UserRequested => "you paused it",
+            Self::CheckUnavailable => "a goal check could not run to completion",
         }
     }
 }
@@ -510,6 +514,15 @@ pub struct GoalProgress {
     /// Fingerprint of the previous round's all-failing mutating calls, so an
     /// identical failure repeated next round is not counted as progress.
     pub last_failure_fingerprint: Option<u64>,
+    /// Consecutive evaluations whose check timed out or could not start, so a
+    /// configuration problem parks the goal instead of burning every round.
+    pub check_unavailable: u32,
+    /// Whether the goal's checks have run against the current workspace, so a
+    /// round that changed nothing can reuse the result instead of rerunning
+    /// the suite.
+    pub last_feedback_checked: bool,
+    /// The failing output of that run, when it failed.
+    pub last_feedback_failure: Option<String>,
 }
 
 impl GoalProgress {
@@ -757,7 +770,7 @@ impl Goal {
     /// Record one gate evaluation of `round`, discarding the oldest beyond
     /// [`MAX_ROUND_HISTORY`]. Consecutive evaluations of the same round are
     /// numbered as attempts.
-    pub fn push_history(&mut self, round: u32, summary: &str) {
+    pub fn push_history(&mut self, round: u32, summary: &str) -> u32 {
         let attempt = self
             .history
             .back()
@@ -781,6 +794,7 @@ impl Goal {
         while self.history.len() > MAX_ROUND_HISTORY {
             self.history.pop_front();
         }
+        attempt
     }
 
     /// Append a model report, discarding the oldest beyond [`MAX_REPORTS`].
@@ -857,6 +871,9 @@ impl Goal {
         self.progress.consecutive_blocked = 0;
         self.progress.consecutive_round_failures = 0;
         self.progress.judge_failures = 0;
+        self.progress.check_unavailable = 0;
+        self.progress.last_feedback_checked = false;
+        self.progress.last_feedback_failure = None;
     }
 
     pub fn touch(&mut self) {
@@ -1002,7 +1019,18 @@ impl GoalStore {
     pub fn status_label(&self) -> Option<String> {
         let slot = self.lock();
         let goal = slot.as_ref().filter(|goal| !goal.status.is_terminal())?;
-        let progress = format!("goal {}/{}", goal.progress.rounds, goal.bounds.max_rounds);
+        // The wrap-up round runs after the bound is reached, so say so rather
+        // than showing a counter past its maximum.
+        let wrap_up = if goal.progress.wrap_up_issued {
+            " +wrap-up"
+        } else {
+            ""
+        };
+        let progress = format!(
+            "goal {}/{}{wrap_up}",
+            goal.progress.rounds.min(goal.bounds.max_rounds),
+            goal.bounds.max_rounds
+        );
         Some(if goal.status == GoalStatus::Active {
             progress
         } else {
@@ -1035,6 +1063,17 @@ impl GoalStore {
         #[cfg(feature = "hooks")]
         publish_hook_info(guard.as_ref());
         result
+    }
+
+    /// Record the judge a verification actually resolved, so the status line,
+    /// the transcript and the "own model" caveat describe the model that
+    /// judged rather than the one resolved when the goal was created.
+    pub fn record_judge(&self, resolved: Option<&ResolvedJudge>) {
+        self.with_mut(|goal| {
+            if goal.resolved_judge.as_ref() != resolved {
+                goal.resolved_judge = resolved.cloned();
+            }
+        });
     }
 
     /// Record a model report against the current round.

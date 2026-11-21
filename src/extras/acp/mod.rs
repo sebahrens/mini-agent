@@ -4937,7 +4937,7 @@ async fn settle_acp_goal_round(
             .is_some_and(|command| !command.trim().is_empty()),
     );
     summary.end = match (error, reason) {
-        (Some(error), _) => RoundEnd::Failed(error.to_string()),
+        (Some(error), _) => RoundEnd::from_error(error.to_string()),
         (None, StopReason::EndTurn) => RoundEnd::Done,
         (None, StopReason::Cancelled) => RoundEnd::Cancelled,
         (None, other) => RoundEnd::Failed(format!("{other:?}")),
@@ -4948,6 +4948,7 @@ async fn settle_acp_goal_round(
     // the line and in `_meta`, wherever it is settled.
     let (main_provider, main_model) = acp_provider_and_model(&state.cli, cfg);
     let judge = crate::extras::goal::judge::resolve(&goal.judge, cfg, &main_provider, &main_model);
+    store.record_judge(judge.as_ref());
     let transcript = crate::extras::goal::judge::transcript_from_interactions(interactions);
     let outcome = driver::settle_round(store, summary, |request| async move {
         let checks = crate::extras::goal::checks::run(&goal, &request, sandbox, cfg).await;

@@ -6779,10 +6779,13 @@ impl<'a> App<'a> {
             return Ok(());
         }
         if self.run.is_running && !super::allowed_while_running(text) {
-            self.renderer.write_line(
-                "finish or stop the current turn before changing model, session or context",
-                C_ERROR,
-            )?;
+            let message = if text.split_whitespace().next() == Some("/goal") {
+                "a goal round is running: press Esc or run /goal pause first \
+                 (/goal status, bounds and check work while it runs)"
+            } else {
+                "finish or stop the current turn before changing model, session or context"
+            };
+            self.renderer.write_line(message, C_ERROR)?;
             return Ok(());
         }
         if (selected_session.is_some() || text.split_whitespace().next() == Some("/fork"))
@@ -9120,6 +9123,7 @@ mod input_reader_lifecycle_tests {
                 UserEvent::GoalVerificationDone(Box::new(crate::event::GoalVerificationEvent {
                     operation_id,
                     checks: Some(crate::extras::goal::gate::CheckOutcome {
+                        failure_kind: Default::default(),
                         all_passed: true,
                         failure_tail: Some(format!("completion-{round}")),
                         verified: Vec::new(),

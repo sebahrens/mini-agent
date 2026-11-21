@@ -114,6 +114,10 @@ async fn handle_loop(parts: &[&str], ctx: &mut SlashCtx<'_>) -> anyhow::Result<(
         write_error(ctx.renderer, LOOP_USAGE);
         return Ok(());
     }
+    if let Some(refusal) = super::goal::native_goal_refusal(ctx) {
+        write_error(ctx.renderer, refusal);
+        return Ok(());
+    }
     // The plan lives in the workspace the agent edits, not wherever the
     // process happened to start: after `/worktree` the two differ, and a
     // relative path would have every round re-read the original checkout's

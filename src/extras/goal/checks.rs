@@ -13,7 +13,7 @@
 //!
 //! Owning specification: `docs/specs/goals.md` (Verification tiers).
 
-use super::gate::{CheckOutcome, VerifyRequest};
+use super::gate::{CheckFailureKind, CheckOutcome, VerifyRequest};
 use super::{Goal, VerificationKind};
 use crate::sandbox::{CommandLimits, Sandbox};
 
@@ -91,6 +91,7 @@ where
         if let Err(error) = crate::spend::run::admit_current_effect().await {
             return (
                 Some(CheckOutcome {
+                    failure_kind: CheckFailureKind::Unavailable,
                     all_passed: false,
                     failure_tail: Some(error.to_string()),
                     verified,
@@ -140,6 +141,7 @@ where
             );
             return (
                 Some(CheckOutcome {
+                    failure_kind: failure_kind(&result),
                     all_passed: false,
                     failure_tail: Some(format!(
                         "{} failed:\n{}",
@@ -158,12 +160,24 @@ where
 
     (
         Some(CheckOutcome {
+            failure_kind: CheckFailureKind::Exit,
             all_passed: true,
             failure_tail: None,
             verified,
         }),
         false,
     )
+}
+
+/// Whether a failed check is a finding about the work or about the check: a
+/// timeout or a command that never started says nothing about the objective
+/// and no edit fixes it.
+fn failure_kind(result: &crate::extras::validation::ValidationResult) -> CheckFailureKind {
+    use crate::extras::validation::ValidationStatus;
+    match result.status {
+        ValidationStatus::TimedOut | ValidationStatus::Failed => CheckFailureKind::Unavailable,
+        _ => CheckFailureKind::Exit,
+    }
 }
 
 /// A check cut short by an interrupt: never evidence the objective was met,
@@ -174,6 +188,7 @@ fn interrupted_outcome(
     verified: Vec<VerificationKind>,
 ) -> CheckOutcome {
     CheckOutcome {
+        failure_kind: CheckFailureKind::Exit,
         all_passed: false,
         failure_tail: Some(format!(
             "{} interrupted:\n{}",

@@ -4889,6 +4889,7 @@ async fn run_headless_goal_rounds_inner(
                 &session.provider,
                 &session.model,
             );
+            session.goal_store.record_judge(judge.as_ref());
             // The round that just ran is persisted after the gate settles, so
             // the session does not contain it yet and the judge would be shown
             // every round except the one it was asked about. The turn's own
