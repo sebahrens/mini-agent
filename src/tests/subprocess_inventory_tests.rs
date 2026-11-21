@@ -1283,6 +1283,12 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         2,
         "NON-PROCESS",
     ),
+    (
+        "src/extras/acp/mod.rs",
+        ".status(ToolCallStatus::Failed)",
+        2,
+        "NON-PROCESS",
+    ),
     ("src/extras/acp/mod.rs", ".status(status)", 1, "NON-PROCESS"),
     ("src/extras/acp/mod.rs", "cx.spawn({", 1, "NON-PROCESS"),
     (
@@ -1580,18 +1586,6 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
         "std::process::Command::new(\"/bin/kill\")",
         1,
         "TEST-ONLY",
-    ),
-    (
-        "src/extras/loop/mod.rs",
-        ".status()",
-        1,
-        "TC-INTERNAL-VERIFICATION",
-    ),
-    (
-        "src/extras/loop/mod.rs",
-        "let status = std::process::Command::new(\"bash\")",
-        1,
-        "TC-INTERNAL-VERIFICATION",
     ),
     ("src/extras/lsp/client.rs", ".spawn()", 1, "TC-LSP-SERVICE"),
     (
@@ -1935,7 +1929,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ") -> Result<tokio::process::Command, String> {",
-        7,
+        8,
         "NON-PROCESS",
     ),
     (
@@ -2214,12 +2208,6 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     ("src/extras/js/skills/store.rs", "status,", 8, "NON-PROCESS"),
     // Authored native heading formats a String, never a process receiver.
-    (
-        "src/extras/loop/mod.rs",
-        "status.success(),",
-        1,
-        "NON-PROCESS",
-    ),
     // FakeStep response fields in the rendered-output budget regressions.
     // These vec! bodies contain no process receiver or terminal call.
     // Captured Sandbox command-result fields in native boundary tests; the
@@ -2412,13 +2400,6 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
         "src/extras/js/tool.rs",
         &[(
             "34e3105112941e29707d7c89c27658d9e34c02bcf446c9bf49b08d275c5fbdfa",
-            1,
-        )],
-    ),
-    (
-        "src/extras/loop/mod.rs",
-        &[(
-            "e225d1fcf2e8c60201d067ff175cbdcbbf980e3b0a3b09a34a8aa0279bfe11e7",
             1,
         )],
     ),
@@ -3196,6 +3177,12 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
         2,
         "NON-PROCESS",
     ),
+    (
+        "src/extras/acp/mod.rs",
+        ".status(ToolCallStatus::Failed)",
+        2,
+        "NON-PROCESS",
+    ),
     ("src/extras/acp/mod.rs", "cx.spawn({", 1, "NON-PROCESS"),
     // The ACP /cron driver is a connection task on the ACP executor, not a process.
     (
@@ -3481,7 +3468,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     (
         "src/sandbox/windows.rs",
         ") -> Result<tokio::process::Command, String> {",
-        7,
+        8,
         "NON-PROCESS",
     ),
     (
@@ -3712,7 +3699,6 @@ const SINGLE_CLASS_FAMILIES: &[(&str, &str)] = &[
     ("src/docs.rs", "TC-SUPPORT-UTILITY"),
     ("src/git/runner.rs", "TC-INTERNAL-GIT"),
     ("src/extras/hooks/subprocess.rs", "TC-PROJECT-AUTOMATION"),
-    ("src/extras/loop/mod.rs", "TC-INTERNAL-VERIFICATION"),
     ("src/extras/lsp/client.rs", "TC-LSP-SERVICE"),
     ("src/extras/mcp/client.rs", "TC-MCP-STDIO"),
     ("src/extras/mcp/server.rs", "TC-SUPPORT-UTILITY"),

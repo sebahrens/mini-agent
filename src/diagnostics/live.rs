@@ -110,28 +110,38 @@ pub(crate) fn sandbox_status(status: &str, reason: Option<&str>, enabled: bool) 
 /// Run `<program> --version` through the sandbox; failure is a warning because
 /// the tool may simply be absent.
 pub(crate) async fn tool_in_sandbox(sandbox: &crate::sandbox::Sandbox, program: &str) -> Outcome {
-    let mut command = match sandbox.wrap_command(&format!("{program} --version")) {
+    let command = match sandbox.wrap_command(&format!("{program} --version")) {
         Ok(command) => command,
         Err(error) => {
             return Outcome::Warn(bounded(format!("{program}: could not launch: {error}")));
         }
     };
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
-    match tokio::time::timeout(TOOL_TIMEOUT, command.output()).await {
-        Err(_) => Outcome::Warn(format!("{program}: timed out inside the sandbox")),
-        Ok(Err(error)) => Outcome::Warn(bounded(format!("{program}: {error}"))),
-        Ok(Ok(output)) if output.status.success() => Outcome::Pass(bounded(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or(program),
-        )),
-        Ok(Ok(output)) => Outcome::Warn(bounded(format!(
-            "{program} failed inside the sandbox ({}): {}",
+    // The sandbox owns launch through the process-creation boundary and bounds
+    // time and output.
+    let limits = crate::sandbox::CommandLimits {
+        timeout: TOOL_TIMEOUT,
+        stdout_bytes: 16 * 1024,
+        stderr_bytes: 16 * 1024,
+        combined_bytes: 32 * 1024,
+    };
+    match sandbox
+        .output_built_command_with_limits(command, limits)
+        .await
+    {
+        Err(error) => Outcome::Warn(bounded(format!("{program}: {error}"))),
+        Ok(output) if output.status == crate::sandbox::CommandStatus::TimedOut => {
+            Outcome::Warn(format!("{program}: timed out inside the sandbox"))
+        }
+        Ok(output) if output.exit_status.is_some_and(|status| status.success()) => {
+            Outcome::Pass(bounded(
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .next()
+                    .unwrap_or(program),
+            ))
+        }
+        Ok(output) => Outcome::Warn(bounded(format!(
+            "{program} failed inside the sandbox ({:?}): {}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
                 .lines()

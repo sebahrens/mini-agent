@@ -658,7 +658,7 @@ The audit currently resolves as follows:
 | `TC-LSP-SERVICE` | Tokio child/stdin types (including the transport guard's owned stdin lock and writer accessor), constructor, and terminal spawn in `src/extras/lsp/client.rs`. |
 | `TC-INTERNAL-GIT` | The Tokio constructor/import in `src/extras/git_worktree/mod.rs` and the shared hardened runner in `src/git/runner.rs`, used by the background session-status refresh, the headless change baseline, and the explicit-workspace `/undo stash` helper in `src/ui/mod.rs`. |
 | `TC-SUPPORT-UTILITY` | Direct-argv sites: pager in `src/docs.rs`, lazygit in `src/ui/app.rs`, opener/clipboard constructors in `src/ui/renderer.rs`, fixed image-clipboard constructors in `src/ui/clipboard_image.rs`, the fixed macOS version probe in `src/sandbox/worker/macos.rs`, the `gh attestation verify` check and staged-binary `--version` probe in `src/self_update.rs`, and the opt-in `--mcp-server` relaunch in `src/extras/mcp/server.rs` (this executable, the operator's own flags, then `-p -- <prompt>` with the MCP client's prompt as one literal argv element; the child applies its ordinary headless sandbox and permission policy). Opaque editor-shell sites: `src/ui/input/mod.rs` and `src/ui/slash/memory.rs`. The Windows `ShellExecuteW` URL opener in `src/ui/renderer.rs` is `NON-PROCESS` and has no command-interpreter fallback. |
-| `TC-INTERNAL-VERIFICATION` | Fixed embedded-policy Bash constructor/status in `src/extras/loop/mod.rs`; fixed Windows AppContainer runtime probe constructors/terminals in `src/sandbox/windows.rs`. |
+| `TC-INTERNAL-VERIFICATION` | Fixed Windows AppContainer runtime probe constructors/terminals in `src/sandbox/windows.rs`. |
 | `TC-LIFECYCLE-HELPER` | Shared bounded captured-process terminal and in-process Unix process-group signalling in `src/sandbox.rs`, and the forwarder's final `exec` of the already-selected contained command in `src/sandbox/net_forwarder.rs`. Caller trust remains the caller's class; this helper grants no authority itself. |
 | `TC-CREDENTIAL-HELPER` | The user-configured credential command constructors and guarded spawns in `src/key_command.rs`. |
 | `TEST-ONLY` | Inline Bash-tool and loop-validation process-existence helpers, plus the unconfined protocol-pipe worker fixture in `src/sandbox/worker.rs`. |
@@ -713,7 +713,13 @@ existing unknown-context and cross-family negative controls remain enforced.
 Doctor App regressions inspect captured renderer strings for pricing, report
 sections and redacted content. Those additional terminal-looking string
 methods have exact `NON-PROCESS` line entries and complete macro digests/counts
-in the checked inventory. The doctor itself launches no process; its CLI LSP
+in the checked inventory. The `--doctor` live tool probe (`src/diagnostics/live.rs`) launches its one
+sandbox-wrapped `<tool> --version` through
+`Sandbox::output_built_command_with_limits`, which owns the process-creation
+boundary and output/time bounds; it has no raw terminal. The two ACP
+`.status(ToolCallStatus::Failed)` builder calls in `src/extras/acp/mod.rs` are
+protocol data classified `NON-PROCESS`. Apart from that probe, the doctor
+launches no process; its CLI LSP
 fixture checks executable metadata against an owned marker script and never
 executes it. All constructor, macro-identity and cross-family negatives remain
 enforced. The existing combined 1 MiB App consumer also submits `/doctor`
