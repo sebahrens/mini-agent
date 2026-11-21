@@ -124,12 +124,18 @@ struct HostedProbePaths {
 impl HostedProbePaths {
     fn create() -> io::Result<Self> {
         let identifier = uuid::Uuid::new_v4();
-        let workspace = std::env::current_dir()?
-            .join(format!(".mini-agent-macos-workspace-sentinel-{identifier}"));
         let root = std::env::temp_dir().join(format!("mini-agent-macos-matrix-{identifier}"));
+        // Prefer a sentinel in the working directory; when that cannot be
+        // written (read-only checkout, foreign owner, `/` for an ACP client
+        // without a cwd) the sentinel lives in the private matrix root, where
+        // the worker's denial is proven the same way as for the skill and
+        // credential sentinels (mini-agent-nvnkx.171).
+        let workspace = std::env::current_dir()
+            .map(|cwd| cwd.join(format!(".mini-agent-macos-workspace-sentinel-{identifier}")))
+            .unwrap_or_else(|_| root.join("workspace-sentinel"));
         let skill_directory = root.join("skill-store");
         let credential_directory = root.join("credentials");
-        let paths = Self {
+        let mut paths = Self {
             workspace,
             skill: skill_directory.join("sentinel"),
             credential: credential_directory.join("sentinel"),
@@ -141,7 +147,15 @@ impl HostedProbePaths {
             create_private_directory(&paths.root)?;
             create_private_directory(&paths.skill_directory)?;
             create_private_directory(&paths.credential_directory)?;
-            for path in [&paths.workspace, &paths.skill, &paths.credential] {
+            if let Err(error) = create_hosted_sentinel(&paths.workspace) {
+                if !workspace_directory_unwritable(&error) {
+                    return Err(error);
+                }
+                tracing::debug!(%error, "working directory is not writable; using a private workspace sentinel");
+                paths.workspace = paths.root.join("workspace-sentinel");
+                create_hosted_sentinel(&paths.workspace)?;
+            }
+            for path in [&paths.skill, &paths.credential] {
                 create_hosted_sentinel(path)?;
             }
             Ok(())
@@ -207,6 +221,17 @@ impl HostedProbePaths {
         let _ = std::fs::remove_dir(&self.credential_directory);
         let _ = std::fs::remove_dir(&self.root);
     }
+}
+
+/// A sentinel that could not be created because the directory is not ours to
+/// write (as opposed to a collision or an I/O fault the preflight must report).
+fn workspace_directory_unwritable(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::PermissionDenied
+            | io::ErrorKind::ReadOnlyFilesystem
+            | io::ErrorKind::NotFound
+    )
 }
 
 fn create_hosted_sentinel(path: &Path) -> io::Result<()> {
@@ -523,10 +548,15 @@ fn unavailable_reason_for_major(major: u32) -> String {
 }
 
 fn worker_executable() -> Result<PathBuf, WorkerLaunchError> {
-    std::env::current_exe().map_err(|source| WorkerLaunchError::Io {
-        backend: BACKEND,
-        source,
-    })
+    // macOS reports the invoked path, so a launcher symlink (`~/.local/bin`,
+    // Homebrew, install.sh) would be refused by the no-follow source check.
+    // Resolve it once; the checks then run on the real file (nvnkx.148).
+    std::env::current_exe()
+        .and_then(|path| path.canonicalize())
+        .map_err(|source| WorkerLaunchError::Io {
+            backend: BACKEND,
+            source,
+        })
 }
 
 #[cfg(not(test))]
@@ -4508,19 +4538,41 @@ mod one_time_image {
         Ok(())
     }
 
-    fn validate_source_image(metadata: &std::fs::Metadata) -> io::Result<()> {
-        if !metadata.is_file()
-            || metadata.file_type().is_symlink()
-            || !source_owner_is_trusted(metadata.uid(), current_uid())
-            || metadata.nlink() != 1
-            || metadata.mode() & 0o022 != 0
-            || metadata.mode() & 0o111 == 0
-        {
-            return Err(permission_denied(
-                "worker source is not a stable private executable",
-            ));
+    /// Name the failed property so an operator can tell a symlinked launcher
+    /// from a hard-linked or group-writable install (nvnkx.148/.172). The
+    /// image is still cloned to a private inode and hashed before use, but a
+    /// source with extra links or a writable mode is refused, unchanged.
+    fn source_image_defect(metadata: &std::fs::Metadata, user: u32) -> Option<String> {
+        if metadata.file_type().is_symlink() {
+            Some("it is a symbolic link; launch the resolved executable path".into())
+        } else if !metadata.is_file() {
+            Some("it is not a regular file".into())
+        } else if !source_owner_is_trusted(metadata.uid(), user) {
+            Some(format!(
+                "it is owned by uid {}, not the current user or root",
+                metadata.uid()
+            ))
+        } else if metadata.nlink() != 1 {
+            Some(format!(
+                "it has {} hard links (exactly one is required)",
+                metadata.nlink()
+            ))
+        } else if metadata.mode() & 0o022 != 0 {
+            Some("it is group or other writable".into())
+        } else if metadata.mode() & 0o111 == 0 {
+            Some("it is not executable".into())
+        } else {
+            None
         }
-        Ok(())
+    }
+
+    fn validate_source_image(metadata: &std::fs::Metadata) -> io::Result<()> {
+        match source_image_defect(metadata, current_uid()) {
+            None => Ok(()),
+            Some(defect) => Err(permission_denied(format!(
+                "worker source is not a stable private executable: {defect}"
+            ))),
+        }
     }
 
     fn source_owner_is_trusted(owner: u32, user: u32) -> bool {
@@ -5694,6 +5746,62 @@ mod one_time_image {
             let hard_link = root.path.join("source-hard-link");
             std::fs::hard_link(&source, &hard_link).unwrap();
             assert!(OneTimeWorkerImage::prepare_from(&source, &root.path).is_err());
+        }
+
+        #[test]
+        fn worker_source_defects_name_the_failed_property() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"worker");
+            let user = current_uid();
+            let meta = |path: &Path| std::fs::symlink_metadata(path).unwrap();
+            assert_eq!(source_image_defect(&meta(&source), user), None);
+
+            let link = root.path.join("launcher");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            let defect = source_image_defect(&meta(&link), user).unwrap();
+            assert!(defect.contains("symbolic link"), "{defect}");
+
+            let hard = root.path.join("hard");
+            std::fs::hard_link(&source, &hard).unwrap();
+            let defect = source_image_defect(&meta(&source), user).unwrap();
+            assert!(defect.contains("2 hard links"), "{defect}");
+            std::fs::remove_file(&hard).unwrap();
+
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o770)).unwrap();
+            let defect = source_image_defect(&meta(&source), user).unwrap();
+            assert!(defect.contains("group or other writable"), "{defect}");
+            std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+            let unrelated = if user == 1 { 2 } else { 1 };
+            let defect = source_image_defect(&meta(&source), unrelated).unwrap();
+            assert!(defect.contains("owned by uid"), "{defect}");
+        }
+
+        #[test]
+        fn unwritable_workspace_directory_falls_back_to_a_private_sentinel() {
+            assert!(workspace_directory_unwritable(&permission_denied("ro")));
+            assert!(!workspace_directory_unwritable(&io::Error::from(
+                io::ErrorKind::AlreadyExists
+            )));
+            let root = TestRoot::new();
+            let missing = root.path.join("absent").join("sentinel");
+            let error = create_hosted_sentinel(&missing).unwrap_err();
+            assert!(workspace_directory_unwritable(&error), "{error}");
+        }
+
+        #[test]
+        fn worker_executable_through_a_symlink_resolves_to_the_real_file() {
+            let root = TestRoot::new();
+            let source = root.source("source-worker", b"worker");
+            let link = root.path.join("launcher");
+            std::os::unix::fs::symlink(&source, &link).unwrap();
+            let resolved = link.canonicalize().unwrap();
+            assert_eq!(resolved, source.canonicalize().unwrap());
+            // The resolved target passes the unchanged source validation.
+            assert!(validate_source_image(&std::fs::symlink_metadata(&resolved).unwrap()).is_ok());
+            // And the unresolved launcher is still refused by the no-follow check.
+            assert!(OneTimeWorkerImage::prepare_from(&link, &root.path).is_err());
         }
 
         #[test]

@@ -92,6 +92,61 @@ fn reply() -> String {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn settled_build_waits_for_a_held_probe_and_then_registers_js() {
+    #[cfg(feature = "hooks")]
+    let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();
+    let root = crate::tests::OwnedTestDirectory::new("probe-race-settle");
+    let wire = Wire::at_path(vec![], "/chat/completions");
+    let completed = Arc::new(OnceLock::new());
+    let release = Release(Arc::new((Mutex::new(false), Condvar::new())));
+    let held = release.0.clone();
+    let slot = completed.clone();
+    let (started, entered) = tokio::sync::oneshot::channel();
+    let probe = StartupWorkerProbe::start_for_test(AgentWorkScope::new(), move || {
+        let _ = started.send(());
+        let mut ready = held.0.lock().unwrap();
+        while !*ready {
+            ready = held.1.wait(ready).unwrap();
+        }
+        let status = WorkerContainmentStatus::Available {
+            backend: WorkerBackend::for_current_platform(),
+            assurance: WorkerContainmentAssurance::Enforced,
+        };
+        slot.set(status.clone()).unwrap();
+        status
+    })
+    .await;
+    entered.await.unwrap();
+    let known = {
+        let completed = completed.clone();
+        move || completed.get().cloned()
+    };
+    // A build that does not wait (the idle prebuild) still sees the placeholder.
+    let idle = build(&wire, root.path(), known()).await;
+    assert!(idle.js_probe_pending);
+    // A turn-owning caller waits: nothing is returned while the probe is held.
+    let waiting = settle_probe_snapshot(known.clone(), || async {
+        probe.retire().await.unwrap();
+    });
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), &mut waiting)
+            .await
+            .is_err(),
+        "settle must wait while the probe is held"
+    );
+    release.release();
+    let settled = waiting.await;
+    assert!(matches!(
+        settled,
+        Some(WorkerContainmentStatus::Available { .. })
+    ));
+    let rebuilt = build(&wire, root.path(), settled).await;
+    assert!(!rebuilt.js_probe_pending);
+    let _ = wire.finish();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn startup5_first_http_overlaps_probe_and_completed_snapshot_changes_only_next_bundle() {
     #[cfg(feature = "hooks")]
     let _dispatcher = crate::tests::fake_model::dispatcher_guard::acquire();

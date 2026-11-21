@@ -160,6 +160,10 @@ pub(crate) struct AllowConfig {
     workspace_binding: Option<std::sync::Arc<crate::paths::WorkspaceBinding>>,
     read: PathPolicy,
     write: PathPolicy,
+    /// `js-read-roots` and `js-read-unrestricted` were both absent: reads
+    /// default to the bound workspace once one is attached (nvnkx.113). An
+    /// explicit `js-read-roots = []` is the opt-out and never sets this.
+    read_defaults_to_workspace: bool,
     #[cfg(feature = "sandbox")]
     fetch: FetchPolicy,
 }
@@ -185,6 +189,7 @@ impl AllowConfig {
                 workspace_binding: None,
                 read: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Read)),
                 write: PathPolicy::Deny(AllowPolicyReason::InvalidConfiguration(FileAccess::Write)),
+                read_defaults_to_workspace: false,
                 #[cfg(feature = "sandbox")]
                 fetch: FetchPolicy::default(),
             };
@@ -193,6 +198,7 @@ impl AllowConfig {
         Self {
             read: build_path_policy(&base, read_roots, read_unrestricted, FileAccess::Read),
             write: build_path_policy(&base, write_roots, write_unrestricted, FileAccess::Write),
+            read_defaults_to_workspace: read_roots.is_none() && !read_unrestricted,
             base,
             workspace_binding: None,
             #[cfg(feature = "sandbox")]
@@ -204,6 +210,17 @@ impl AllowConfig {
         mut self,
         workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
     ) -> Self {
+        if self.read_defaults_to_workspace {
+            // Read-only, workspace-only: the same scope the built-in read and
+            // grep tools expose. Every read is still a typed brokered effect
+            // under the `js/read_file` permission key; writes stay default-deny.
+            self.read = build_path_policy(
+                workspace.root(),
+                Some(&[".".to_string()]),
+                false,
+                FileAccess::Read,
+            );
+        }
         self.workspace_binding = Some(workspace);
         self
     }
@@ -9239,6 +9256,41 @@ mod tests {
         expect_denied(
             ambiguous.authorize_read(temp.path()),
             AllowPolicyReason::InvalidConfiguration(FileAccess::Read),
+        );
+    }
+
+    #[test]
+    fn js_default_read_policy_is_the_bound_workspace_and_writes_stay_denied() {
+        let temp = TempDir::new("js-default-read");
+        let workspace = temp.path().join("ws");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(workspace.join("Cargo.toml"), "x").unwrap();
+        std::fs::write(outside.join("hosts"), "y").unwrap();
+        let binding =
+            std::sync::Arc::new(crate::paths::WorkspaceBinding::capture(&workspace).unwrap());
+
+        let policy = AllowConfig::from_settings(&workspace, None, None, None, false, false)
+            .with_workspace_binding(binding.clone());
+        expect_allowed(policy.authorize_read(&workspace.join("Cargo.toml")));
+        expect_denied(
+            policy.authorize_read(&outside.join("hosts")),
+            AllowPolicyReason::OutsideConfiguredRoots(FileAccess::Read),
+        );
+        expect_denied(
+            policy.authorize_write(&workspace.join("new.txt")),
+            AllowPolicyReason::NoConfiguredRoots(FileAccess::Write),
+        );
+
+        // `js-read-roots = []` stays the explicit opt-out.
+        let empty = Vec::new();
+        let opted_out =
+            AllowConfig::from_settings(&workspace, None, Some(&empty), None, false, false)
+                .with_workspace_binding(binding);
+        expect_denied(
+            opted_out.authorize_read(&workspace.join("Cargo.toml")),
+            AllowPolicyReason::NoConfiguredRoots(FileAccess::Read),
         );
     }
 

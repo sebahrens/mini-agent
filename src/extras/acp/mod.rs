@@ -7500,6 +7500,7 @@ async fn build_turn_agent(
     let temperature = crate::config::resolve_temperature(&state.cli, &state.cfg, model_str);
     let extra_body = crate::config::resolve_extra_body(&state.cfg, model_str);
     let native_js_context = history.session.native_js_context();
+    let native_js_omitted = native_js_context.omitted();
     let tool_output_session_id = turn.session_id.to_string();
     let build = crate::provider::build_agent_in_workspace(
         model,
@@ -7533,6 +7534,12 @@ async fn build_turn_agent(
     let build = {
         let lsp_session = history.reuse.lsp.clone();
         async move { lsp_session.scope(build).await }
+    };
+    // Wait for the process's worker probe inside the owned pre-run so
+    // `session/cancel` still reaches it (mini-agent-nvnkx.169).
+    let build = async move {
+        crate::provider::settle_js_probe(&state.cli, &state.cfg, native_js_omitted).await;
+        build.await
     };
     match run_owned_pre_run(&turn.control, work_scope, build).await {
         Some(agent) => Ok(agent),

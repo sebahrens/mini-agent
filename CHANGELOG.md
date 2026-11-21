@@ -98,6 +98,12 @@ Notable changes to mini-agent are documented in this file. The format follows
   caps concurrent relays at 256 (mini-agent-y42nd). `update` and `install.sh` treat a `gh` whose
   `attestation verify --help` lacks the pin flags as unavailable (upgrade gh), not a failed
   verification (mini-agent-0cshc).
+- The `js` tool is offered in headless `-p`/`--loop` runs, in a TUI turn started from the command-line prompt and in the first ACP turn: each waits for the startup worker probe before building its agent, and a lost startup race no longer pins an Anthropic session without JavaScript (mini-agent-nvnkx.147, .167, .168, .169).
+- macOS: launching through a symlink (`~/.local/bin`, Homebrew) no longer disables `js`; refusals of the worker source name the failed property, and an unwritable working directory no longer fails the preflight (mini-agent-nvnkx.148, .171, .172).
+- Brokered JS reads default to the bound workspace (read-only) when `js-read-roots` is unset; `js-read-roots = []` opts out (mini-agent-nvnkx.113).
+- A failed idle JS worker shutdown no longer turns a completed run into a failing exit code (mini-agent-nvnkx.173).
+- README, CONFIG and GET_STARTED no longer describe the removed manual `js-read-roots` and routing-prompt steps (mini-agent-nvnkx.124).
+- One-shot `--doctor` runs bounded live checks (sandbox, git and python3 in the sandbox, JS worker preflight, symlinked launch, credential, price), prints a summary and exits non-zero when a required check fails (mini-agent-nvnkx.225).
 
 ### Added
 

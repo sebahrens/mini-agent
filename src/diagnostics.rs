@@ -5,6 +5,8 @@ use std::path::Path;
 use crate::auth::{AuthResolver, CredentialSource};
 use crate::{cli::Cli, config::Config, paths::AppPaths, sandbox::Sandbox, session::Session};
 
+pub(crate) mod live;
+
 const MAX_REPORT_BYTES: usize = 64 * 1024;
 const MAX_LABEL_CHARS: usize = 192;
 const MAX_DIRECTORY_ENTRIES: usize = 128;

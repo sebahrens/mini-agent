@@ -36,6 +36,8 @@ use crate::sandbox::worker::{WorkerLaunchError, WorkerLauncher, WorkerProcess};
 const PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// Upper bound of the escalating poll `shutdown` uses while waiting for the idle worker to exit.
 const SHUTDOWN_POLL_CAP: Duration = Duration::from_millis(50);
+/// Idle shutdown is cleanup, so it gets a short deadline rather than the step watchdog.
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(1);
 /// A pipe can report EOF just before the OS makes the worker's exit status observable. Keep this
 /// window short and bounded so native resource exits retain their closed classification without a
 /// malformed or abandoned transport delaying the caller materially.
@@ -957,52 +959,26 @@ impl JsWorkerSupervisor {
         result
     }
 
-    /// Gracefully retires the current idle generation, with forced tree cleanup on any fault.
+    /// Retires the current idle generation. Shutdown is cleanup: it asks the idle worker to
+    /// exit within a short dedicated deadline and, on any fault (dead worker, failed pipe write,
+    /// non-zero exit, timeout), forces the tree teardown, logs one warning and still returns
+    /// `Ok`, so a finished run keeps its own result and exit code (mini-agent-nvnkx.173).
+    /// Only a teardown that itself fails is reported.
     pub(crate) async fn shutdown(&self) -> Result<(), WorkerError> {
         let cancellation = PermCancellation::new();
-        let deadline = Instant::now() + self.0.watchdog;
+        let deadline = Instant::now() + self.0.watchdog.min(SHUTDOWN_DEADLINE);
         let mut state = await_controlled(self.0.transport.lock(), &cancellation, deadline).await?;
         let Some(mut connection) = state.idle.take() else {
             return Ok(());
         };
-        let frame = WireFrame::connection(
-            connection.build.clone(),
-            connection.sequence,
-            ParentFrame::Shutdown,
-        );
-        connection
-            .protocol
-            .on_send(&frame)
-            .map_err(|_| WorkerError::Protocol)?;
-        write_parent(&connection, frame, &cancellation, deadline).await?;
-        // The worker exits within milliseconds of the frame: poll with a short
-        // escalating delay instead of the 250 ms effect-liveness interval.
-        let mut poll = Duration::from_millis(1);
-        loop {
-            if connection
+        if let Err(error) = shutdown_idle_worker(&mut connection, &cancellation, deadline).await {
+            tracing::warn!(%error, "idle JavaScript worker did not exit cleanly; forcing teardown");
+            connection
                 .process
-                .try_wait()
-                .map_err(|_| WorkerError::Transport)?
-                .is_some()
-            {
-                let status = connection
-                    .process
-                    .terminate_and_reap(PROCESS_REAP_TIMEOUT)
-                    .map_err(|_| WorkerError::Transport)?;
-                return if status.success() {
-                    Ok(())
-                } else {
-                    Err(WorkerError::Transport)
-                };
-            }
-            tokio::select! {
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                    return Err(WorkerError::TimedOut);
-                }
-                _ = tokio::time::sleep(poll) => {}
-            }
-            poll = (poll * 2).min(SHUTDOWN_POLL_CAP);
+                .terminate_and_reap(PROCESS_REAP_TIMEOUT)
+                .map_err(|_| WorkerError::Transport)?;
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -2829,3 +2805,49 @@ async fn await_controlled<F: Future>(
 #[cfg(test)]
 #[path = "tests/worker_exit.rs"]
 mod worker_exit_tests;
+
+/// Graceful half of [`JsWorkerSupervisor::shutdown`]: send `Shutdown` and wait for a clean exit.
+async fn shutdown_idle_worker(
+    connection: &mut WorkerConnection,
+    cancellation: &PermCancellation,
+    deadline: Instant,
+) -> Result<(), WorkerError> {
+    let frame = WireFrame::connection(
+        connection.build.clone(),
+        connection.sequence,
+        ParentFrame::Shutdown,
+    );
+    connection
+        .protocol
+        .on_send(&frame)
+        .map_err(|_| WorkerError::Protocol)?;
+    write_parent(connection, frame, cancellation, deadline).await?;
+    // The worker exits within milliseconds of the frame: poll with a short
+    // escalating delay instead of the 250 ms effect-liveness interval.
+    let mut poll = Duration::from_millis(1);
+    loop {
+        if connection
+            .process
+            .try_wait()
+            .map_err(|_| WorkerError::Transport)?
+            .is_some()
+        {
+            let status = connection
+                .process
+                .terminate_and_reap(PROCESS_REAP_TIMEOUT)
+                .map_err(|_| WorkerError::Transport)?;
+            return if status.success() {
+                Ok(())
+            } else {
+                Err(WorkerError::Transport)
+            };
+        }
+        tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
+                return Err(WorkerError::TimedOut);
+            }
+            _ = tokio::time::sleep(poll) => {}
+        }
+        poll = (poll * 2).min(SHUTDOWN_POLL_CAP);
+    }
+}

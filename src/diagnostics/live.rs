@@ -1,0 +1,359 @@
+//! Live health checks for the one-shot `--doctor` command.
+//!
+//! The captured-state report cannot say whether the sandbox or the `js` tool
+//! work on this machine. These checks run the real preflights, each bounded by
+//! a timeout, and never make a provider call or print a credential value
+//! (mini-agent-nvnkx.225).
+
+use std::path::Path;
+use std::time::Duration;
+
+use super::CredentialReport;
+
+/// Upper bound for any single live check.
+pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+/// Upper bound for one `tool --version` probe through the sandbox.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_DETAIL_CHARS: usize = 240;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Outcome {
+    Pass(String),
+    /// A degradation worth reading that does not make the install unusable.
+    Warn(String),
+    /// A required capability is missing.
+    Fail(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Check {
+    pub name: &'static str,
+    pub outcome: Outcome,
+}
+
+impl Check {
+    fn new(name: &'static str, outcome: Outcome) -> Self {
+        Self { name, outcome }
+    }
+}
+
+fn bounded(text: impl AsRef<str>) -> String {
+    let mut out: String = text
+        .as_ref()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(MAX_DETAIL_CHARS)
+        .collect();
+    if text.as_ref().chars().count() > MAX_DETAIL_CHARS {
+        out.push('…');
+    }
+    out
+}
+
+/// Warn when the invoked executable path differs from its canonical path.
+pub(crate) fn install_layout(invoked: &Path, canonical: &Path) -> Outcome {
+    if invoked == canonical {
+        Outcome::Pass(format!("launched from {}", invoked.display()))
+    } else {
+        Outcome::Warn(bounded(format!(
+            "launched through a symlink ({}); the real executable is {}. Older builds refused \
+             the JavaScript worker for a symlinked launcher; use the real path if js is unavailable",
+            invoked.display(),
+            canonical.display()
+        )))
+    }
+}
+
+/// A route that cannot authenticate is a failed required capability.
+pub(crate) fn credential(report: &CredentialReport) -> Outcome {
+    use crate::auth::LoginRecordState as S;
+    match report {
+        CredentialReport::Missing => {
+            Outcome::Fail("no credential for the selected provider".into())
+        }
+        CredentialReport::InvalidRoute => Outcome::Fail("provider configuration is invalid".into()),
+        CredentialReport::ChatGpt(S::SignInRequired) => {
+            Outcome::Fail("ChatGPT sign-in required".into())
+        }
+        CredentialReport::Copilot(S::Absent | S::SignInRequired) => {
+            Outcome::Fail("Copilot sign-in required".into())
+        }
+        _ => Outcome::Pass("credential source present (value omitted)".into()),
+    }
+}
+
+pub(crate) fn price(prices: Option<(f64, f64)>, model: &str) -> Outcome {
+    match prices {
+        Some((input, output)) => Outcome::Pass(format!(
+            "input {input}; output {output} USD per million tokens"
+        )),
+        None => Outcome::Warn(bounded(format!(
+            "no price resolved for {model}; spend limits and cost totals cannot account for it"
+        ))),
+    }
+}
+
+pub(crate) fn sandbox_status(status: &str, reason: Option<&str>, enabled: bool) -> Outcome {
+    if !enabled {
+        return Outcome::Pass("sandbox disabled by configuration".into());
+    }
+    if status == "required-and-available" {
+        Outcome::Pass("sandbox preflight passed".into())
+    } else {
+        Outcome::Fail(bounded(format!(
+            "sandbox is enabled but unavailable: {}",
+            reason.unwrap_or(status)
+        )))
+    }
+}
+
+/// Run `<program> --version` through the sandbox; failure is a warning because
+/// the tool may simply be absent.
+pub(crate) async fn tool_in_sandbox(sandbox: &crate::sandbox::Sandbox, program: &str) -> Outcome {
+    let mut command = match sandbox.wrap_command(&format!("{program} --version")) {
+        Ok(command) => command,
+        Err(error) => {
+            return Outcome::Warn(bounded(format!("{program}: could not launch: {error}")));
+        }
+    };
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    match tokio::time::timeout(TOOL_TIMEOUT, command.output()).await {
+        Err(_) => Outcome::Warn(format!("{program}: timed out inside the sandbox")),
+        Ok(Err(error)) => Outcome::Warn(bounded(format!("{program}: {error}"))),
+        Ok(Ok(output)) if output.status.success() => Outcome::Pass(bounded(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or(program),
+        )),
+        Ok(Ok(output)) => Outcome::Warn(bounded(format!(
+            "{program} failed inside the sandbox ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .lines()
+                .next()
+                .unwrap_or("no output")
+        ))),
+    }
+}
+
+/// The unchanged worker preflight (the one `--js-runtime-check` depends on).
+#[cfg(feature = "js")]
+pub(crate) async fn js_worker() -> Outcome {
+    use crate::sandbox::worker::{WorkerContainmentStatus, containment_status};
+    match tokio::time::timeout(
+        CHECK_TIMEOUT,
+        tokio::task::spawn_blocking(containment_status),
+    )
+    .await
+    {
+        Err(_) => Outcome::Fail("worker preflight timed out".into()),
+        Ok(Err(error)) => Outcome::Fail(bounded(format!("worker preflight failed: {error}"))),
+        Ok(Ok(WorkerContainmentStatus::Available { .. })) => {
+            Outcome::Pass("worker containment preflight passed".into())
+        }
+        Ok(Ok(WorkerContainmentStatus::Unavailable { reason, .. })) => {
+            Outcome::Warn(bounded(format!("js tool unavailable: {reason}")))
+        }
+    }
+}
+
+/// Run every live check for the one-shot `--doctor` command.
+pub(crate) async fn run_all(
+    cli: &crate::cli::Cli,
+    cfg: &crate::config::Config,
+    paths: &crate::paths::AppPaths,
+    workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
+) -> Vec<Check> {
+    let mut checks = Vec::new();
+    if let Ok(invoked) = std::env::current_exe() {
+        let canonical = invoked.canonicalize().unwrap_or_else(|_| invoked.clone());
+        checks.push(Check::of(
+            "install path",
+            install_layout(&invoked, &canonical),
+        ));
+    }
+    let (provider, model) = cli.resolve_provider_and_model(cfg);
+    let credential_report = super::provider_credential_with_env(
+        cfg,
+        &provider,
+        cli.api_key.as_deref(),
+        &paths.credentials_dir,
+        |name| std::env::var(name),
+    );
+    checks.push(Check::of("credential", credential(&credential_report)));
+    let (prices, _) = crate::startup::diagnostic_startup_pricing(cli, cfg, &provider, &model);
+    checks.push(Check::of("price", price(prices, &model)));
+
+    let enabled = cli.resolve_sandbox(cfg);
+    let backend = cli.resolve_sandbox_backend(cfg);
+    let sandbox = crate::sandbox::Sandbox::new(enabled, &backend)
+        .with_general_profile(
+            cli.resolve_sandbox_profile(cfg),
+            cfg.sandbox_read_roots.clone(),
+            cfg.sandbox_write_roots.clone(),
+        )
+        .with_windows_appcontainer_roots(
+            cli.resolve_windows_appcontainer_read_roots(cfg),
+            cli.resolve_windows_appcontainer_write_roots(cfg),
+        )
+        .with_bwrap_read_roots(cli.resolve_sandbox_toolchain_roots(cfg))
+        .with_workspace_binding(workspace);
+    let probe = sandbox.clone();
+    let matrix = tokio::time::timeout(
+        CHECK_TIMEOUT,
+        tokio::task::spawn_blocking(move || probe.capability_matrix()),
+    )
+    .await;
+    let sandbox_ok = match matrix {
+        Ok(Ok(matrix)) => {
+            let outcome = sandbox_status(matrix.status, matrix.reason.as_deref(), enabled);
+            let ok = !matches!(outcome, Outcome::Fail(_));
+            checks.push(Check::of("sandbox", outcome));
+            ok
+        }
+        _ => {
+            checks.push(Check::of(
+                "sandbox",
+                Outcome::Fail("sandbox preflight timed out or failed".into()),
+            ));
+            false
+        }
+    };
+    if enabled && sandbox_ok {
+        for program in ["git", "python3"] {
+            let name = if program == "git" {
+                "sandboxed git"
+            } else {
+                "sandboxed python3"
+            };
+            checks.push(Check::of(name, tool_in_sandbox(&sandbox, program).await));
+        }
+    }
+    #[cfg(feature = "js")]
+    if cli.tool_is_eligible(cfg, "js") {
+        checks.push(Check::of("js worker", js_worker().await));
+    }
+    checks
+}
+
+/// `(failed, warned)` counts and the final summary line.
+pub(crate) fn summary(checks: &[Check]) -> (usize, usize, String) {
+    let failed = checks
+        .iter()
+        .filter(|check| matches!(check.outcome, Outcome::Fail(_)))
+        .count();
+    let warned = checks
+        .iter()
+        .filter(|check| matches!(check.outcome, Outcome::Warn(_)))
+        .count();
+    (
+        failed,
+        warned,
+        format!(
+            "{} check(s) run: {} failed, {} warning(s)",
+            checks.len(),
+            failed,
+            warned
+        ),
+    )
+}
+
+pub(crate) fn render_into(report: &mut super::DoctorReport, checks: &[Check]) {
+    report.section("Live checks");
+    for check in checks {
+        let (tag, text) = match &check.outcome {
+            Outcome::Pass(text) => ("ok", text),
+            Outcome::Warn(text) => ("warn", text),
+            Outcome::Fail(text) => ("FAIL", text),
+        };
+        report.row(check.name, format!("[{tag}] {text}"));
+    }
+    report.row("summary", summary(checks).2);
+}
+
+impl Check {
+    pub(crate) fn of(name: &'static str, outcome: Outcome) -> Self {
+        Self::new(name, outcome)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::LoginRecordState as S;
+
+    #[test]
+    fn symlinked_launch_is_reported_with_the_real_path() {
+        let same = install_layout(Path::new("/a/mini-agent"), Path::new("/a/mini-agent"));
+        assert!(matches!(same, Outcome::Pass(_)));
+        let linked = install_layout(
+            Path::new("/home/u/.local/bin/mini-agent"),
+            Path::new("/c/bin/mini-agent"),
+        );
+        let Outcome::Warn(text) = linked else {
+            panic!("{linked:?}")
+        };
+        assert!(text.contains("/c/bin/mini-agent") && text.contains("symlink"));
+    }
+
+    #[test]
+    fn a_missing_credential_fails_and_a_present_one_never_prints_a_value() {
+        assert!(matches!(
+            credential(&CredentialReport::Missing),
+            Outcome::Fail(_)
+        ));
+        assert!(matches!(
+            credential(&CredentialReport::ChatGpt(S::SignInRequired)),
+            Outcome::Fail(_)
+        ));
+        let present = credential(&CredentialReport::Source(
+            crate::auth::CredentialSource::Environment("OPENROUTER_API_KEY".into()),
+        ));
+        assert!(matches!(present, Outcome::Pass(_)));
+    }
+
+    #[test]
+    fn missing_price_and_unavailable_sandbox_are_classified() {
+        assert!(matches!(price(None, "m"), Outcome::Warn(_)));
+        assert!(matches!(price(Some((1.0, 2.0)), "m"), Outcome::Pass(_)));
+        assert!(matches!(
+            sandbox_status("x", Some("no bwrap"), true),
+            Outcome::Fail(_)
+        ));
+        assert!(matches!(sandbox_status("x", None, false), Outcome::Pass(_)));
+        assert!(matches!(
+            sandbox_status("required-and-available", None, true),
+            Outcome::Pass(_)
+        ));
+    }
+
+    #[test]
+    fn details_are_bounded_and_control_free() {
+        let text = bounded(format!("\u{1b}[31m{}", "x".repeat(1000)));
+        assert!(text.chars().count() <= MAX_DETAIL_CHARS + 1 && !text.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn summary_counts_failures_and_warnings() {
+        let checks = [
+            Check::of("a", Outcome::Pass("".into())),
+            Check::of("b", Outcome::Warn("".into())),
+            Check::of("c", Outcome::Fail("".into())),
+        ];
+        let (failed, warned, line) = summary(&checks);
+        assert_eq!((failed, warned), (1, 1));
+        assert!(line.contains("3 check(s) run"));
+    }
+
+    #[tokio::test]
+    async fn tool_probe_is_bounded_and_missing_tools_only_warn() {
+        let sandbox = crate::sandbox::Sandbox::new(false, "none");
+        let outcome = tool_in_sandbox(&sandbox, "mini-agent-definitely-absent-tool").await;
+        assert!(matches!(outcome, Outcome::Warn(_)), "{outcome:?}");
+    }
+}
