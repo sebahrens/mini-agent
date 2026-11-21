@@ -4980,6 +4980,8 @@ mod tests {
                         stdout_truncated,
                         stderr_truncated,
                     },
+                    // Worst-case credit digits: the frame must still fit.
+                    approval_wait_ms: u64::MAX,
                 }),
             );
             let mut encoded = Vec::new();
@@ -7500,6 +7502,7 @@ mod tests {
             ParentFrame::EffectResponse(EffectResponse {
                 effect_ordinal: 0,
                 result,
+                approval_wait_ms: u64::MAX,
             }),
         );
         let mut encoded = Vec::new();

@@ -2047,8 +2047,15 @@ async fn run_invocation<H: InvocationEffectHandler>(
     request: InvocationRequest,
     authority: &mut InvocationAuthority<'_, H>,
     cancellation: &PermCancellation,
-    deadline: Instant,
+    base_deadline: Instant,
 ) -> Result<InvocationTerminal, WorkerError> {
+    // The parent owns the clock. The effective deadline is the step deadline plus the time this
+    // invocation spent awaiting a user approval it initiated (capped by the allowance the tool
+    // configured; zero for every other caller), so a slow approval is not charged to the step
+    // while the total wall time stays hard-bounded at step budget plus allowance.
+    let effective_deadline = || base_deadline + cancellation.approval_pause();
+    let mut credited_pause = Duration::ZERO;
+    let deadline = base_deadline;
     #[cfg(not(any(test, feature = "skills")))]
     let expected_verification_cases: Option<Vec<String>> = None;
     #[cfg(any(test, feature = "skills"))]
@@ -2088,6 +2095,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
     connection.sequence = advance(connection.sequence)?;
 
     loop {
+        let deadline = effective_deadline();
         let frame = read_worker(connection, false, cancellation, deadline);
         #[cfg(test)]
         let frame = async {
@@ -2127,11 +2135,18 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     TimedOut,
                 }
                 let wait = loop {
+                    let wait_deadline = effective_deadline();
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => break EffectWait::Cancelled,
-                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => {
-                            break EffectWait::TimedOut;
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wait_deadline)) => {
+                            // A pending approval keeps extending the deadline while this timer
+                            // slept; only an expired *current* deadline ends the wait.
+                            if tokio::time::Instant::now()
+                                >= tokio::time::Instant::from_std(effective_deadline())
+                            {
+                                break EffectWait::TimedOut;
+                            }
                         }
                         result = &mut effect => break EffectWait::Completed(result),
                         _ = tokio::time::sleep(PROCESS_POLL_INTERVAL) => {
@@ -2183,6 +2198,13 @@ async fn run_invocation<H: InvocationEffectHandler>(
                 };
                 cancel_on_drop.armed = false;
                 drop(effect);
+                // Credit the worker only for approval wait the parent itself measured.
+                let pause = effective_deadline().saturating_duration_since(base_deadline);
+                let approval_wait_ms =
+                    u64::try_from(pause.saturating_sub(credited_pause).as_millis())
+                        .unwrap_or(u64::MAX);
+                credited_pause = pause;
+                let deadline = effective_deadline();
                 // The effect already executed and was audited. A result that cannot be framed must
                 // become a bounded effect error, never a worker protocol fault that reads like a
                 // pre-effect failure and invites replay of a mutating effect.
@@ -2192,6 +2214,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     connection.sequence,
                     effect_ordinal,
                     result,
+                    approval_wait_ms,
                 );
                 let outcome_unknown = matches!(
                     &result,
@@ -2223,6 +2246,7 @@ async fn run_invocation<H: InvocationEffectHandler>(
                     ParentFrame::EffectResponse(EffectResponse {
                         effect_ordinal,
                         result,
+                        approval_wait_ms,
                     }),
                 );
                 connection
@@ -2374,6 +2398,7 @@ fn fit_effect_result_to_frame(
     sequence: u64,
     effect_ordinal: u32,
     result: EffectResult,
+    approval_wait_ms: u64,
 ) -> (EffectResult, Option<Vec<u8>>) {
     let frame = WireFrame::invocation(
         build.clone(),
@@ -2382,6 +2407,7 @@ fn fit_effect_result_to_frame(
         ParentFrame::EffectResponse(EffectResponse {
             effect_ordinal,
             result,
+            approval_wait_ms,
         }),
     );
     // One serialization both enforces the limit and produces the bytes to send.
