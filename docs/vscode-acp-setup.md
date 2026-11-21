@@ -45,7 +45,7 @@ process and selected `file:` workspace share the same authority.
 
 ### Commands
 
-The Command Palette exposes six commands:
+The Command Palette exposes eleven commands:
 
 | Command | Effect |
 |---|---|
@@ -55,6 +55,11 @@ The Command Palette exposes six commands:
 | **Mini Agent: Select Workspace Folder** | Choose which trusted workspace folder the session is bound to. |
 | **Mini Agent: Open Config** | Open the agent's global config, creating an inert owner-private `config.toml` when none exists. |
 | **Mini Agent: Show Output** | Reveal the Mini Agent output channel without moving keyboard focus. |
+| **Mini Agent: Resume Saved Session** | Pick a saved session for this workspace and reload it (`session/load`). |
+| **Mini Agent: Select Persona** | Choose the persona (system prompt) for the session. |
+| **Mini Agent: Select Model** | Choose a model from the agent's `[quick_models]`. |
+| **Mini Agent: Select Reasoning Effort** | Choose the reasoning effort. |
+| **Mini Agent: Select Permission Mode** | Choose the session's permission mode. |
 
 Open Config resolves the global configuration root exactly like the binary:
 `MINI_AGENT_CONFIG_DIR`, then `MINI_AGENT_HOME`, then `~/.mini-agent` when it
@@ -64,7 +69,7 @@ when present.
 
 ### Settings
 
-The extension contributes exactly two settings, both machine-scoped:
+The extension contributes four settings:
 
 | Setting | Default | Meaning |
 |---|---|---|
@@ -192,18 +197,42 @@ traffic, so a client without the key is rejected immediately.
 
 | Capability | Supported |
 |---|---|
-| `session/new` | Yes |
-| `session/close` | Yes |
-| `session/prompt` | Yes |
-| `session/cancel` | Yes |
+| `session/new`, `session/prompt`, `session/cancel`, `session/close` | Yes |
+| `session/load` (`loadSession`) | Yes — replays the saved transcript with the same titles, kinds and file locations as live updates |
+| `session/list` (`sessionCapabilities.list`) | Yes — paged, 20 per page |
+| `session/set_mode` | Yes — the permission mode |
+| `session/set_config_option` | Yes — `model`, `effort` and persona |
+| Prompt content | Text, resource links, embedded text context and images (PNG, JPEG, GIF, WebP) |
 | `session/request_permission` | Yes — prompts appear in the editor UI |
+| Updates | Message and thought chunks, tool calls with live output previews, plan, available commands, usage and session info |
 | Max concurrent sessions | 64 |
+
+An image above 2 MiB is re-encoded to fit, like `/add` in the terminal UI; an
+image for a model the catalog lists as text-only is refused with a message
+naming the model.
+
+Slash commands sent as the sole text block of a prompt (announced through
+`available_commands_update`): `/compact`, `/undo`, `/rename <name>`, `/cost`,
+`/model [alias|default]`, `/effort [level|default]`, `/cron …`, `/tasks`
+(`/tasks result <id>`, `/tasks cancel <id>`) and, with the goal feature,
+`/goal`. `/compact`, `/undo`, `/rename` and `/goal <objective>` are refused on
+a session that holds provider-native conversation state (Anthropic with session
+persistence, after its first turn); the message names the command and says to
+start a new session. Automatic compaction still runs on such sessions.
+
+The transport is stdio, or TCP with the nonce/HMAC challenge; setting
+`MINI_AGENT_ACP_TLS_CERT` and `MINI_AGENT_ACP_TLS_KEY` wraps the TCP listener
+in TLS.
 
 The machine-readable summary lives in [`docs/acp-registry.json`](acp-registry.json).
 
-ACP history is kept in memory for the lifetime of the session. Before a new
-model turn, history exceeding 128 complete turns or 2 MiB is summarized from
-the oldest turns until it fits those limits. If a provider summarizes only a
+ACP sessions are checkpointed to disk after each turn and can be reloaded with
+`session/load` (for the same workspace folder; a mismatch names the saved
+folder). Live history is not capped by turn count by default
+(`acp_history_max_turns` is `0`): compaction is driven by token pressure under
+`compact_enabled`, and a serialized-size memory guard (`acp_history_max_bytes`,
+by default the larger of 2 MiB and four bytes per context-window token) summarizes
+the oldest turns until the history fits. If a provider summarizes only a
 prefix, the next pass carries that recap forward. A failed summary or one that
 covers no complete turn triggers bounded eviction with an explicit recap notice.
 Cancellation interrupts a pending summary; completed passes remain committed,
@@ -222,9 +251,12 @@ When a tool needs authorization, mini-agent sends a `session/request_permission`
 The VS Code extension cancels the decision if workspace trust is revoked while
 the dialog is open, even if an Allow option was selected.
 
-The `allow_always` option ("Allow for this session") installs a rule for the
-current agent session only; nothing is written to configuration. Its `_meta`
-names that rule exactly: `suggestedPattern` is the human-readable rule (for
+The `allow_always` option installs a rule for the current agent session only;
+nothing is written to configuration. Its label states the rule
+(`Allow for this session: exactly /repo/src/a.rs`, clipped to about 80
+characters) and the request carries the same sentence as a text block, because
+generic clients render only the option name. Its `_meta` names that rule
+exactly: `suggestedPattern` is the human-readable rule (for
 example `exactly /repo/src/**` or `anything under /repo/`),
 `allowPatterns` lists the exact patterns the agent installs, and `scope` is
 `"session"`. When the tool supplies no narrower scope, a file tool's grant
@@ -236,6 +268,11 @@ entry. That entry finishes when the approval is granted, denied, cancelled, or
 fails; its result describes the permission decision. The underlying operation
 keeps its own lifecycle. If an operation stops waiting for approval, mini-agent
 cancels that pending request so later approvals can proceed.
+
+A request keeps the descriptive title the call was announced with (for example
+`shell cargo test --all`). MCP permission questions use this same flow. MCP
+elicitation forms cannot be answered over ACP: the request is cancelled and an
+agent thought says so.
 
 If no ACP client is connected, or if the session is non-interactive, tool calls that require a permission prompt are denied automatically.
 

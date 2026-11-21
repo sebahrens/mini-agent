@@ -166,6 +166,36 @@ pub(super) fn serialize_bounded_session(session: &Session) -> anyhow::Result<Str
     String::from_utf8(json.bytes).map_err(|_| anyhow::anyhow!("invalid persisted session UTF-8"))
 }
 
+/// Why an exact read-only load refused a session file that exists. Typed so a
+/// frontend can say which problem the user can fix; `Display` stays bounded
+/// and never echoes file contents beyond the saved workspace label.
+#[cfg(any(feature = "acp", test))]
+#[derive(Debug)]
+pub(crate) enum ExactLoadRefusal {
+    /// The session was saved for a different workspace (the saved label).
+    WorkspaceMismatch { saved: String },
+    /// The file is not a session this build can read.
+    Incompatible,
+    /// The file holds a different session than the requested id.
+    IdentityMismatch,
+}
+
+#[cfg(any(feature = "acp", test))]
+impl std::fmt::Display for ExactLoadRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WorkspaceMismatch { .. } => {
+                f.write_str("persisted session belongs to another workspace")
+            }
+            Self::Incompatible => f.write_str("persisted session is not readable by this version"),
+            Self::IdentityMismatch => f.write_str("persisted session identity mismatch"),
+        }
+    }
+}
+
+#[cfg(any(feature = "acp", test))]
+impl std::error::Error for ExactLoadRefusal {}
+
 /// Exact, noncreating and nonrepairing import. Both retained directories are
 /// supplied by the host; stored working_dir is compared as text, never opened.
 #[cfg(any(feature = "acp", test))]
@@ -207,17 +237,17 @@ pub(crate) fn load_session_exact_read_only(
     )?;
     sessions_root.validate_private_root()?;
     workspace.validate().map_err(anyhow::Error::msg)?;
-    let json = std::str::from_utf8(&bytes)
-        .map_err(|_| anyhow::anyhow!("invalid persisted session UTF-8"))?;
-    let mut session = decode_session_json(json)?;
-    anyhow::ensure!(
-        session.id == requested_id,
-        "persisted session identity mismatch"
-    );
-    anyhow::ensure!(
-        super::catalogue::same_workspace(&session.working_dir, workspace),
-        "persisted session belongs to another workspace"
-    );
+    let json = std::str::from_utf8(&bytes).map_err(|_| ExactLoadRefusal::Incompatible)?;
+    let mut session = decode_session_json(json).map_err(|_| ExactLoadRefusal::Incompatible)?;
+    if session.id != requested_id {
+        return Err(ExactLoadRefusal::IdentityMismatch.into());
+    }
+    if !super::catalogue::same_workspace(&session.working_dir, workspace) {
+        return Err(ExactLoadRefusal::WorkspaceMismatch {
+            saved: session.working_dir.to_string(),
+        }
+        .into());
+    }
     // Import history/task data, never explicit grants or concealed redo.
     session.permission_allowlist.clear();
     session.rewind_undo = None;
