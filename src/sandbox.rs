@@ -4327,11 +4327,23 @@ impl Sandbox {
     /// Whether commands run in PowerShell inside the Windows AppContainer, where the workspace
     /// is reached through the [`POWERSHELL_WORKSPACE_DRIVE`] drive.
     pub(crate) fn uses_powershell_workspace_drive(&self) -> bool {
+        // A sandbox that only names its shell (`--doctor` probes) has no resolved capability yet.
+        let dialect = self
+            .shell_capability()
+            .map(ShellCapability::dialect)
+            .or_else(|| {
+                if self.shell_resolution_complete {
+                    return None;
+                }
+                Path::new(&self.shell)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(ShellDialect::for_name)
+            });
         cfg!(windows)
             && self.enabled
             && self.backend == "appcontainer"
-            && self.shell_capability().map(ShellCapability::dialect)
-                == Some(ShellDialect::PowerShell)
+            && dialect == Some(ShellDialect::PowerShell)
     }
 
     /// The configured backend name (`bwrap`, `seatbelt`, `appcontainer`, ...).
