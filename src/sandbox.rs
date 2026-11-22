@@ -4001,7 +4001,7 @@ impl Sandbox {
         matrix
     }
 
-    fn unavailable_reason(&self) -> Option<String> {
+    pub(crate) fn unavailable_reason(&self) -> Option<String> {
         #[cfg(target_os = "windows")]
         if self.backend == "appcontainer" {
             return windows::unavailable_reason();

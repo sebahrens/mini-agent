@@ -1443,9 +1443,57 @@ fn recover_preserved_preflight_roots(temp_root: &Path, deadline: Instant) -> Res
     candidates.sort();
     for candidate in candidates {
         ensure_preflight_cleanup_deadline(deadline)?;
-        recover_preserved_preflight_root(&canonical_temp, &candidate, deadline)?;
+        if let Err(error) = recover_preserved_preflight_root(&canonical_temp, &candidate, deadline)
+        {
+            // Every process owns a private preflight root in the shared temporary directory, so
+            // a concurrently starting session's live root is enumerated here too. It is not
+            // preserved recovery state: skip it instead of failing this process closed.
+            if preflight_root_is_possibly_live(&candidate) {
+                tracing::debug!(
+                    phase = "windows_general_appcontainer_preflight",
+                    "skipped a production-preflight root owned by a concurrent session"
+                );
+                continue;
+            }
+            return Err(error);
+        }
     }
     Ok(())
+}
+
+/// How long after creation a production-preflight root can still belong to a live session: the
+/// run, reap and recovery windows of one preflight plus a generous scheduling margin. Older roots
+/// that cannot be verified stay fail-closed errors.
+const PREFLIGHT_ROOT_LIVE_WINDOW: Duration = Duration::from_secs(300);
+
+/// Whether a root that failed recovery may belong to a concurrent live session: its owner lease
+/// is currently held (sharing violation), it vanished while being inspected (the owner finished),
+/// or it is younger than [`PREFLIGHT_ROOT_LIVE_WINDOW`] (its owner has not yet created the lease
+/// or the DACL attestation raced its creation).
+fn preflight_root_is_possibly_live(candidate: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    let metadata = match std::fs::symlink_metadata(candidate) {
+        Ok(metadata) => metadata,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+    };
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(candidate.join(PREFLIGHT_OWNER_FILE));
+    // ERROR_SHARING_VIOLATION: a live session holds its exclusive lease.
+    if matches!(&owner, Err(error) if error.raw_os_error() == Some(32)) {
+        return true;
+    }
+    match metadata
+        .created()
+        .ok()
+        .and_then(|created| created.elapsed().ok())
+    {
+        Some(age) => age < PREFLIGHT_ROOT_LIVE_WINDOW,
+        // A creation time in the future (clock adjustment) or an unreadable one is not stale.
+        None => true,
+    }
 }
 
 fn recover_preserved_preflight_root(
