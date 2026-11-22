@@ -22,6 +22,12 @@ dispatch and the weekly schedule, so on pull requests and branch pushes their
 `skipped` result is accepted by design; on a tag push or dispatch they must
 succeed like every other job, which keeps the release's CI evidence complete.
 
+Pull requests also drop the non-default macOS `test` rows and the macOS
+`parallel-test-smoke` run from the job matrices (workflow `exclude` entries
+keyed on the event), so those jobs report a plain `success` for the rows that
+exist; nothing here needs to accept a skip for them. Pushes to main, tags and
+dispatch still run every row.
+
 For a full code scope, every applicable gating job must succeed, including
 `harness-regression` on branch pushes. The explicit test-scope and heavy-gate
 exceptions above are the only additional accepted skips for code=true runs.
