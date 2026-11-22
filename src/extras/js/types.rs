@@ -77,11 +77,13 @@ pub(crate) enum EffectServiceError {
     #[error("resource limit: effect body exceeded its limit")]
     BodyLimit,
     #[error("invalid encoding: effect body is invalid")]
+    #[cfg_attr(not(feature = "sandbox"), allow(dead_code))]
     InvalidBody,
     #[error("effect target is not UTF-8 text")]
     NotText,
     #[cfg(any(test, feature = "sandbox"))]
     #[error("name resolution failed")]
+    #[cfg_attr(not(feature = "sandbox"), allow(dead_code))]
     DnsFailed,
     #[error("effect backend is unavailable")]
     BackendFailure,

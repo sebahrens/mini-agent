@@ -886,6 +886,7 @@ pub(crate) enum HostEffectError {
     #[error("operation target is not UTF-8 text")]
     NotText,
     #[error("name resolution failed")]
+    #[cfg_attr(not(any(test, feature = "sandbox")), allow(dead_code))]
     DnsFailed,
     #[error("operation target is outside the allowed scope")]
     TargetDenied,

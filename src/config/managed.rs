@@ -399,6 +399,7 @@ fn bounded_list(what: &str, list: &[String]) -> Result<(), String> {
 /// root (Unix) or by Administrators/SYSTEM/TrustedInstaller (Windows). Used for
 /// every administrator-owned file the program trusts without a prompt: the
 /// managed policy and the managed hooks (mini-agent-nvnkx.221).
+#[cfg_attr(not(any(test, feature = "hooks", not(unix))), allow(dead_code))]
 pub(crate) fn check_administrator_authority(path: &Path) -> Result<(), String> {
     let shown = path.display();
     #[cfg(unix)]

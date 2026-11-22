@@ -528,9 +528,12 @@ async fn test_configured_lower_step_timeout_is_enforced() {
         })
         .await
         .expect("timeout call failed");
-    assert_eq!(
-        result,
-        "JS error: execution timed out (2s js-step-timeout-secs limit exceeded)"
+    // The worker's own deadline appends its diagnostic; the parent's backstop
+    // reports the bare headline. Either way the configured key and budget lead.
+    let headline = "JS error: execution timed out (2s js-step-timeout-secs limit exceeded)";
+    assert!(
+        result == headline || result == format!("{headline} (stage: evaluation; script: model)"),
+        "{result}"
     );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(15),

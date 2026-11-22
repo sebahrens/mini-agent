@@ -8,7 +8,7 @@ description: "Copy-paste Agent Client Protocol configuration for Zed, JetBrains 
 mini-agent is an Agent Client Protocol (ACP) server. Any ACP client can start it as a child process
 over stdio with one argument, `--acp`, and talk to it with newline-delimited JSON-RPC. This page gives
 a configuration block per editor, what the server offers, and what to check when a client behaves
-differently. The protocol surface is described in [vscode-acp-setup.md](vscode-acp-setup.md) and
+differently. The protocol surface is described in [vscode-acp-setup.md](../vscode-acp-setup.md) and
 summarised in `docs/acp-registry.json` in the repository.
 
 ## What was verified
@@ -99,7 +99,7 @@ Confirmed with: not yet recorded.
 
 ## VS Code
 
-Use the native extension (see [vscode-acp-setup.md](vscode-acp-setup.md)); it launches `mini-agent --acp`
+Use the native extension (see [vscode-acp-setup.md](../vscode-acp-setup.md)); it launches `mini-agent --acp`
 itself. It is distributed as a VSIX attached to each release, not through the Marketplace.
 
 ## What each client gets
@@ -127,7 +127,7 @@ mini-agent advertises these capabilities. Whether the editor shows them is up to
 - Project hooks and sensitive project config need the same approvals as a headless run. Approve them
   once in a terminal (`mini-agent hooks trust`, `mini-agent trust`) before relying on them in an editor.
 - A client that reads TCP instead of spawning a process needs the key and TLS setup in
-  [vscode-acp-setup.md](vscode-acp-setup.md#generic-acp-clients-over-tcp).
+  [vscode-acp-setup.md](../vscode-acp-setup.md#generic-acp-clients-over-tcp).
 
 ## Listing mini-agent in an ACP agent registry
 

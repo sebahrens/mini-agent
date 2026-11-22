@@ -631,7 +631,7 @@ impl GitTool {
 
     /// A tool over `root` that runs git directly, for tests of callers that
     /// need real repository output without a platform sandbox.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "git-worktree"))]
     pub(crate) fn uncontained_for_test(root: &Path) -> Self {
         let workspace = Arc::new(
             crate::paths::WorkspaceBinding::capture(root).expect("capture test repository"),

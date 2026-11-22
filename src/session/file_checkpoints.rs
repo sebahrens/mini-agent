@@ -90,6 +90,7 @@ enum SkipReason {
     TotalBytes(usize),
     Storage,
     /// A typed git operation rewrote working-tree files that were not captured.
+    #[cfg_attr(not(any(test, feature = "git-worktree")), allow(dead_code))]
     GitOperation,
     /// The whole-workspace snapshot for a turn was refused (caps or storage).
     WorkspaceSnapshot,
@@ -1272,6 +1273,7 @@ pub(crate) fn skipped() {
 }
 /// Records working-tree files rewritten by a typed git operation (switch,
 /// stash) whose individual preimages are not captured.
+#[cfg_attr(not(any(test, feature = "git-worktree")), allow(dead_code))]
 pub(crate) fn skipped_git() {
     if let Some(recorder) = current() {
         let mut state = recorder.edit_store();
