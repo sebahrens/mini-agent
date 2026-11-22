@@ -4456,6 +4456,20 @@ impl Sandbox {
             .as_ref()
     }
 
+    /// Pin this sandbox's runtime cache to `dir` (created private) instead of
+    /// the application cache. Read-only diagnostics use an ephemeral directory
+    /// so a sandboxed probe never creates `sandbox-runtime` in the user's cache.
+    pub(crate) fn with_ephemeral_cache_dir(self, dir: &Path) -> Result<Self, String> {
+        crate::fs::ensure_private_directory(dir).map_err(|error| error.to_string())?;
+        crate::fs::ensure_private_directory(&dir.join("tmp")).map_err(|error| error.to_string())?;
+        let canonical = dir.canonicalize().map_err(|error| error.to_string())?;
+        *self
+            .cached_cache_dir
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(canonical));
+        Ok(self)
+    }
+
     /// Test seam: pin this sandbox's cache directory without touching the
     /// process-global `ZS_CACHE_DIR`, which concurrent readers would observe.
     #[cfg(test)]

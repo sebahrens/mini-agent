@@ -3503,7 +3503,6 @@ pub async fn branch_report(info: &WorktreeInfo, base_oid: &str) -> Result<Branch
 /// Remove a worktree this process created for a subagent, together with its
 /// branch, discarding anything in either. Idempotent: an already-removed
 /// worktree or branch is not an error.
-#[cfg(feature = "subagents")]
 pub async fn discard_worktree(info: &WorktreeInfo) -> Result<(), String> {
     let main_repo_path = canonical_path(&info.main_repo_path, "main repository")?;
     validate_branch_name(&main_repo_path, &info.branch).await?;

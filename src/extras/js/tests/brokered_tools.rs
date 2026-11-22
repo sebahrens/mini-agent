@@ -102,10 +102,30 @@ async fn call_tool_runs_read_only_tools_in_a_loop_and_returns_only_the_aggregate
         "const a = call_tool('grep', {pattern: 'alpha'});\nconst b = call_tool('grep', {pattern: 'beta', path: 'src'});\nresult({texts: [a.text, b.text], ok: a.ok && b.ok, truncated: a.truncated})",
     )
     .await;
+    // Key order of the re-serialized aggregate (and of the argument JSON the
+    // fake echoes) depends on whether serde_json's `preserve_order` feature is
+    // unified into this feature row, so compare parsed values.
+    let parsed: serde_json::Value = serde_json::from_str(&out).expect(&out);
+    let texts: Vec<serde_json::Value> = parsed["texts"]
+        .as_array()
+        .expect(&out)
+        .iter()
+        .map(|text| {
+            let text = text.as_str().expect(&out);
+            let args = text.strip_prefix("grep saw ").expect(text);
+            serde_json::from_str(args).expect(text)
+        })
+        .collect();
     assert_eq!(
-        out,
-        r#"{"texts":["grep saw {\"pattern\":\"alpha\"}","grep saw {\"pattern\":\"beta\",\"path\":\"src\"}"],"ok":true,"truncated":false}"#
+        texts,
+        vec![
+            serde_json::json!({"pattern": "alpha"}),
+            serde_json::json!({"pattern": "beta", "path": "src"}),
+        ]
     );
+    assert_eq!(parsed["ok"], serde_json::json!(true), "{out}");
+    assert_eq!(parsed["truncated"], serde_json::json!(false), "{out}");
+    assert_eq!(parsed.as_object().unwrap().len(), 3, "{out}");
     assert_eq!(fake.calls.lock().unwrap().len(), 2);
     // Each call is one audited effect that names the tool only by a keyed tag.
     let audit = audit.lock().unwrap();
