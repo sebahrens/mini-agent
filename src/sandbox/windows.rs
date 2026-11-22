@@ -2423,6 +2423,7 @@ impl LaunchRequest {
 }
 
 static DISCOVERED_TOOLCHAINS: OnceLock<Vec<windows_toolchains::Toolchain>> = OnceLock::new();
+static SKIPPED_TOOLCHAINS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Resolve the PATH toolchains once, on a background thread, when
 /// `windows-appcontainer-toolchain-discovery` is on. Nothing runs when the key is off, and a
@@ -2433,25 +2434,27 @@ pub(crate) fn start_toolchain_discovery() {
         let _ = std::thread::Builder::new()
             .name("windows-toolchain-discovery".into())
             .spawn(|| {
-                let toolchains = windows_toolchains::DiscoveryEnvironment::from_process()
-                    .map(|mut environment| {
-                        environment.already_readable = Some(all_packages_read_tree);
-                        if let Ok(paths) = crate::paths::AppPaths::from_process(None) {
-                            environment.excluded_roots = [
-                                &paths.config_dir,
-                                &paths.data_dir,
-                                &paths.local_data_dir,
-                                &paths.state_dir,
-                                &paths.cache_dir,
-                                &paths.credentials_dir,
-                            ]
-                            .into_iter()
-                            .filter_map(|dir| std::fs::canonicalize(dir).ok())
-                            .collect();
-                        }
-                        windows_toolchains::discover(&environment)
-                    })
-                    .unwrap_or_default();
+                let (toolchains, skipped) =
+                    windows_toolchains::DiscoveryEnvironment::from_process()
+                        .map(|mut environment| {
+                            environment.already_readable = Some(all_packages_read_tree);
+                            if let Ok(paths) = crate::paths::AppPaths::from_process(None) {
+                                environment.excluded_roots = [
+                                    &paths.config_dir,
+                                    &paths.data_dir,
+                                    &paths.local_data_dir,
+                                    &paths.state_dir,
+                                    &paths.cache_dir,
+                                    &paths.credentials_dir,
+                                ]
+                                .into_iter()
+                                .filter_map(|dir| std::fs::canonicalize(dir).ok())
+                                .collect();
+                            }
+                            windows_toolchains::discover_with_report(&environment)
+                        })
+                        .unwrap_or_default();
+                let _ = SKIPPED_TOOLCHAINS.set(skipped);
                 let _ = DISCOVERED_TOOLCHAINS.set(toolchains);
             });
     });
@@ -2487,6 +2490,11 @@ pub(crate) fn discovered_toolchain_root_count() -> usize {
         std::thread::sleep(Duration::from_millis(50));
     }
     discovered_toolchain_roots().len()
+}
+
+/// Commands the host `PATH` resolves whose directory was not granted, with the reason.
+pub(crate) fn skipped_toolchain_report() -> Vec<String> {
+    SKIPPED_TOOLCHAINS.get().cloned().unwrap_or_default()
 }
 
 fn build_helper_with_ready_and_roots(

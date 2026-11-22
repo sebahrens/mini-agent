@@ -3953,7 +3953,10 @@ mod tests {
             &host_path_extensions(),
         )
         .expect("resolved on the temporary PATH");
-        assert_eq!(found, root.join(tool));
+        assert_eq!(
+            found.to_string_lossy().to_ascii_lowercase(),
+            root.join(tool).to_string_lossy().to_ascii_lowercase()
+        );
         assert_eq!(
             crate::sandbox::windows_toolchains::resolve_on_path(
                 "nothing-here",

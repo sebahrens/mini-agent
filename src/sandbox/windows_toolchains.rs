@@ -438,17 +438,29 @@ pub(crate) fn mentioned_roots(toolchains: &[Toolchain], script: &str) -> Vec<Pat
 /// The read/execute roots to propose, deduplicated and without nested entries. Each root is a
 /// canonical directory; nothing here touches an ACL.
 pub(crate) fn discover(environment: &DiscoveryEnvironment) -> Vec<Toolchain> {
-    discover_within(
+    discover_with_report(environment).0
+}
+
+/// [`discover`] plus one `command: reason` line for every resolved command whose directory was
+/// not proposed (shown by `--doctor`, so a missing grant is explainable).
+pub(crate) fn discover_with_report(
+    environment: &DiscoveryEnvironment,
+) -> (Vec<Toolchain>, Vec<String>) {
+    let mut skipped = Vec::new();
+    let toolchains = discover_within(
         environment,
         MAX_DISCOVERED_ROOT_ENTRIES,
         MAX_DISCOVERED_TOTAL_ENTRIES,
-    )
+        &mut skipped,
+    );
+    (toolchains, skipped)
 }
 
 fn discover_within(
     environment: &DiscoveryEnvironment,
     root_limit: usize,
     total_limit: usize,
+    skipped: &mut Vec<String>,
 ) -> Vec<Toolchain> {
     let mut proposed: Vec<(Toolchain, usize)> = Vec::new();
     for name in TOOLCHAIN_COMMANDS {
@@ -508,6 +520,7 @@ fn discover_within(
                 ));
             }
             Err(reason) => {
+                skipped.push(format!("{name}: {reason:?}"));
                 tracing::debug!(
                     command = *name,
                     reason = ?reason,
@@ -558,7 +571,7 @@ mod tests {
         root_limit: usize,
         total_limit: usize,
     ) -> Vec<PathBuf> {
-        discover_within(environment, root_limit, total_limit)
+        discover_within(environment, root_limit, total_limit, &mut Vec::new())
             .into_iter()
             .map(|toolchain| toolchain.root)
             .collect()

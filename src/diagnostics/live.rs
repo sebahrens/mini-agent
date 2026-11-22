@@ -193,6 +193,10 @@ pub(crate) fn appcontainer_extras_line(sandbox: &crate::sandbox::Sandbox) -> Str
     if sandbox.windows_toolchain_discovery() {
         let roots = crate::sandbox::discovered_toolchain_root_count();
         line.push_str(&format!(" ({roots} toolchain root(s) resolved)"));
+        let skipped = crate::sandbox::skipped_toolchain_report();
+        if !skipped.is_empty() {
+            line.push_str(&format!("; not granted: {}", skipped.join(", ")));
+        }
     }
     line
 }

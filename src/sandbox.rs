@@ -58,6 +58,18 @@ pub(crate) fn retained_stale_grants() -> usize {
     }
 }
 
+/// PATH commands whose directory was not granted, with the reason (doctor).
+pub(crate) fn skipped_toolchain_report() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        windows::skipped_toolchain_report()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
 /// PATH toolchain roots resolved for the Windows AppContainer shell (doctor).
 pub(crate) fn discovered_toolchain_root_count() -> usize {
     #[cfg(windows)]
