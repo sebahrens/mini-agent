@@ -3,7 +3,7 @@
 
 Runs each fixture task of ``tests/harness_eval/delegation/tasks.json`` twice with
 a real mini-agent binary: once with the ``task`` tool enabled and once with
-``[subagents] task_enabled = false``. It reads each run's headless JSON result
+``task_enabled = false`` (a top-level config key). It reads each run's headless JSON result
 (``usage``, ``total_cost_usd``, ``num_turns`` and the ``subagent_delegation``
 telemetry), checks the task's expected files, and prints one JSON record per
 arm plus a comparison.
@@ -66,11 +66,44 @@ def record_from_result(task: str, arm: str, result: dict[str, Any], success: boo
         "host_replaced": delegation.get("host_replaced", 0),
         "child_tokens": delegation.get("total_tokens", 0),
         "child_cost_units": delegation.get("cost_units", 0),
+        # The whole aggregate, so repaired / unstructured / normalized contracts
+        # and the per-child rows survive into the record.
+        "subagent_delegation": delegation,
     }
 
 
+class ConfigRejected(RuntimeError):
+    """The binary refused the generated configuration; the run would be an
+    all-zero failure that looks like a result."""
+
+
+CONFIG_ERROR_MARKERS = ("config is not valid", "unknown field", "invalid config")
+
+
+def config_error(stderr: str, returncode: int) -> str | None:
+    """The stderr tail when the binary exited because of its configuration."""
+    if returncode == 0:
+        return None
+    lowered = stderr.lower()
+    if any(marker in lowered for marker in CONFIG_ERROR_MARKERS):
+        return stderr[-500:]
+    return None
+
+
+def scratch_root() -> str:
+    """A temp root with no symlinked path component (macOS ``/var`` is one;
+    the binary rejects private paths through symlinks)."""
+    return os.path.realpath(tempfile.gettempdir())
+
+
+def config_text(arm: str) -> str:
+    """`task_enabled` is a top-level key, not a table member."""
+    enabled = "true" if arm == "delegated" else "false"
+    return f"task_enabled = {enabled}\n"
+
+
 def run_arm(binary: Path, task: dict[str, Any], arm: str, extra: list[str]) -> dict:
-    with tempfile.TemporaryDirectory(prefix="delegation-eval-") as scratch:
+    with tempfile.TemporaryDirectory(prefix="delegation-eval-", dir=scratch_root()) as scratch:
         scratch_path = Path(scratch)
         workspace = scratch_path / "work"
         config = scratch_path / "config"
@@ -79,10 +112,7 @@ def run_arm(binary: Path, task: dict[str, Any], arm: str, extra: list[str]) -> d
             target = workspace / relative
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
-        enabled = "true" if arm == "delegated" else "false"
-        (config / "config.toml").write_text(
-            f"[subagents]\ntask_enabled = {enabled}\n", encoding="utf-8"
-        )
+        (config / "config.toml").write_text(config_text(arm), encoding="utf-8")
         env = dict(os.environ, MINI_AGENT_CONFIG_DIR=str(config))
         completed = subprocess.run(
             [str(binary), "-p", task["prompt"], "--output", "json", *extra],
@@ -92,6 +122,9 @@ def run_arm(binary: Path, task: dict[str, Any], arm: str, extra: list[str]) -> d
             text=True,
             check=False,
         )
+        rejected = config_error(completed.stderr, completed.returncode)
+        if rejected is not None:
+            raise ConfigRejected(f"{task['name']}/{arm}: the binary rejected its config: {rejected}")
         try:
             result = json.loads(completed.stdout.strip().splitlines()[-1])
         except (IndexError, json.JSONDecodeError):

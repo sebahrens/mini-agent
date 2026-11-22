@@ -543,7 +543,7 @@ impl Run {
             return;
         };
         let run = self.clone();
-        generation::spawn(&self.session_id, async move {
+        generation::run_in_background(&self.session_id, async move {
             let Some(reported) = generation::lookup(&lookup, generation::TIMEOUT).await else {
                 return;
             };
