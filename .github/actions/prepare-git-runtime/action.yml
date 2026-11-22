@@ -80,13 +80,13 @@ runs:
         update: false
         cache: false
 
-    - name: Synchronise and upgrade MSYS2 packages (pass 1)
+    - name: Limit pacman to the base and toolchain repositories
       if: runner.os == 'Windows' && steps.bundle-cache.outputs.cache-hit != 'true'
       shell: msys2 {0}
       env:
         MINI_AGENT_GIT_TARGET: ${{ inputs.target }}
       run: |
-        set -uo pipefail
+        set -euo pipefail
         # Sync only the base repository and the one the toolchain comes from; the other
         # environments' databases are never downloaded.
         if [ "$MINI_AGENT_GIT_TARGET" = aarch64-pc-windows-msvc ]; then keep=clangarm64; else keep=ucrt64; fi
@@ -95,12 +95,19 @@ runs:
           !skip { print }' /etc/pacman.conf > /tmp/pacman.conf.new
         grep -Fxq "[$keep]" /tmp/pacman.conf.new
         cp /tmp/pacman.conf.new /etc/pacman.conf
-        for attempt in 1 2 3; do
-          /usr/bin/pacman --noconfirm -Syuu && exit 0
-          echo "::warning::pacman database sync attempt $attempt failed"
-          sleep $((attempt * 20))
-        done
-        exit 1
+
+    - name: Upgrade the MSYS2 core (pass 1; MSYS2 ends its own processes)
+      if: runner.os == 'Windows' && steps.bundle-cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        # A core (msys-runtime) update terminates every MSYS2 process, including its shell, so it is
+        # run from a non-MSYS2 process and its exit status is not meaningful. Pass 2 repeats the full
+        # upgrade strictly, with retries, and fails the job if the system is not fully synchronised.
+        $script = Join-Path $env:RUNNER_TEMP 'mini-agent-pacman-core.sh'
+        Set-Content -Path $script -Value '/usr/bin/pacman --noconfirm -Syuu' -Encoding ascii
+        & (Join-Path $env:RUNNER_TEMP 'setup-msys2\msys2.cmd') $script
+        $global:LASTEXITCODE = 0
+        exit 0
 
     - name: Install the explicit build dependencies (pass 2, retrying)
       if: runner.os == 'Windows' && steps.bundle-cache.outputs.cache-hit != 'true'
@@ -109,7 +116,7 @@ runs:
         MINI_AGENT_GIT_TARGET: ${{ inputs.target }}
       run: |
         set -uo pipefail
-        # A second full upgrade completes any core update that required a fresh runtime.
+        # The strict full upgrade after the core pass; retries cover slow mirrors (pacman skips a failing mirror).
         if [ "$MINI_AGENT_GIT_TARGET" = aarch64-pc-windows-msvc ]; then
           packages="make patch python zstd diffutils mingw-w64-clang-aarch64-clang mingw-w64-clang-aarch64-curl-winssl mingw-w64-clang-aarch64-pcre2 mingw-w64-clang-aarch64-zlib mingw-w64-clang-aarch64-expat mingw-w64-clang-aarch64-libiconv"
         else

@@ -286,8 +286,7 @@ class GitRuntimeCiTests(unittest.TestCase):
             self.assertIn(package, install["run"].split())  # diffutils: Git GIT-VERSION-GEN requires /usr/bin/cmp.
         # Retries with backoff, and only the base plus the toolchain repository are synchronised.
         self.assertIn("for attempt in 1 2 3", install["run"])
-        sync = next(step for step in steps if step.get("name", "").startswith("Synchronise and upgrade"))
-        self.assertIn("for attempt in 1 2 3", sync["run"])
+        sync = next(step for step in steps if step.get("name", "").startswith("Limit pacman"))
         self.assertIn('name != "msys" && name != keep', sync["run"])
         # A prepared payload is reused only for unchanged pinned inputs, never during source collection.
         cache = next(step for step in steps if step.get("id") == "bundle-cache")
@@ -295,7 +294,7 @@ class GitRuntimeCiTests(unittest.TestCase):
         for pinned in ("policy.patch", "git-2.56.0.tar.xz", "build-git-runtime-windows.py", "action.yml", "inputs.target"):
             self.assertIn(pinned, cache["with"]["key"])
         for step in steps:
-            if step.get("uses", "").startswith("msys2/") or step.get("name", "").startswith(("Synchronise", "Install the explicit", "Build and select")):
+            if step.get("uses", "").startswith("msys2/") or step.get("name", "").startswith(("Limit pacman", "Upgrade the MSYS2 core", "Install the explicit", "Build and select")):
                 self.assertIn("steps.bundle-cache.outputs.cache-hit != 'true'", step["if"])
         for package in ["make patch python", "gcc", "curl-winssl", "zlib", "expat", "libiconv"]:
             self.assertIn(package, self.action)
