@@ -1128,6 +1128,12 @@ async fn run_inner(mut cli: cli::Cli) -> anyhow::Result<()> {
     for warning in &cfg.load_warnings[loaded_warning_count..] {
         eprintln!("warning: {warning}");
     }
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    if let Some(notice) =
+        diagnostics::x64_on_arm64_notice(std::env::var("PROCESSOR_IDENTIFIER").ok().as_deref())
+    {
+        eprintln!("warning: {notice}");
+    }
     if one_shot_stage!(Needs::Config, Some(&cfg)) {
         return Ok(());
     }
