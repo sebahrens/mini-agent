@@ -1942,7 +1942,7 @@ partial statuses are returned.")
                     "type": "integer",
                     "minimum": 1,
                     "maximum": timeout_ceiling,
-                    "description": format!("Optional per-child window in seconds from its start (default: the persona's timeout_secs, else task_timeout_secs {default_timeout}, or {default_background_timeout} in the background); a child past it returns a marked partial write-up. Above {timeout_ceiling} ([subagents] task_timeout_ceiling_secs) is rejected.")
+                    "description": format!("Optional per-child window in seconds from its start (default: the persona's timeout_secs, else task_timeout_secs {default_timeout}, or task_background_timeout_secs {default_background_timeout} in the background); a child past it returns a marked partial write-up. Above {timeout_ceiling} ([subagents] task_timeout_ceiling_secs) is rejected.")
                 },
                 "label": {
                     "type": "string",
