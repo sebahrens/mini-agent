@@ -741,15 +741,17 @@ pub async fn handle_compress_with_force(
         && ui
             .session
             .actionable_size_pressure(ui.cfg.resolve_compact_size_fraction());
-    let result = handle_compress_unfloored(
-        instructions,
-        auto,
-        force,
-        run,
-        renderer,
-        ui,
-        reasoning_enabled,
-    )
+    let result = crate::startup::heap_future(|| {
+        handle_compress_unfloored(
+            instructions,
+            auto,
+            force,
+            run,
+            renderer,
+            ui,
+            reasoning_enabled,
+        )
+    })
     .await;
     if result.is_err() && byte_pressure {
         // A failed byte-pressure compaction must not re-arm at the next tool
@@ -862,13 +864,15 @@ async fn handle_compress_unfloored(
     // Same model on a native prompt-cache route: fork the conversation's own
     // request instead of re-serializing it, so the summary reads the cache.
     let cache_fork = if compaction_model.is_none() {
-        cache_fork_input(
-            ui,
-            cut_idx,
-            keep_recent_tool_results,
-            summarizer_input_budget,
-            reasoning_enabled,
-        )
+        crate::startup::heap_future(|| {
+            cache_fork_input(
+                ui,
+                cut_idx,
+                keep_recent_tool_results,
+                summarizer_input_budget,
+                reasoning_enabled,
+            )
+        })
         .await
     } else {
         None
@@ -905,64 +909,68 @@ async fn handle_compress_unfloored(
             #[cfg(not(feature = "memory"))]
             let _ = (summary, first_kept_index);
         });
-    let compaction = crate::session::compaction_run::run(
-        ui.session,
-        crate::session::compaction_run::Plan {
-            cut_idx,
-            input_token_budget: summarizer_input_budget,
-            response_token_budget: reserve,
-            restore_read_tokens,
-            auto,
-            instructions,
-            fork_keep_recent_tool_results: None,
-            pre_compact_sent: &pre_compact_sent,
-            snap: None,
-        },
-        &mut observer,
-        |request| async move {
-            let model = compaction_model.unwrap_or(request.model);
-            let messages = request.messages;
-            let previous_summary = request.previous_summary;
-            let (input_budget, response_budget) = crate::config::CompactionBudgetCap::apply(
-                budget_cap,
-                request.input_token_budget,
-                request.response_token_budget,
-            );
-            if let Some((agent, history)) = cache_fork {
-                match agent
-                    .compress_forked(
-                        history,
-                        messages.len(),
+    let mut compaction = crate::startup::heap_future(|| {
+        crate::session::compaction_run::run(
+            ui.session,
+            crate::session::compaction_run::Plan {
+                cut_idx,
+                input_token_budget: summarizer_input_budget,
+                response_token_budget: reserve,
+                restore_read_tokens,
+                auto,
+                instructions,
+                fork_keep_recent_tool_results: None,
+                pre_compact_sent: &pre_compact_sent,
+                snap: None,
+            },
+            &mut observer,
+            |request| async move {
+                let model = compaction_model.unwrap_or(request.model);
+                let messages = request.messages;
+                let previous_summary = request.previous_summary;
+                let (input_budget, response_budget) = crate::config::CompactionBudgetCap::apply(
+                    budget_cap,
+                    request.input_token_budget,
+                    request.response_token_budget,
+                );
+                if let Some((agent, history)) = cache_fork {
+                    match crate::startup::heap_future(|| {
+                        agent.compress_forked(
+                            history,
+                            messages.len(),
+                            instructions,
+                            input_budget,
+                            response_budget,
+                            retry_config,
+                            request_observer.clone(),
+                            compaction_timeout,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(output) => return Ok(output),
+                        Err(error) => tracing::warn!(
+                            "cache-reusing compaction failed, using the text summarizer: {error}"
+                        ),
+                    }
+                }
+                crate::startup::heap_future(|| {
+                    client.compress_messages_observed_with_timeout(
+                        &model,
+                        &messages,
+                        previous_summary.as_deref(),
                         instructions,
                         input_budget,
                         response_budget,
                         retry_config,
-                        request_observer.clone(),
+                        request_observer,
                         compaction_timeout,
                     )
-                    .await
-                {
-                    Ok(output) => return Ok(output),
-                    Err(error) => tracing::warn!(
-                        "cache-reusing compaction failed, using the text summarizer: {error}"
-                    ),
-                }
-            }
-            client
-                .compress_messages_observed_with_timeout(
-                    &model,
-                    &messages,
-                    previous_summary.as_deref(),
-                    instructions,
-                    input_budget,
-                    response_budget,
-                    retry_config,
-                    request_observer,
-                    compaction_timeout,
-                )
+                })
                 .await
-        },
-    );
+            },
+        )
+    });
     // The event loop is parked on this await, so show liveness here: elapsed
     // time and the summarizer request in flight, on each progress tick.
     let started_at = std::time::Instant::now();
@@ -971,7 +979,6 @@ async fn handle_compress_unfloored(
         COMPACTION_PROGRESS_INTERVAL,
     );
     let compacted = {
-        tokio::pin!(compaction);
         loop {
             tokio::select! {
                 biased;
@@ -996,6 +1003,7 @@ async fn handle_compress_unfloored(
             }
         }
     };
+    drop(compaction);
     drop(cancel);
     let (first_kept_index, tokens_before, usage) = match compacted {
         Ok(compacted) => compacted,
@@ -1022,12 +1030,15 @@ async fn handle_compress_unfloored(
 
     // A native thinking chain was built over the pre-compaction transcript:
     // restart it from the compacted one so the next prompt replays cleanly.
-    let native_notice = crate::ui::reconcile_native_chain(run, ui).await;
+    let native_notice =
+        crate::startup::heap_future(|| crate::ui::reconcile_native_chain(run, ui)).await;
 
+    let build_ctx = ui.agent_build_ctx();
     run.agent = Some(
-        ui.agent_build_ctx()
-            .rebuild_agent(&ui.session.model, reasoning_enabled)
-            .await,
+        crate::startup::heap_future(|| {
+            build_ctx.rebuild_agent(&ui.session.model, reasoning_enabled)
+        })
+        .await,
     );
 
     render_session(renderer, ui.session, ui.cli, ui.cfg, ui.context)?;

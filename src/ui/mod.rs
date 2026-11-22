@@ -2252,7 +2252,10 @@ pub(crate) async fn mid_turn_compact_and_respawn(
     ui: &mut UiContext<'_>,
     slash: &SlashState,
 ) -> anyhow::Result<()> {
-    compact_and_respawn(Some(pressure), interactions, renderer, run, ui, slash).await
+    crate::startup::heap_future(|| {
+        compact_and_respawn(Some(pressure), interactions, renderer, run, ui, slash)
+    })
+    .await
 }
 
 /// Reactive context relief (mini-agent-cj9oh): the provider rejected a request
@@ -2266,7 +2269,10 @@ pub(crate) async fn reactive_compact_and_respawn(
     ui: &mut UiContext<'_>,
     slash: &SlashState,
 ) -> anyhow::Result<()> {
-    compact_and_respawn(None, interactions, renderer, run, ui, slash).await
+    crate::startup::heap_future(|| {
+        compact_and_respawn(None, interactions, renderer, run, ui, slash)
+    })
+    .await
 }
 
 /// A model/admission failure is recoverable at the turn boundary. Keep it
@@ -2335,15 +2341,17 @@ async fn compact_and_respawn(
     // Measured provider pressure is authoritative even when the local
     // window-minus-reserve estimate is lower (mini-agent-p0h9g.3).
     let compactions_before = ui.session.compaction_count();
-    crate::ui::slash::handle_compress_with_force(
-        None,
-        true,
-        true,
-        run,
-        renderer,
-        ui,
-        slash.reasoning_enabled,
-    )
+    crate::startup::heap_future(|| {
+        crate::ui::slash::handle_compress_with_force(
+            None,
+            true,
+            true,
+            run,
+            renderer,
+            ui,
+            slash.reasoning_enabled,
+        )
+    })
     .await
     .map_err(|error| {
         if error.is::<std::io::Error>() {
@@ -2357,10 +2365,10 @@ async fn compact_and_respawn(
     run.mid_turn_compaction_disabled = ui.session.compaction_count() == compactions_before;
 
     // 4. Respawn on the compacted history with the continuation prompt.
-    ensure_agent(&mut run.agent, ui, slash.reasoning_enabled).await;
+    crate::startup::heap_future(|| ensure_agent(&mut run.agent, ui, slash.reasoning_enabled)).await;
     // Context relief may have rebuilt the agent; a self-paced `/cron` turn
     // keeps its `schedule_wakeup` across the respawn.
-    register_cron_wakeup(run).await?;
+    crate::startup::heap_future(|| register_cron_wakeup(run)).await?;
     run.request_tool_results_cleared = ui
         .session
         .tool_results_cleared_for_retention(ui.cfg.resolve_keep_recent_tool_results());
@@ -2380,23 +2388,25 @@ async fn compact_and_respawn(
     .await;
     #[cfg(feature = "agent-skills")]
     let agent = agent.with_instruction_turn(run.instruction_turn.clone());
-    let paused = agent
-        .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
-        .with_file_checkpoints(ui.session.file_checkpoints.recorder(
-            &ui.session.id,
-            ui.session.messages.len(),
-            ui.cli.no_session,
-        ))
-        .with_question_turn(run.question_turn.clone())
-        .with_budget_carry(std::sync::Arc::clone(&run.budget_carry))
-        .spawn_runner_paused(
-            MID_TURN_CONTINUE_PROMPT.to_string(),
-            history,
-            ui.cfg.retry.clone(),
-            #[cfg(feature = "hooks")]
-            None,
-        )
-        .await;
+    let paused = crate::startup::heap_future(|| {
+        agent
+            .with_spend_for_session(ui.session, ui.cfg, crate::spend::RequestKind::Turn)
+            .with_file_checkpoints(ui.session.file_checkpoints.recorder(
+                &ui.session.id,
+                ui.session.messages.len(),
+                ui.cli.no_session,
+            ))
+            .with_question_turn(run.question_turn.clone())
+            .with_budget_carry(std::sync::Arc::clone(&run.budget_carry))
+            .spawn_runner_paused(
+                MID_TURN_CONTINUE_PROMPT.to_string(),
+                history,
+                ui.cfg.retry.clone(),
+                #[cfg(feature = "hooks")]
+                None,
+            )
+    })
+    .await;
     #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
     let mut paused = paused;
     #[cfg(any(feature = "hooks", feature = "memory", feature = "subagents"))]
