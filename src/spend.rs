@@ -321,6 +321,14 @@ struct Row {
     usage_reported: bool,
     prices: PriceSnapshot,
     cost: Option<f64>,
+    /// The usage is this program's estimate for a stream that ended before
+    /// the provider reported it (mini-agent-4zov7), not a provider report.
+    #[serde(default, skip_serializing_if = "is_false")]
+    estimated: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 // Decode each version against its exact wire schema. Testing only the decoded
@@ -360,6 +368,8 @@ struct RowFields<P, U, const V: u8> {
     usage_reported: bool,
     prices: P,
     cost: Option<f64>,
+    #[serde(default)]
+    estimated: bool,
 }
 
 impl<P: Into<PriceSnapshot>, U: Into<UsageDelta>, const V: u8> From<RowFields<P, U, V>> for Row {
@@ -377,6 +387,7 @@ impl<P: Into<PriceSnapshot>, U: Into<UsageDelta>, const V: u8> From<RowFields<P,
             usage_reported: fields.usage_reported,
             prices: fields.prices.into(),
             cost: fields.cost,
+            estimated: fields.estimated,
         }
     }
 }
@@ -555,10 +566,20 @@ impl Receipt {
                 usage_reported,
                 prices,
                 cost,
+                estimated: false,
             }),
             charged: Arc::new(AtomicBool::new(false)),
             #[cfg(feature = "subagents")]
             observation: None,
+        }
+    }
+    /// Marks the receipt as this program's estimate (an interrupted stream).
+    pub(crate) fn into_estimate(self) -> Self {
+        let mut row = (*self.row).clone();
+        row.estimated = true;
+        Self {
+            row: Arc::new(row),
+            ..self
         }
     }
     #[cfg(feature = "subagents")]
@@ -583,6 +604,9 @@ struct State {
     token_cap_total: Option<u64>,
     observed_input_tokens: u64,
     observed_output_tokens: u64,
+    /// Part of the observed totals that are estimates (interrupted streams).
+    estimated_input_tokens: u64,
+    estimated_output_tokens: u64,
     historical_input_tokens: u64,
     historical_output_tokens: u64,
     legacy_estimate: f64,
@@ -973,6 +997,12 @@ impl Account {
         state.tracking_error |= prior.missing_usage || prior.unpriced_records > 0;
         Ok(())
     }
+    /// Input and output tokens of this run that are estimates for interrupted
+    /// streams; their cost is part of the recorded spend.
+    pub(crate) fn estimated_tokens(&self) -> (u64, u64) {
+        let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        (state.estimated_input_tokens, state.estimated_output_tokens)
+    }
     pub(crate) fn snapshot(&self) -> AccountSnapshot {
         let state = self.0.lock().unwrap_or_else(|error| error.into_inner());
         AccountSnapshot {
@@ -1109,6 +1139,12 @@ impl Account {
         state.observed_output_tokens = state
             .observed_output_tokens
             .saturating_add(usage.output_tokens);
+        if row.estimated {
+            state.estimated_input_tokens = state.estimated_input_tokens.saturating_add(input);
+            state.estimated_output_tokens = state
+                .estimated_output_tokens
+                .saturating_add(usage.output_tokens);
+        }
         if let Some(cost) = row.cost {
             let sum = state.observed_cost + cost;
             if sum.is_finite() {

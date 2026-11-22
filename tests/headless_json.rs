@@ -5871,7 +5871,9 @@ fn output_schema_passive_openrouter_privacy_is_retained_or_fails_before_auxiliar
 fn usd_budget_actual_provider_stops_effects_and_repair_but_keeps_valid_answer_and_usage() {
     for (outcome, cap, expected_calls, expected_success, effect, schema) in [
         ("budget_effect", "0", 0, false, false, false),
-        ("budget_effect", "0.0001", 1, false, false, false),
+        // mini-agent-qpci0: a cap below the prompt's own cost is refused
+        // before any request is sent.
+        ("budget_effect", "0.0001", 0, false, false, false),
         ("budget_schema", "0.0005", 2, false, true, true),
         ("budget_completed", "0.0001", 1, true, false, false),
     ] {
@@ -5886,6 +5888,11 @@ fn usd_budget_actual_provider_stops_effects_and_repair_but_keeps_valid_answer_an
             "write"
         });
         command.args(["-p", "answer", "--output", "json", "--max-budget-usd", cap]);
+        // The fixture's reported usage is far below its prompt's list price;
+        // only the refusal case keeps the pre-send check (mini-agent-qpci0).
+        if expected_calls > 0 {
+            command.env("MINI_AGENT_BUDGET_PREFLIGHT", "0");
+        }
         if schema {
             command.arg("--output-schema").arg(schema_file(&root));
         }

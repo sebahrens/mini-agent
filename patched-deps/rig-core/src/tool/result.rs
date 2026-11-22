@@ -489,6 +489,14 @@ impl ToolExecutionResult {
         self
     }
 
+    /// Puts `prefix` before the model output, keeping the outcome and
+    /// extensions. mini-agent uses it to tell the model that an approver
+    /// rewrote the call's arguments.
+    pub fn with_model_output_prefix(mut self, prefix: &str) -> Self {
+        self.model_output.insert_str(0, prefix);
+        self
+    }
+
     /// The text delivered to the model as the tool result. Present even for a
     /// failure, so the model gets useful feedback (a handled error message).
     pub fn model_output(&self) -> &str {

@@ -261,6 +261,23 @@ static RESPONSE_FLOW: std::sync::Mutex<ResponseFlow> = std::sync::Mutex::new(Res
     reasoning_ends_newline: true,
 });
 
+/// Anthropic-shaped usage the provider reported for the response whose records
+/// are being written (`--stream-json-schema claude` `message.usage`).
+static RESPONSE_USAGE: std::sync::Mutex<Option<serde_json::Value>> = std::sync::Mutex::new(None);
+
+fn response_usage() -> Option<serde_json::Value> {
+    RESPONSE_USAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+fn set_response_usage(value: Option<serde_json::Value>) {
+    *RESPONSE_USAGE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+}
+
 fn response_flow() -> std::sync::MutexGuard<'static, ResponseFlow> {
     RESPONSE_FLOW
         .lock()
@@ -276,6 +293,8 @@ fn begin_response_content() -> bool {
     }
     flow.seq += 1;
     flow.open = true;
+    drop(flow);
+    set_response_usage(None);
     true
 }
 
@@ -593,7 +612,7 @@ pub(crate) fn claude_stream_records(event: serde_json::Value) -> Vec<serde_json:
             "message":{
                 "id":current_message_id(), "type":"message", "role":"assistant",
                 "content":[block], "model":model, "stop_reason":stop_reason,
-                "stop_sequence":null,
+                "stop_sequence":null, "usage":response_usage(),
             },
             "parent_tool_use_id":null, "session_id":session_id,
             "uuid":uuid::Uuid::new_v4().to_string(),
@@ -1080,6 +1099,15 @@ impl HeadlessOutputPolicy {
         cumulative: Usage,
     ) -> anyhow::Result<()> {
         if self.format == cli::OutputFormat::StreamJson {
+            if delta.has_values() {
+                let reported: Usage = delta.into();
+                set_response_usage(Some(serde_json::json!({
+                    "input_tokens": reported.input_tokens,
+                    "output_tokens": reported.output_tokens,
+                    "cache_read_input_tokens": reported.cached_input_tokens,
+                    "cache_creation_input_tokens": reported.cache_creation_input_tokens,
+                })));
+            }
             flush_pending_assistant_text().await?;
         }
         end_api_span();
@@ -6126,6 +6154,26 @@ mod headless_output_policy_tests {
         };
         assert!(take_full_text_chunks(&mut short, 64).is_empty());
         assert_eq!(short.pending, "short");
+    }
+
+    /// mini-agent-s940q: a Claude-schema message carries the usage the provider
+    /// reported for its response.
+    #[test]
+    fn claude_assistant_message_carries_reported_usage() {
+        set_response_usage(Some(
+            serde_json::json!({"input_tokens": 7, "output_tokens": 3}),
+        ));
+        let records = claude_stream_records(
+            serde_json::json!({"type":"assistant_text","text":"hi","truncated":false}),
+        );
+        let usage = records
+            .iter()
+            .find(|row| row["type"] == "assistant")
+            .map(|row| row["message"]["usage"].clone())
+            .unwrap();
+        set_response_usage(None);
+        assert_eq!(usage["input_tokens"], 7);
+        assert_eq!(usage["output_tokens"], 3);
     }
 
     /// mini-agent-7b0m8: the piped-stdin notice fires only when data arrives.

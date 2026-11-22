@@ -116,6 +116,26 @@ tokio::task_local! {
     static CALL_ARGS: String;
 }
 
+/// Reports a driver mistake to the driver as an `input_error` record (no-op
+/// when the control channel is off).
+pub(crate) async fn report_input_error(message: &str) {
+    if let Some(state) = STATE.get() {
+        let _ = state
+            .output
+            .emit_event(serde_json::json!({"type":"input_error","message":message}))
+            .await;
+    }
+}
+
+/// The note put before a result whose call ran with arguments the approver
+/// changed, so the model knows they are not the ones it sent.
+pub(crate) fn rewritten_notice(effective: &str) -> String {
+    let (shown, _) = crate::print::bounded_progress(effective, 512);
+    format!(
+        "[the approver changed this call's arguments before it ran; effective arguments: {shown}]\n"
+    )
+}
+
 /// The error text that makes the call wrapper rerun with `args`.
 pub(crate) fn rewrite_error(args: &str) -> String {
     format!("{REWRITE_SENTINEL}{args}")

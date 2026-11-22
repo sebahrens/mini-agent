@@ -495,6 +495,10 @@ impl Run {
     pub(crate) fn observe(&self, usage: UsageDelta) {
         self.observe_receipt(&self.receipt(usage));
     }
+    /// Charges an interrupted stream's estimate, flagged as such in the ledger.
+    pub(crate) fn observe_estimate(&self, usage: UsageDelta) {
+        self.observe_receipt(&self.receipt(usage).into_estimate());
+    }
     fn receipt(&self, mut usage: UsageDelta) -> Receipt {
         if self.reasoning_exclusive {
             usage.output_tokens = usage.output_tokens.saturating_add(usage.reasoning_tokens);
@@ -666,6 +670,53 @@ impl Run {
         if let Some(usage) = remaining {
             self.observe(usage);
         }
+    }
+    /// Refuses a request whose input alone is certain to cost more than the
+    /// remaining USD budget (mini-agent-qpci0): the HTTP layer knows the body
+    /// before sending it, so a budget below the system prompt and tool list
+    /// is reported at once instead of after the first billed request. The
+    /// bound is deliberately low (one token per eight body bytes, at the
+    /// cheaper of the input and cache-read rates), so it never refuses a
+    /// request that could have fit. Returns true when refused.
+    pub(crate) fn refuse_unaffordable(&self, body_bytes: usize) -> bool {
+        let snapshot = self.account.snapshot();
+        let Some(cap) = snapshot.cap else {
+            return false;
+        };
+        // For providers billed far below their list price.
+        if std::env::var_os("MINI_AGENT_BUDGET_PREFLIGHT").is_some_and(|value| value == "0") {
+            return false;
+        }
+        let tokens = (body_bytes / 8) as u64;
+        let usage = UsageDelta {
+            input_tokens: tokens,
+            total_tokens: tokens,
+            ..Default::default()
+        };
+        let Some(mut floor) = self.prices.cost(usage) else {
+            return false;
+        };
+        if let (Some(input), Some(read)) = (self.prices.input, self.prices.cache_read)
+            && input > 0.0
+        {
+            floor *= (read / input).min(1.0);
+        }
+        let remaining = cap - snapshot.recorded_spend();
+        if floor <= remaining.max(0.0) {
+            return false;
+        }
+        self.refused
+            .store(true, std::sync::atomic::Ordering::Release);
+        let message = format!(
+            "budget ${cap:.4} cannot pay for one request: its prompt and tools alone cost at least ${floor:.4} (${:.4} left); raise --max-budget-usd",
+            remaining.max(0.0)
+        );
+        if crate::print::headless_surface() {
+            crate::print::headless_stderr(format_args!("{message}\n"));
+        } else {
+            tracing::warn!("{message}");
+        }
+        true
     }
     pub(crate) fn was_refused(&self) -> bool {
         self.refused.load(std::sync::atomic::Ordering::Acquire)
@@ -946,7 +997,7 @@ impl Drop for StreamGuard {
                         .load(std::sync::atomic::Ordering::Relaxed);
                     bound.output_tokens = bound.output_tokens.min(streamed_output_tokens(streamed));
                     bound.total_tokens = bound.input_tokens.saturating_add(bound.output_tokens);
-                    run.observe(bound)
+                    run.observe_estimate(bound)
                 }
                 None => run.account.tracking_failed(),
             }
@@ -1032,6 +1083,23 @@ mod first_item_tests {
     }
 
     #[tokio::test]
+    async fn a_request_that_cannot_fit_the_budget_is_refused_before_sending() {
+        let root = crate::tests::OwnedTestDirectory::new("unaffordable");
+        let account = Account::new("unaffordable", Some(0.5), 0.0).unwrap();
+        let run = Run::fixture(
+            account,
+            Arc::new(Ledger::new(root.path())),
+            "unaffordable",
+            PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false),
+        );
+        assert!(!run.refuse_unaffordable(1_000), "a small prompt fits");
+        assert!(!run.was_refused());
+        // 8 MB of body is at least 1M input tokens, $1 at $1 per million.
+        assert!(run.refuse_unaffordable(8_000_000));
+        assert!(run.was_refused());
+    }
+
+    #[tokio::test]
     async fn dropped_stream_with_an_estimate_settles_instead_of_latching() {
         let root = crate::tests::OwnedTestDirectory::new("first-item-estimate");
         let account = Account::new("estimate", Some(1.0), 0.0).unwrap();
@@ -1059,6 +1127,8 @@ mod first_item_tests {
             (snapshot.observed_cost - 0.002).abs() < 1e-9,
             "{snapshot:?}"
         );
+        // The charge is flagged: its tokens are reported as estimates.
+        assert_eq!(run.account.estimated_tokens(), (1_000, 500));
         run.flush().await;
         assert!(run.admit().is_ok(), "the session continues");
     }

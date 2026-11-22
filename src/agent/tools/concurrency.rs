@@ -502,7 +502,13 @@ impl ToolDyn for ConcurrencyBoundTool {
                         let original = &original;
                         async move {
                             self.prepare_effective(original, &args).await;
-                            self.inner.call_structured(args, extensions).await
+                            let rewritten = args != *original;
+                            let effective = rewritten.then(|| args.clone());
+                            let out = self.inner.call_structured(args, extensions).await;
+                            match effective {
+                                Some(effective) => rewritten_result(out, &effective).await,
+                                None => out,
+                            }
                         }
                     },
                 )
@@ -525,6 +531,27 @@ impl ToolDyn for ConcurrencyBoundTool {
         let future = crate::permission::ask::scope_tool_call(self.inner.name(), future);
         Box::pin(future)
     }
+}
+
+/// The result of a call that ran with arguments a stream-json driver edited:
+/// arguments the tool cannot parse are reported to the driver as an
+/// `input_error` and deny the call (it never ran), and a normal result is
+/// prefixed so the model learns its arguments were changed (mini-agent-6wtc2).
+async fn rewritten_result(out: ToolExecutionResult, effective: &str) -> ToolExecutionResult {
+    if out
+        .outcome()
+        .is_error_kind(rig::tool::ToolFailureKind::InvalidArgs)
+    {
+        let message = format!(
+            "updatedInput does not match the tool's arguments ({}); the call was not run",
+            out.model_output()
+        );
+        crate::headless_control::report_input_error(&message).await;
+        return ToolExecutionResult::denied(format!(
+            "Permission denied by the stream-json control channel: {message}"
+        ));
+    }
+    out.with_model_output_prefix(&crate::headless_control::rewritten_notice(effective))
 }
 
 pub(crate) fn bind(tools: Vec<Box<dyn ToolDyn>>) -> Vec<Box<dyn ToolDyn>> {
@@ -1776,5 +1803,33 @@ mod prompt_release_tests {
             result.model_output()
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), external);
+    }
+}
+
+#[cfg(test)]
+mod rewritten_result_tests {
+    use super::*;
+    use rig::tool::ToolFailure;
+
+    #[tokio::test]
+    async fn rewritten_calls_tell_the_model_and_invalid_arguments_deny() {
+        let ok = rewritten_result(
+            ToolExecutionResult::success("file contents"),
+            r#"{"path":"b.txt"}"#,
+        )
+        .await;
+        assert!(ok.model_output().starts_with("[the approver changed"));
+        assert!(ok.model_output().contains(r#"{"path":"b.txt"}"#));
+        assert!(ok.model_output().ends_with("file contents"));
+
+        let bad = rewritten_result(
+            ToolExecutionResult::failed(
+                "failed to parse tool arguments: unknown field cmd",
+                ToolFailure::invalid_args("unknown field cmd"),
+            ),
+            r#"{"cmd":"ls"}"#,
+        )
+        .await;
+        assert!(bad.model_output().contains("the call was not run"));
     }
 }

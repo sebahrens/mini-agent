@@ -892,7 +892,17 @@ impl HttpClientExt for ProviderHttpClient {
         if let Some(guard) = &budget_guard {
             guard.set_estimate(request_usage_bound(request.body()));
         }
+        let unaffordable = crate::spend::run::Run::current()
+            .is_some_and(|run| run.refuse_unaffordable(request.body().len()));
         async move {
+            if unaffordable {
+                if let Some(guard) = &budget_guard {
+                    guard.finished();
+                }
+                return Err(http_client::Error::Instance(
+                    std::io::Error::other("the USD budget cannot pay for this request").into(),
+                ));
+            }
             let response = match client.send_with_credentials(request).await {
                 Ok(response) => response,
                 Err(error) => {

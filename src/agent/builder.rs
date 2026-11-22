@@ -768,6 +768,7 @@ fn strip_markdown_section(text: &str, heading: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compose_registered_preamble(
     context: &ContextFiles,
     reasoning_enabled: bool,
