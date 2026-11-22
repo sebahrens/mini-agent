@@ -235,7 +235,7 @@ pub(crate) enum Rejection {
     ContainsCredentials,
     TooLarge,
     OverBudget,
-    ContainsLinks,
+    ContainsLinks(String),
     OverlapsExcludedRoot,
 }
 
@@ -246,20 +246,21 @@ fn credential_child_present(directory: &Path) -> bool {
 }
 
 /// What a bounded walk below a root found.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TreeScan {
     /// Entries seen (capped at `limit + 1`).
     pub(crate) entries: usize,
-    /// A symbolic link or junction exists below the root: an inheritable grant could follow it
-    /// out of the tree, so such a root is never proposed.
-    pub(crate) has_link: bool,
+    /// A directory symbolic link or junction (or one that cannot be resolved) exists below the
+    /// root: an inheritable grant could follow it out of the tree, so such a root is never
+    /// proposed. Links to files do not leave the tree and are allowed. Holds the entry's name.
+    pub(crate) link: Option<String>,
 }
 
 /// Walk `root` without following links, stopping at `limit + 1` entries.
 pub(crate) fn scan_tree(root: &Path, limit: usize) -> TreeScan {
     let mut scan = TreeScan {
         entries: 0,
-        has_link: false,
+        link: None,
     };
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -273,7 +274,10 @@ pub(crate) fn scan_tree(root: &Path, limit: usize) -> TreeScan {
             }
             match entry.file_type() {
                 Ok(kind) if kind.is_symlink() => {
-                    scan.has_link = true;
+                    if std::fs::metadata(entry.path()).is_ok_and(|target| !target.is_dir()) {
+                        continue;
+                    }
+                    scan.link = Some(entry.file_name().to_string_lossy().into_owned());
                     return scan;
                 }
                 Ok(kind) if kind.is_dir() => pending.push(entry.path()),
@@ -330,8 +334,8 @@ fn judge(
         return Err(Rejection::OverlapsExcludedRoot);
     }
     let scan = scan_tree(directory, entry_limit);
-    if scan.has_link {
-        return Err(Rejection::ContainsLinks);
+    if let Some(link) = scan.link {
+        return Err(Rejection::ContainsLinks(link));
     }
     if scan.entries > entry_limit {
         return Err(Rejection::TooLarge);
@@ -682,6 +686,18 @@ mod tests {
         let tools = fixture.tool("tools/py", "python");
         std::os::unix::fs::symlink(fixture.canonical(), tools.join("persist")).unwrap();
         assert!(roots(&fixture.environment(&[tools])).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_a_file_does_not_leave_the_tree_and_is_allowed() {
+        let fixture = Fixture::new();
+        let tools = fixture.tool("tools/py", "python");
+        std::os::unix::fs::symlink(tools.join("python"), tools.join("python3")).unwrap();
+        assert_eq!(
+            roots(&fixture.environment(std::slice::from_ref(&tools))),
+            vec![tools]
+        );
     }
 
     #[test]
