@@ -45,6 +45,42 @@ pub(crate) use pty_windows as pty;
 mod git_metadata;
 mod read_roots;
 pub(crate) use read_roots::default_sandbox_read_roots;
+
+/// Earlier sessions' Windows AppContainer grants this launcher could not withdraw (doctor).
+pub(crate) fn retained_stale_grants() -> usize {
+    #[cfg(windows)]
+    {
+        windows::retained_stale_journals()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+/// PATH commands whose directory was not granted, with the reason (doctor).
+pub(crate) fn skipped_toolchain_report() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        windows::skipped_toolchain_report()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// PATH toolchain roots resolved for the Windows AppContainer shell (doctor).
+pub(crate) fn discovered_toolchain_root_count() -> usize {
+    #[cfg(windows)]
+    {
+        windows::discovered_toolchain_root_count()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod linux_workspace_tests;
 #[cfg(any(windows, test))]
@@ -54,6 +90,8 @@ mod profile_journal;
 /// currently needs it, so it is gated the same way.
 #[cfg(all(feature = "js", target_os = "linux"))]
 pub(crate) mod spawner;
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod windows_toolchains;
 #[cfg(feature = "js")]
 pub(crate) mod worker;
 mod workspace_layout;
@@ -537,6 +575,13 @@ pub struct SandboxConfig {
     disabled_reason: DisabledSandboxReason,
     working_dir: Option<PathBuf>,
     windows_appcontainer_read_roots: Vec<PathBuf>,
+    /// Propose read/execute roots for the toolchains the host `PATH` resolves
+    /// (`windows-appcontainer-toolchain-discovery`).
+    windows_toolchain_discovery: bool,
+    /// `windows-appcontainer-ancestor-listing`: grant name listing on the workspace's ancestors.
+    windows_ancestor_listing: bool,
+    /// `windows-appcontainer-null-device`: add the container to the NUL device DACL (elevated only).
+    windows_null_device: bool,
     windows_appcontainer_write_roots: Vec<PathBuf>,
     /// Configured `sandbox-read-roots` for the Linux `bwrap` profiles.
     bwrap_read_roots: Vec<PathBuf>,
@@ -699,7 +744,7 @@ pub(crate) fn windows_utf8_output_prelude(dialect: ShellDialect, command: &str) 
     match dialect {
         ShellDialect::Cmd => format!("chcp 65001>nul 2>&1 & {command}"),
         ShellDialect::PowerShell => format!(
-            "try {{ [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Text.UTF8Encoding]::new($false) }} catch {{}}; {command}"
+            "try {{ [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false); $OutputEncoding = [Text.UTF8Encoding]::new($false) }} catch {{}}; try {{ $PSStyle.OutputRendering = 'PlainText' }} catch {{}}; {command}"
         ),
         ShellDialect::Posix => command.to_owned(),
     }
@@ -3684,6 +3729,9 @@ impl Sandbox {
                 disabled_reason: DisabledSandboxReason::UserTrustedBypass,
                 working_dir: None,
                 windows_appcontainer_read_roots: Vec::new(),
+                windows_toolchain_discovery: false,
+                windows_ancestor_listing: false,
+                windows_null_device: false,
                 windows_appcontainer_write_roots: Vec::new(),
                 bwrap_read_roots: read_roots::default_sandbox_read_roots(),
             }),
@@ -3731,6 +3779,43 @@ impl Sandbox {
         self.windows_appcontainer_read_roots = read_roots;
         self.windows_appcontainer_write_roots = write_roots;
         self
+    }
+
+    /// Enable or disable the `PATH`-derived read/execute toolchain roots of
+    /// the Windows AppContainer shell (`windows-appcontainer-toolchain-discovery`).
+    pub fn with_windows_toolchain_discovery(mut self, enabled: bool) -> Self {
+        self.windows_toolchain_discovery = enabled;
+        #[cfg(windows)]
+        if enabled {
+            windows::start_toolchain_discovery();
+        }
+        self
+    }
+
+    /// Enable or disable the workspace-ancestor listing grants of the Windows AppContainer shell
+    /// (`windows-appcontainer-ancestor-listing`).
+    pub fn with_windows_ancestor_listing(mut self, enabled: bool) -> Self {
+        self.windows_ancestor_listing = enabled;
+        self
+    }
+
+    /// Enable or disable the elevated-only NUL device ACE of the Windows AppContainer shell
+    /// (`windows-appcontainer-null-device`).
+    pub fn with_windows_null_device(mut self, enabled: bool) -> Self {
+        self.windows_null_device = enabled;
+        self
+    }
+
+    pub(crate) fn windows_toolchain_discovery(&self) -> bool {
+        self.windows_toolchain_discovery
+    }
+
+    pub(crate) fn windows_ancestor_listing(&self) -> bool {
+        self.windows_ancestor_listing
+    }
+
+    pub(crate) fn windows_null_device(&self) -> bool {
+        self.windows_null_device
     }
 
     /// Replace the extra read-only roots mounted by the Linux `bwrap`
@@ -4093,7 +4178,7 @@ impl Sandbox {
         matrix
     }
 
-    fn unavailable_reason(&self) -> Option<String> {
+    pub(crate) fn unavailable_reason(&self) -> Option<String> {
         #[cfg(target_os = "windows")]
         if self.backend == "appcontainer" {
             return windows::unavailable_reason();
@@ -4125,6 +4210,11 @@ impl Sandbox {
     /// not run the backend and mask checks `policy` performs.
     pub(crate) fn containment_requested(&self) -> bool {
         self.enabled
+    }
+
+    /// The configured backend name (`bwrap`, `seatbelt`, `appcontainer`, ...).
+    pub(crate) fn backend_name(&self) -> &str {
+        &self.backend
     }
 
     /// `off`, or `<backend>/<profile>`, for comparing environments across runs.
@@ -4787,6 +4877,13 @@ impl Sandbox {
         let utf8_command;
         #[cfg(windows)]
         let command = match self.shell_capability().map(ShellCapability::dialect) {
+            // The cmd.exe prelude redirects `chcp` to `nul`, which an AppContainer cannot open: it
+            // would print "Access is denied." before every command and never switch the code page.
+            Some(ShellDialect::Cmd)
+                if self.containment_requested() && self.backend == "appcontainer" =>
+            {
+                command
+            }
             Some(dialect @ (ShellDialect::Cmd | ShellDialect::PowerShell)) => {
                 utf8_command = windows_utf8_output_prelude(dialect, command);
                 utf8_command.as_str()
@@ -4876,6 +4973,12 @@ impl Sandbox {
                 &self.windows_appcontainer_write_roots,
                 self.pty_launch.as_ref(),
                 &self.shell_env_extra(),
+                Some(windows::ShellLaunchOptions {
+                    toolchain_discovery: self.windows_toolchain_discovery,
+                    ancestor_listing: self.windows_ancestor_listing,
+                    null_device: self.windows_null_device,
+                    command,
+                }),
             )
             .map(ExecutionCommand::appcontainer_helper);
         }
@@ -10288,7 +10391,13 @@ mod sandbox_tests {
             "FILE_GENERIC_READ | FILE_GENERIC_EXECUTE | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD,\n        true,\n        true,"
         ));
         assert!(source.contains(
+            "grant_access_root(\n                    &root,\n                    &mut grants,\n                    &parent,\n                    ANCESTOR_NAME_ACCESS,\n                    false,\n                    false,\n                )"
+        ));
+        assert!(source.contains(
             "grant_access_root(&root, &mut grants, &parent, FILE_TRAVERSE, false, false)?"
+        ));
+        assert!(source.contains(
+            "const ANCESTOR_NAME_ACCESS: u32 =\n    FILE_TRAVERSE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE;"
         ));
         assert!(source.contains("let traverse_roots = workspace\n        .ancestors()"));
         let root_grant = source
@@ -10296,7 +10405,8 @@ mod sandbox_tests {
             .nth(1)
             .and_then(|source| source.split("fn validate_write_root_tree(").next())
             .expect("root-scoped ACL grant missing");
-        assert_eq!(root_grant.matches("update_access_ace(").count(), 1);
+        assert_eq!(root_grant.matches("update_access_ace_with(").count(), 1);
+        assert!(root_grant.contains("local_only"));
         assert!(root_grant.contains("directory && inherit_to_children"));
         assert!(!root_grant.contains("read_dir("));
         assert!(root_grant.contains("FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE"));
@@ -10428,9 +10538,8 @@ mod sandbox_tests {
             .and_then(|source| source.split("fn sweep_stale_profile_intent(").next())
             .expect("stale profile journal sweep missing");
         assert!(stale_journal.contains("if trusted_machine_read_file(&root)?"));
-        assert!(
-            stale_journal.contains("let stale_effective = effective_path_rights(&root, sid.0)?")
-        );
+        assert!(stale_journal.contains("effective_path_rights(&root, sid.0)"));
+        assert!(stale_journal.contains("RootKind::Ancestor"));
         assert!(stale_journal.contains("if stale_effective == 0"));
         assert!(stale_journal.contains("revoke_tree_until(&root, sid.0, deadline)"));
         assert!(profile_creation.contains("if !trusted_machine_read_file(root)?"));
@@ -11621,7 +11730,7 @@ mod sandbox_tests {
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn canonical_scratch() -> (TempDir, PathBuf) {
         let scratch = TempDir::new("sandbox");
         let root = std::fs::canonicalize(scratch.path()).unwrap();
@@ -12421,6 +12530,10 @@ echo COMMITTED"#;
         );
         let ps = windows_utf8_output_prelude(ShellDialect::PowerShell, "Get-ChildItem -Name");
         assert!(ps.contains("OutputEncoding") && ps.ends_with("; Get-ChildItem -Name"));
+        assert!(
+            ps.contains("$PSStyle.OutputRendering = 'PlainText'"),
+            "PowerShell errors must not carry ANSI colour sequences into tool output"
+        );
         assert_eq!(windows_utf8_output_prelude(ShellDialect::Posix, "ls"), "ls");
     }
 

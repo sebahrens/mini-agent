@@ -130,6 +130,14 @@ pub(crate) fn sandbox_status(status: &str, reason: Option<&str>, enabled: bool) 
     }
 }
 
+fn first_output_line(bytes: &[u8]) -> Option<String> {
+    let text = crate::ui::events::sanitize_output(&String::from_utf8_lossy(bytes)).to_string();
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// Run `<program> --version` through the sandbox; failure is a warning because
 /// the tool may simply be absent.
 pub(crate) async fn tool_in_sandbox(sandbox: &crate::sandbox::Sandbox, program: &str) -> Outcome {
@@ -166,11 +174,73 @@ pub(crate) async fn tool_in_sandbox(sandbox: &crate::sandbox::Sandbox, program: 
         Ok(output) => Outcome::Warn(bounded(format!(
             "{program} failed inside the sandbox ({:?}): {}",
             output.status,
-            String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .next()
-                .unwrap_or("no output")
+            first_output_line(&output.stderr)
+                .or_else(|| first_output_line(&output.stdout))
+                .unwrap_or_else(|| "no output".to_string())
         ))),
+    }
+}
+
+/// The effective state of the three opt-in AppContainer shell extras.
+pub(crate) fn appcontainer_extras_line(sandbox: &crate::sandbox::Sandbox) -> String {
+    let state = |on: bool| if on { "on" } else { "off" };
+    let mut line = format!(
+        "ancestor-listing={}, null-device={}, toolchain-discovery={}",
+        state(sandbox.windows_ancestor_listing()),
+        state(sandbox.windows_null_device()),
+        state(sandbox.windows_toolchain_discovery()),
+    );
+    if sandbox.windows_toolchain_discovery() {
+        let roots = crate::sandbox::discovered_toolchain_root_count();
+        line.push_str(&format!(" ({roots} toolchain root(s) resolved)"));
+        let skipped = crate::sandbox::skipped_toolchain_report();
+        if !skipped.is_empty() {
+            line.push_str(&format!("; not granted: {}", skipped.join(", ")));
+        }
+    }
+    line
+}
+
+/// Command names the sandboxed Python probe tries, in order. Windows has no
+/// `python3`: the interpreter is `python`, or the `py` launcher.
+pub(crate) fn python_probe_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["python", "py"]
+    } else {
+        &["python3"]
+    }
+}
+
+fn python_check_name() -> &'static str {
+    if cfg!(windows) {
+        "sandboxed python"
+    } else {
+        "sandboxed python3"
+    }
+}
+
+/// Probe each name in turn; the first that runs wins, otherwise the first
+/// failure is reported (with the remaining names noted).
+pub(crate) async fn first_tool_in_sandbox(
+    sandbox: &crate::sandbox::Sandbox,
+    names: &[&str],
+) -> Outcome {
+    let mut first_failure = None;
+    for name in names {
+        match tool_in_sandbox(sandbox, name).await {
+            Outcome::Pass(text) => return Outcome::Pass(text),
+            other => {
+                first_failure.get_or_insert(other);
+            }
+        }
+    }
+    match first_failure {
+        Some(Outcome::Warn(text)) if names.len() > 1 => Outcome::Warn(bounded(format!(
+            "{text} (also tried: {})",
+            names[1..].join(", ")
+        ))),
+        Some(outcome) => outcome,
+        None => Outcome::Warn("no command names to probe".into()),
     }
 }
 
@@ -234,6 +304,13 @@ pub(crate) async fn run_all(
             cli.resolve_windows_appcontainer_read_roots(cfg),
             cli.resolve_windows_appcontainer_write_roots(cfg),
         )
+        .with_shell(&cli.resolve_shell(cfg))
+        .with_windows_toolchain_discovery(
+            cfg.windows_appcontainer_toolchain_discovery
+                .unwrap_or(false),
+        )
+        .with_windows_ancestor_listing(cfg.windows_appcontainer_ancestor_listing.unwrap_or(false))
+        .with_windows_null_device(cfg.windows_appcontainer_null_device.unwrap_or(false))
         .with_bwrap_read_roots(cli.resolve_sandbox_toolchain_roots(cfg))
         .with_workspace_binding(workspace);
     // Doctor is read-only: run the sandboxed probes against a throwaway cache
@@ -270,15 +347,31 @@ pub(crate) async fn run_all(
             false
         }
     };
-    if enabled && sandbox_ok {
-        for program in ["git", "python3"] {
-            let name = if program == "git" {
-                "sandboxed git"
-            } else {
-                "sandboxed python3"
-            };
-            checks.push(Check::of(name, tool_in_sandbox(&sandbox, program).await));
+    if enabled && backend == "appcontainer" {
+        let for_line = sandbox.clone();
+        let line = tokio::task::spawn_blocking(move || appcontainer_extras_line(&for_line))
+            .await
+            .unwrap_or_else(|_| "unavailable".to_string());
+        checks.push(Check::of("appcontainer extras", Outcome::Pass(line)));
+        let retained = crate::sandbox::retained_stale_grants();
+        if retained > 0 {
+            checks.push(Check::of(
+                "stale grants",
+                Outcome::Warn(format!(
+                    "{retained} earlier session(s) left access grants an unelevated launcher could not remove; start mini-agent elevated once to clear them"
+                )),
+            ));
         }
+    }
+    if enabled && sandbox_ok {
+        checks.push(Check::of(
+            "sandboxed git",
+            tool_in_sandbox(&sandbox, "git").await,
+        ));
+        checks.push(Check::of(
+            python_check_name(),
+            first_tool_in_sandbox(&sandbox, python_probe_names()).await,
+        ));
     }
     #[cfg(feature = "js")]
     if cli.tool_is_eligible(cfg, "js") {
@@ -333,6 +426,26 @@ impl Check {
 mod tests {
     use super::*;
     use crate::auth::LoginRecordState as S;
+
+    #[test]
+    fn the_sandboxed_python_probe_uses_the_names_of_the_host_platform() {
+        if cfg!(windows) {
+            assert_eq!(python_probe_names(), ["python", "py"]);
+            assert_eq!(python_check_name(), "sandboxed python");
+        } else {
+            assert_eq!(python_probe_names(), ["python3"]);
+            assert_eq!(python_check_name(), "sandboxed python3");
+        }
+    }
+
+    #[test]
+    fn a_failed_probe_reports_the_first_non_empty_line_of_stderr_or_stdout() {
+        assert_eq!(
+            first_output_line(b"\r\n  \nfatal: nope\nmore"),
+            Some("fatal: nope".to_string())
+        );
+        assert_eq!(first_output_line(b"  \n"), None);
+    }
 
     #[test]
     fn symlinked_launch_is_reported_with_the_real_path() {

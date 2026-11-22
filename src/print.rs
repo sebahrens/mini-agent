@@ -3471,6 +3471,15 @@ fn sandbox_profile_entry(cli: &cli::Cli, cfg: &config::Config) -> (&'static str,
 
 /// `--print-config` entry for `sandbox-toolchain-roots`: the configured list
 /// and the effective binds after validation against the current workspace.
+/// The effective state of an opt-in AppContainer extra (default off), as `--print-config` shows it.
+fn opt_in_state(value: Option<bool>) -> String {
+    if value.unwrap_or(false) {
+        "on (global config)".to_string()
+    } else {
+        "off (default; windows-appcontainer-* keys, Windows only)".to_string()
+    }
+}
+
 fn sandbox_toolchain_roots_entry(
     cli: &cli::Cli,
     cfg: &config::Config,
@@ -3765,6 +3774,18 @@ pub(crate) fn print_config(cli: &cli::Cli, cfg: &config::Config) -> io::Result<(
                 sandbox_capabilities.filesystem_reads.to_string(),
             ),
             ("read-only toolchain roots", sandbox_toolchain_roots),
+            (
+                "windows ancestor listing",
+                opt_in_state(cfg.windows_appcontainer_ancestor_listing),
+            ),
+            (
+                "windows NUL device",
+                opt_in_state(cfg.windows_appcontainer_null_device),
+            ),
+            (
+                "windows toolchain discovery",
+                opt_in_state(cfg.windows_appcontainer_toolchain_discovery),
+            ),
             (
                 "filesystem writes",
                 sandbox_capabilities.filesystem_writes.to_string(),

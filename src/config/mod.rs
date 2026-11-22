@@ -682,6 +682,36 @@ pub struct Config {
         alias = "windows_appcontainer_read_roots"
     )]
     pub windows_appcontainer_read_roots: Vec<std::path::PathBuf>,
+    /// `windows-appcontainer-toolchain-discovery`: let the AppContainer shell
+    /// read and execute the install directories of the toolchains the host
+    /// `PATH` resolves (python, node, ...). Default true; global-only.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "windows-appcontainer-toolchain-discovery",
+        alias = "windows_appcontainer_toolchain_discovery"
+    )]
+    pub windows_appcontainer_toolchain_discovery: Option<bool>,
+    /// `windows-appcontainer-ancestor-listing`: let the AppContainer shell list the names, sizes
+    /// and timestamps in each parent directory of the workspace (needed by PowerShell
+    /// `Set-Location`, cmd `dir` and Git to resolve the working directory). Default false;
+    /// global-only; system-owned parents need an elevated launcher.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "windows-appcontainer-ancestor-listing",
+        alias = "windows_appcontainer_ancestor_listing"
+    )]
+    pub windows_appcontainer_ancestor_listing: Option<bool>,
+    /// `windows-appcontainer-null-device`: let an elevated launcher add the container to the NUL
+    /// device DACL for the life of the command. Default false; global-only.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "windows-appcontainer-null-device",
+        alias = "windows_appcontainer_null_device"
+    )]
+    pub windows_appcontainer_null_device: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

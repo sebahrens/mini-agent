@@ -521,6 +521,8 @@ fn configured_sandbox_validation_probe<'a>(
         {
             let reason = sandbox
                 .unavailable_diagnostic()
+                .map(str::to_string)
+                .or_else(|| sandbox.unavailable_reason())
                 .map(|diagnostic| format!("\n{diagnostic}"))
                 .unwrap_or_default();
             anyhow::bail!(

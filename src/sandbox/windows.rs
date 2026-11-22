@@ -11,6 +11,7 @@
 use super::profile_journal::{
     MAX_CONTROL_RECORD_BYTES, RecordKind, is_staging_leaf, validate_payload,
 };
+use super::windows_toolchains;
 
 pub(super) mod general_owner;
 #[cfg(test)]
@@ -59,13 +60,14 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Security::{
     AccessCheck, CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, DuplicateToken,
-    DuplicateTokenEx, EqualSid, FreeSid, GENERIC_MAPPING, GetTokenInformation,
+    DuplicateTokenEx, EqualSid, FreeSid, GENERIC_MAPPING, GetLengthSid, GetTokenInformation,
     ImpersonateLoggedOnUser, InitializeSecurityDescriptor, OBJECT_INHERIT_ACE,
     OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION, PSID,
     RevertToSelf, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SECURITY_DESCRIPTOR,
     SID_AND_ATTRIBUTES, SecurityImpersonation, SetSecurityDescriptorDacl,
-    SetSecurityDescriptorOwner, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_IMPERSONATE,
-    TOKEN_QUERY, TOKEN_USER, TokenCapabilities, TokenImpersonation, TokenIsAppContainer, TokenUser,
+    SetSecurityDescriptorOwner, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_ELEVATION,
+    TOKEN_IMPERSONATE, TOKEN_QUERY, TOKEN_USER, TokenCapabilities, TokenElevation,
+    TokenImpersonation, TokenIsAppContainer, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CREATE_NEW, CreateFileW, DELETE, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
@@ -190,6 +192,15 @@ const STALE_JOB_CLEANUP_EXIT_CODE: u32 = 126;
 /// ties back to the sandbox in its failure note.
 const MAX_JOB_PROCESSES: u32 = 1024;
 const ACL_MUTEX_WAIT_MS: u32 = 5_000;
+/// Access the container receives, on the directory itself and without inheritance, on every
+/// named ancestor of the workspace that does not already admit application packages. Windows
+/// resolves the working directory by name: PowerShell, cmd.exe built-ins such as `dir` and
+/// `del`, and `GetLongPathName` enumerate each ancestor to find the correctly cased child, so a
+/// traverse-only grant leaves the shell in `C:\` or refusing `dir`. The grant lets the container
+/// list the *names* inside each ancestor (not read any file or subdirectory content: nothing is
+/// inherited, so children keep their own ACLs) and never write.
+const ANCESTOR_NAME_ACCESS: u32 =
+    FILE_TRAVERSE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const GENERAL_PREFLIGHT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -296,6 +307,18 @@ struct LaunchRequest {
     write_roots: Vec<PathBuf>,
     configured_read_roots: Vec<PathBuf>,
     configured_write_roots: Vec<PathBuf>,
+    /// Read/execute roots proposed from the host `PATH` (see `windows_toolchains`). They are
+    /// part of `read_roots` but granted best effort: a root whose DACL this user cannot change is
+    /// skipped instead of failing the launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    optional_read_roots: Vec<PathBuf>,
+    /// Best-effort read/write on the NUL device for this container (`grant_null_device`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    null_device: bool,
+    /// Grant name listing (not only traverse) on the workspace ancestors and the drive root,
+    /// best effort (`windows-appcontainer-ancestor-listing`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    ancestor_listing: bool,
     parent_pid: u32,
     parent_created: u64,
     ready_path: Option<PathBuf>,
@@ -546,6 +569,53 @@ impl Drop for AclMutationGuard {
     }
 }
 
+/// How long a session waits for other sessions' production preflights to finish: a full
+/// preflight is bounded by about 50 s, so this admits several queued sessions while still
+/// failing closed on a wedged holder.
+const PREFLIGHT_SERIAL_WAIT: Duration = Duration::from_secs(300);
+const PREFLIGHT_SERIAL_MUTEX_NAME: &str = "Global\\mini-agent-general-sandbox-preflight-v1";
+
+/// Cross-process owner-only mutex serialising the production preflight. It is always taken
+/// before the ACL-mutation and profile-control mutexes (never while holding either), so it
+/// cannot deadlock with them; an abandoned holder (a killed session) releases it.
+struct PreflightSerialGuard(Handle);
+
+impl PreflightSerialGuard {
+    fn acquire(deadline: Instant) -> Result<Self, String> {
+        let name = wide_string(PREFLIGHT_SERIAL_MUTEX_NAME);
+        let mut security =
+            OwnerOnlyKernelSecurity::new(MUTEX_ALL_ACCESS, "production-preflight mutex")?;
+        let attributes = security.attributes();
+        let mutex = Handle::created(
+            unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) },
+            "open cross-process production-preflight mutex",
+        )?;
+        attest_owner_only_kernel_object(
+            mutex.raw(),
+            security.user_sid(),
+            MUTEX_ALL_ACCESS,
+            "production-preflight mutex",
+        )?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait_ms = remaining.as_millis().clamp(1, u32::MAX as u128) as u32;
+        match unsafe { WaitForSingleObject(mutex.raw(), wait_ms) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED_0 => Ok(Self(mutex)),
+            WAIT_TIMEOUT => {
+                Err("sandbox: timed out waiting for another session's production preflight".into())
+            }
+            _ => Err(last_error(
+                "wait for cross-process production-preflight mutex",
+            )),
+        }
+    }
+}
+
+impl Drop for PreflightSerialGuard {
+    fn drop(&mut self) {
+        unsafe { ReleaseMutex(self.0.raw()) };
+    }
+}
+
 struct ProfileControlGuard(Handle);
 
 impl ProfileControlGuard {
@@ -788,6 +858,25 @@ struct ProfileJournal {
     sid: String,
     job_name: String,
     roots: Vec<PathBuf>,
+    /// Journaled roots that carry a non-inheriting name-listing/traverse ACE (workspace
+    /// ancestors, drive root). They are revoked locally and never block a later launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ancestor_roots: Vec<PathBuf>,
+    /// Journaled roots granted best effort (PATH toolchains); a revoke failure never blocks a
+    /// later launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    optional_roots: Vec<PathBuf>,
+    /// An ACE for this profile SID was requested on the machine-global NUL device.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    null_device: bool,
+}
+
+/// Root kinds and extra grants recorded in the cleanup journal.
+#[derive(Default)]
+struct JournalExtras {
+    ancestor_roots: Vec<PathBuf>,
+    optional_roots: Vec<PathBuf>,
+    null_device: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -855,7 +944,13 @@ fn general_sandbox_preflight_observed(
 ) -> &'static Result<(), String> {
     cached_general_sandbox_availability(&GENERAL_SANDBOX_AVAILABLE, || {
         let started = Instant::now();
-        let result = run_production_preflight(diagnostics);
+        // Concurrent sessions run one production preflight at a time: each one grants and revokes
+        // ACEs on the shared executable and attests that none survived, and overlapping runs
+        // raced that attestation (an ACE appeared to survive a clean exit).
+        let result = match PreflightSerialGuard::acquire(Instant::now() + PREFLIGHT_SERIAL_WAIT) {
+            Ok(_serial) => run_production_preflight(diagnostics),
+            Err(error) => Err(error),
+        };
         let reason = result
             .as_ref()
             .err()
@@ -1443,9 +1538,41 @@ fn recover_preserved_preflight_roots(temp_root: &Path, deadline: Instant) -> Res
     candidates.sort();
     for candidate in candidates {
         ensure_preflight_cleanup_deadline(deadline)?;
-        recover_preserved_preflight_root(&canonical_temp, &candidate, deadline)?;
+        if let Err(error) = recover_preserved_preflight_root(&canonical_temp, &candidate, deadline)
+        {
+            // Every process owns a private preflight root in the shared temporary directory, so
+            // a concurrently starting session's live root is enumerated here too. It is not
+            // preserved recovery state: skip it instead of failing this process closed.
+            if preflight_root_is_possibly_live(&candidate) {
+                tracing::debug!(
+                    phase = "windows_general_appcontainer_preflight",
+                    "skipped a production-preflight root owned by a concurrent session"
+                );
+                continue;
+            }
+            return Err(error);
+        }
     }
     Ok(())
+}
+
+/// Whether a root that failed recovery belongs to a session that is still running its preflight:
+/// its owner lease is currently held (sharing violation), or it vanished while being inspected
+/// because its owner finished. Preflights are serialised across processes, so nothing else is
+/// skipped: an unverifiable root of a crashed session still fails closed.
+fn preflight_root_is_possibly_live(candidate: &Path) -> bool {
+    use std::os::windows::fs::OpenOptionsExt;
+    match std::fs::symlink_metadata(candidate) {
+        Ok(_) => {}
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
+    }
+    let owner = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(candidate.join(PREFLIGHT_OWNER_FILE));
+    // ERROR_SHARING_VIOLATION: a live session holds its exclusive lease.
+    matches!(&owner, Err(error) if error.raw_os_error() == Some(32))
 }
 
 fn recover_preserved_preflight_root(
@@ -1927,6 +2054,21 @@ fn recover_verified_preflight_profiles(cache: &Path, deadline: Instant) -> Resul
     Ok(())
 }
 
+/// What a model-shell launch adds to the container beyond the explicit roots.
+#[derive(Clone, Copy)]
+pub(crate) struct ShellLaunchOptions<'a> {
+    /// Grant read/execute on the host `PATH` toolchains (`windows_toolchains`) that
+    /// [`Self::command`] names.
+    pub(crate) toolchain_discovery: bool,
+    /// List the names in each parent of the workspace (`windows-appcontainer-ancestor-listing`).
+    pub(crate) ancestor_listing: bool,
+    /// Add the container to the NUL device DACL when elevated (`windows-appcontainer-null-device`).
+    pub(crate) null_device: bool,
+    /// The shell script being launched; only the toolchains it names are granted, because each
+    /// grant costs one ACE write and one revoke per object below the root on every launch.
+    pub(crate) command: &'a str,
+}
+
 pub(crate) fn build_shell_helper(
     shell: &str,
     prefix_args: &[String],
@@ -1938,6 +2080,7 @@ pub(crate) fn build_shell_helper(
     configured_write_roots: &[PathBuf],
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
     extra_env: &[(String, String)],
+    shell_options: Option<ShellLaunchOptions<'_>>,
 ) -> Result<tokio::process::Command, String> {
     let program = resolve_program(shell, cwd)?;
     let arguments = prefix_args
@@ -1954,6 +2097,7 @@ pub(crate) fn build_shell_helper(
         configured_write_roots,
         pty,
         extra_env,
+        shell_options,
     )
 }
 
@@ -1975,6 +2119,7 @@ pub(crate) fn build_direct_helper(
         configured_write_roots,
         None,
         &[],
+        None,
     )
 }
 
@@ -2039,6 +2184,7 @@ pub(crate) fn build_git_direct_helper(
         Some(workspace),
         None,
         extra_env,
+        None,
     )
 }
 
@@ -2097,7 +2243,7 @@ fn build_helper(
     cwd: &Path,
     cache: &Path,
 ) -> Result<tokio::process::Command, String> {
-    build_helper_configured(program, arguments, cwd, cache, &[], &[], None, &[])
+    build_helper_configured(program, arguments, cwd, cache, &[], &[], None, &[], None)
 }
 
 fn build_helper_configured(
@@ -2109,6 +2255,7 @@ fn build_helper_configured(
     configured_write_roots: &[PathBuf],
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
     extra_env: &[(String, String)],
+    shell_options: Option<ShellLaunchOptions<'_>>,
 ) -> Result<tokio::process::Command, String> {
     build_helper_with_ready_roots_and_env(
         program,
@@ -2121,6 +2268,7 @@ fn build_helper_configured(
         None,
         pty,
         extra_env,
+        shell_options,
     )
 }
 
@@ -2173,8 +2321,10 @@ fn prepare_launch_request(
     let write_roots = collect_write_roots(&workspace, &configured_write_roots)?;
     let read_roots = collect_read_roots(&program, &workspace, &cache, &configured_read_roots)?;
     // Windows revalidates every named ancestor when the AppContainer resolves its current
-    // directory, even when CreateProcess received that same directory as `cwd`. Grant only
-    // FILE_TRAVERSE on ancestors that do not already admit application packages.
+    // directory, even when CreateProcess received that same directory as `cwd`, and the shells
+    // enumerate every ancestor to case-correct it. Grant only traverse and name listing
+    // (`ANCESTOR_NAME_ACCESS`, non-inheriting) on ancestors that do not already admit
+    // application packages.
     let traverse_roots = workspace
         .ancestors()
         .skip(1)
@@ -2203,6 +2353,9 @@ fn prepare_launch_request(
         write_roots,
         configured_read_roots,
         configured_write_roots,
+        optional_read_roots: Vec::new(),
+        null_device: false,
+        ancestor_listing: false,
         parent_pid: unsafe { GetCurrentProcessId() },
         parent_created: process_creation_time(unsafe { GetCurrentProcess() })?,
         ready_path,
@@ -2210,6 +2363,142 @@ fn prepare_launch_request(
         pty: None,
         extra_env: Vec::new(),
     })
+}
+
+impl LaunchRequest {
+    /// Also list the drive root and request name listing (not just traverse) on every ancestor.
+    fn enable_ancestor_listing(&mut self) {
+        self.ancestor_listing = true;
+        if let Some(root) = self
+            .workspace
+            .ancestors()
+            .find(|ancestor| is_plain_drive_root(ancestor))
+            && !self.traverse_roots.contains(&root.to_path_buf())
+        {
+            self.traverse_roots.push(root.to_path_buf());
+        }
+    }
+
+    /// Propose read/execute roots for the toolchains the host `PATH` resolves and merge them
+    /// into the read-root set. The proposals never overlap a writable root, the workspace, the
+    /// application cache or its private control root, so the closed explicit-root policy is
+    /// re-validated over the merged set and any conflict stays a hard error.
+    fn add_toolchain_read_roots(&mut self, command: &str) -> Result<(), String> {
+        let proposed =
+            windows_toolchains::mentioned_roots(resolved_toolchains_for_launch(), command);
+        if proposed.is_empty() {
+            return Ok(());
+        }
+        let mut excluded = vec![self.workspace.clone(), self.cache.clone()];
+        excluded.extend(self.cache.parent().map(Path::to_path_buf));
+        excluded.extend(private_control_root_candidate(&self.cache).ok());
+        excluded.extend(self.write_roots.iter().cloned());
+        excluded.extend(self.configured_write_roots.iter().cloned());
+        let mut optional: Vec<PathBuf> = windows_toolchains::without_overlaps(&proposed, &excluded)
+            .into_iter()
+            .filter(|root| !self.configured_read_roots.contains(root))
+            .filter(|root| reject_remote_access_path(root).is_ok())
+            .filter(|root| canonical_access_path(root).is_ok_and(|canonical| &canonical == root))
+            .collect();
+        if optional.is_empty() {
+            return Ok(());
+        }
+        optional.sort();
+        optional.dedup();
+        let mut all_configured = self.configured_read_roots.clone();
+        all_configured.extend(optional.iter().cloned());
+        all_configured.sort();
+        all_configured.dedup();
+        let read_roots =
+            collect_read_roots(&self.program, &self.workspace, &self.cache, &all_configured)?;
+        validate_explicit_root_policy(
+            &self.program,
+            &self.workspace,
+            &self.cache,
+            &all_configured,
+            &self.configured_write_roots,
+            &read_roots,
+            &self.write_roots,
+        )?;
+        self.read_roots = read_roots;
+        self.optional_read_roots = optional;
+        Ok(())
+    }
+}
+
+static DISCOVERED_TOOLCHAINS: OnceLock<Vec<windows_toolchains::Toolchain>> = OnceLock::new();
+static SKIPPED_TOOLCHAINS: OnceLock<Vec<String>> = OnceLock::new();
+
+/// Resolve the PATH toolchains once, on a background thread, when
+/// `windows-appcontainer-toolchain-discovery` is on. Nothing runs when the key is off, and a
+/// launch never walks the candidate trees itself: it uses what the thread has finished.
+pub(crate) fn start_toolchain_discovery() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let _ = std::thread::Builder::new()
+            .name("windows-toolchain-discovery".into())
+            .spawn(|| {
+                let (toolchains, skipped) =
+                    windows_toolchains::DiscoveryEnvironment::from_process()
+                        .map(|mut environment| {
+                            environment.already_readable = Some(all_packages_read_tree);
+                            if let Ok(paths) = crate::paths::AppPaths::from_process(None) {
+                                environment.excluded_roots = [
+                                    &paths.config_dir,
+                                    &paths.data_dir,
+                                    &paths.local_data_dir,
+                                    &paths.state_dir,
+                                    &paths.cache_dir,
+                                    &paths.credentials_dir,
+                                ]
+                                .into_iter()
+                                .filter_map(|dir| std::fs::canonicalize(dir).ok())
+                                .collect();
+                            }
+                            windows_toolchains::discover_with_report(&environment)
+                        })
+                        .unwrap_or_default();
+                let _ = SKIPPED_TOOLCHAINS.set(skipped);
+                let _ = DISCOVERED_TOOLCHAINS.set(toolchains);
+            });
+    });
+}
+
+/// How long a launch waits for the background discovery thread (never for a walk of its own).
+const TOOLCHAIN_DISCOVERY_LAUNCH_WAIT: Duration = Duration::from_secs(5);
+
+/// The toolchains resolved so far, waiting a bounded time for the background thread on the
+/// first launches of a session; empty when it has not finished (the launch then runs without
+/// toolchain grants and the failure note names the key).
+fn resolved_toolchains_for_launch() -> &'static [windows_toolchains::Toolchain] {
+    let deadline = Instant::now() + TOOLCHAIN_DISCOVERY_LAUNCH_WAIT;
+    while DISCOVERED_TOOLCHAINS.get().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    discovered_toolchain_roots()
+}
+
+/// The toolchains resolved so far; empty until the background thread finishes.
+fn discovered_toolchain_roots() -> &'static [windows_toolchains::Toolchain] {
+    DISCOVERED_TOOLCHAINS
+        .get()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// How many toolchain roots were resolved, waiting briefly for the background thread. For the
+/// doctor, never the launch path.
+pub(crate) fn discovered_toolchain_root_count() -> usize {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while DISCOVERED_TOOLCHAINS.get().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    discovered_toolchain_roots().len()
+}
+
+/// Commands the host `PATH` resolves whose directory was not granted, with the reason.
+pub(crate) fn skipped_toolchain_report() -> Vec<String> {
+    SKIPPED_TOOLCHAINS.get().cloned().unwrap_or_default()
 }
 
 fn build_helper_with_ready_and_roots(
@@ -2234,6 +2523,7 @@ fn build_helper_with_ready_and_roots(
         workspace,
         pty,
         &[],
+        None,
     )
 }
 
@@ -2248,6 +2538,7 @@ fn build_helper_with_ready_roots_and_env(
     workspace: Option<&Path>,
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
     extra_env: &[(String, String)],
+    shell_options: Option<ShellLaunchOptions<'_>>,
 ) -> Result<tokio::process::Command, String> {
     let mut request = prepare_launch_request(
         program,
@@ -2259,6 +2550,16 @@ fn build_helper_with_ready_roots_and_env(
         configured_write_roots,
         workspace,
     )?;
+    if let Some(options) = shell_options {
+        // Only model-shell launches get the opt-in extras, each behind its own config key.
+        request.null_device = options.null_device;
+        if options.ancestor_listing {
+            request.enable_ancestor_listing();
+        }
+        if options.toolchain_discovery {
+            request.add_toolchain_read_roots(options.command)?;
+        }
+    }
     request.extra_env = extra_env.to_vec();
     request.pty = pty.map(|launch| PtyRequest {
         rows: launch.rows,
@@ -3190,12 +3491,31 @@ fn run_helper() -> Result<i32, String> {
     let requested_traverse_roots = request
         .traverse_roots
         .iter()
-        .map(|root| canonical_root(root, "workspace traversal root"))
+        .map(|root| {
+            if request.ancestor_listing {
+                canonical_traverse_root(root)
+            } else {
+                canonical_root(root, "workspace traversal root")
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     let all_packages = sid_from_string("S-1-15-2-1")?;
     let mut traverse_roots = Vec::new();
     for root in requested_traverse_roots {
-        if effective_path_rights(&root, all_packages.0)? & FILE_TRAVERSE == 0 {
+        if request.ancestor_listing {
+            // The package check matches only the profile SID and `ALL APPLICATION PACKAGES`, so
+            // an `Everyone` or `Users` ACE does not count (`effective_path_rights` folds it in).
+            let (own, _) = exact_sid_rights(&root, all_packages.0).unwrap_or((0, 0));
+            if own & ANCESTOR_NAME_ACCESS == ANCESTOR_NAME_ACCESS {
+                continue;
+            }
+            // Resolving the working directory by name is a convenience, not a containment
+            // property: an ancestor this user cannot change (`C:\Users` for a standard user) is
+            // left as it is instead of refusing the launch.
+            if read_root_dacl_is_changeable(&root) {
+                traverse_roots.push(root);
+            }
+        } else if effective_path_rights(&root, all_packages.0)? & FILE_TRAVERSE == 0 {
             traverse_roots.push(root);
         }
     }
@@ -3204,10 +3524,17 @@ fn run_helper() -> Result<i32, String> {
         canonicalize_access_roots(request.read_roots.iter().map(PathBuf::as_path), &workspace)?;
     let write_roots =
         canonicalize_access_roots(request.write_roots.iter().map(PathBuf::as_path), &workspace)?;
-    let configured_read_roots = canonicalize_access_roots(
+    let optional_read_roots = canonicalize_access_roots(
+        request.optional_read_roots.iter().map(PathBuf::as_path),
+        &workspace,
+    )?;
+    let mut configured_read_roots = canonicalize_access_roots(
         request.configured_read_roots.iter().map(PathBuf::as_path),
         &workspace,
     )?;
+    configured_read_roots.extend(optional_read_roots.iter().cloned());
+    configured_read_roots.sort();
+    configured_read_roots.dedup();
     let configured_write_roots = canonicalize_access_roots(
         request.configured_write_roots.iter().map(PathBuf::as_path),
         &workspace,
@@ -3241,11 +3568,22 @@ fn run_helper() -> Result<i32, String> {
     preflight_witness::mark(29); // setup_job
     let (job, job_name) = bounded_job()?;
     mark_helper_failure_stage(HELPER_STAGE_PROFILE);
+    let null_device_requested = request.null_device && process_is_elevated();
+    let extras = JournalExtras {
+        ancestor_roots: traverse_roots.clone(),
+        optional_roots: optional_read_roots
+            .iter()
+            .filter(|root| !request.configured_read_roots.contains(root))
+            .cloned()
+            .collect(),
+        null_device: null_device_requested,
+    };
     let profile = create_appcontainer_profile(
         &cache,
         &read_roots,
         &write_roots,
         &traverse_roots,
+        &extras,
         &job_name,
     )?;
     let mut grants = AccessGrants::new(profile, read_roots, write_roots);
@@ -3272,6 +3610,31 @@ fn run_helper() -> Result<i32, String> {
             } else {
                 mark_helper_failure_stage(HELPER_STAGE_CONFIGURED_READ_GRANT);
             }
+            if optional_read_roots.contains(&root)
+                && !request.configured_read_roots.contains(&root)
+                && !read_root_dacl_is_changeable(&root)
+            {
+                // A PATH-derived toolchain root this user cannot change the DACL of (an
+                // administrator-owned install) is simply not exposed; no ACE was written.
+                grants.acl_roots.retain(|candidate| candidate != &root);
+                continue;
+            }
+            if optional_read_roots.contains(&root) && !request.configured_read_roots.contains(&root)
+            {
+                // Best effort per root: a failure (another session holding the ACL mutex over a
+                // large tree, one unchangeable child) removes whatever was written and the
+                // launch simply runs without that toolchain.
+                if let Err(error) = grant_read_root(&root, &mut grants, &parent) {
+                    tracing::debug!(error = %error, "sandbox: skipped a PATH toolchain grant");
+                    let _ = revoke_tree_until(
+                        &root,
+                        grants.sid(),
+                        Instant::now() + Duration::from_secs(5),
+                    );
+                    grants.acl_roots.retain(|candidate| candidate != &root);
+                }
+                continue;
+            }
             grant_read_root(&root, &mut grants, &parent)?;
         }
     }
@@ -3282,8 +3645,26 @@ fn run_helper() -> Result<i32, String> {
             .chain(grants.write_roots.iter())
             .any(|covered| root.starts_with(covered))
         {
-            grant_access_root(&root, &mut grants, &parent, FILE_TRAVERSE, false, false)?;
+            if request.ancestor_listing {
+                // Best effort: a refused or non-local DACL change leaves the ancestor as it is.
+                if let Err(error) = grant_access_root(
+                    &root,
+                    &mut grants,
+                    &parent,
+                    ANCESTOR_NAME_ACCESS,
+                    false,
+                    false,
+                ) {
+                    tracing::debug!(error = %error, "sandbox: skipped an ancestor listing grant");
+                    grants.acl_roots.retain(|candidate| candidate != &root);
+                }
+            } else {
+                grant_access_root(&root, &mut grants, &parent, FILE_TRAVERSE, false, false)?;
+            }
         }
+    }
+    if null_device_requested {
+        grant_null_device(&mut grants);
     }
     // This desktop-only firewall API reads host configuration and is intentionally unavailable
     // inside AppContainer. Attest the freshly-created profile SID from the trusted helper before
@@ -3482,6 +3863,36 @@ fn read_request() -> Result<LaunchRequest, String> {
         .map_err(|error| format!("decode Windows launch request: {error}"))
 }
 
+/// A drive root such as `\\?\C:\`: a disk prefix and a root directory, nothing else.
+fn is_plain_drive_root(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(
+        components.next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+    ) && matches!(components.next(), Some(std::path::Component::RootDir))
+        && components.next().is_none()
+}
+
+/// Canonicalise one named ancestor of the workspace. `canonical_root` refuses a drive root
+/// because no access root may be one; as a name-listing ancestor it is accepted only when it is
+/// already exactly its own canonical form (no substitution or reparse point on the way).
+fn canonical_traverse_root(path: &Path) -> Result<PathBuf, String> {
+    if is_plain_drive_root(path) {
+        let canonical = std::fs::canonicalize(path).map_err(|error| {
+            format!(
+                "sandbox: canonicalize workspace drive root {}: {error}",
+                path.display()
+            )
+        })?;
+        if canonical != path || !canonical.is_dir() {
+            return Err("sandbox: workspace drive root is not its own canonical directory".into());
+        }
+        return Ok(canonical);
+    }
+    canonical_root(path, "workspace traversal root")
+}
+
 fn canonical_root(path: &Path, label: &str) -> Result<PathBuf, String> {
     reject_reparse_components(path)?;
     let canonical = std::fs::canonicalize(path)
@@ -3520,6 +3931,9 @@ struct GrantedObject {
     file: File,
     directory: bool,
     acl_mutated: bool,
+    /// A non-inheriting directory grant: written and revoked only when the DACL change can be
+    /// made without re-propagating through the subtree (`DirectoryAcePropagation::RequireLocal`).
+    local_only: bool,
 }
 
 struct AccessGrants {
@@ -3528,6 +3942,8 @@ struct AccessGrants {
     write_roots: Vec<PathBuf>,
     acl_roots: Vec<PathBuf>,
     objects: Vec<GrantedObject>,
+    /// The NUL device handle that carries this container's temporary ACE, if one was granted.
+    null_device: Option<File>,
     cleaned: bool,
     cleanup_attempted: bool,
     cleanup_allowed: bool,
@@ -3553,6 +3969,7 @@ impl AccessGrants {
             write_roots,
             acl_roots,
             objects: Vec::new(),
+            null_device: None,
             cleaned: false,
             cleanup_attempted: false,
             cleanup_allowed: true,
@@ -3584,12 +4001,24 @@ impl AccessGrants {
         // reopening or locking every descendant.
         for object in self.objects.iter().rev() {
             if object.acl_mutated
-                && let Err(error) =
-                    update_access_ace(&object.file, object.directory, self.sid(), REVOKE_ACCESS, 0)
+                && let Err(error) = update_access_ace_with(
+                    &object.file,
+                    object.directory && !object.local_only,
+                    self.sid(),
+                    REVOKE_ACCESS,
+                    0,
+                    object.local_only,
+                )
                 && first_error.is_none()
             {
                 first_error = Some(error);
             }
+        }
+        if let Some(file) = &self.null_device
+            && let Err(error) = change_null_device_ace(file, self.sid(), false)
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -3641,6 +4070,98 @@ fn grant_read_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> R
         false,
         true,
     )
+}
+
+/// Whether the current user can rewrite `root`'s DACL, the right the read grant needs. Opening
+/// with the same access and sharing as the grant proves it without mutating anything.
+fn read_root_dacl_is_changeable(root: &Path) -> bool {
+    let directory = std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir());
+    open_stable_path(
+        root,
+        directory,
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+    .is_ok()
+}
+
+/// Whether this process runs with an elevated (full administrator) token. The NUL device ACE is
+/// attempted only then: that DACL is machine-global, and an unelevated process is expected to be
+/// refused by the kernel anyway, so the check keeps the attempt (and its journal entry) explicit.
+fn process_is_elevated() -> bool {
+    let Ok(token) = primary_token() else {
+        return false;
+    };
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned = 0u32;
+    let queried = unsafe {
+        GetTokenInformation(
+            token.raw(),
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    queried != 0 && elevation.TokenIsElevated != 0
+}
+
+/// Open `\\.\NUL` for reading and rewriting its security descriptor.
+fn open_null_device() -> Option<File> {
+    let path = wide_string("\\\\.\\NUL");
+    let raw = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        )
+    };
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    Some(unsafe { File::from_raw_handle(raw) })
+}
+
+/// Add (`grant`) or remove the profile SID's read/write ACE on the NUL device, written with
+/// `SetKernelObjectSecurity` only (never a tree-walking `SetSecurityInfo`).
+fn change_null_device_ace(file: &File, sid: PSID, grant: bool) -> Result<(), String> {
+    update_handle_ace_with_propagation(
+        file.as_raw_handle(),
+        SE_FILE_OBJECT,
+        sid,
+        if grant { GRANT_ACCESS } else { REVOKE_ACCESS },
+        if grant {
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE
+        } else {
+            0
+        },
+        0,
+        DirectoryAcePropagation::KernelOnly,
+    )
+}
+
+/// Give this launch's AppContainer read/write on the NUL device (`windows-appcontainer-null-device`).
+///
+/// The default DACL of `\\.\NUL` does not admit AppContainers, so inside the sandbox
+/// `cmd.exe` redirections to `nul`, Git for Windows (which opens `/dev/null` before doing
+/// anything), Python's `subprocess.DEVNULL` and Node's ignored stdio all fail with "Access is
+/// denied". Rewriting that machine-global device DACL needs an elevated administrator, which is
+/// checked explicitly by the caller; the launch's journal records the grant before it is made so
+/// a killed helper's ACE is revoked by the next stale sweep. The ACE names only this launch's
+/// unique profile SID, grants read and write on a device that discards its input and yields
+/// end-of-file, never touches a file, and is revoked in `AccessGrants::cleanup`; the device
+/// object does not survive a reboot.
+fn grant_null_device(grants: &mut AccessGrants) {
+    let Some(file) = open_null_device() else {
+        return;
+    };
+    if change_null_device_ace(&file, grants.sid(), true).is_ok() {
+        grants.null_device = Some(file);
+    }
 }
 
 fn trusted_machine_read_file(path: &Path) -> Result<bool, String> {
@@ -3721,6 +4242,111 @@ fn sid_from_string(value: &str) -> Result<Local, String> {
         return Err(last_error("convert well-known SID"));
     }
     Ok(Local(sid))
+}
+
+/// Rights that ACEs naming exactly `sid` give, ignoring group membership: the AppContainer
+/// package check matches only the profile SID, `ALL APPLICATION PACKAGES` and capability SIDs,
+/// never `Everyone` or `Users`, so [`effective_path_rights`] (which folds `Everyone` in) can
+/// report access the container does not have. Returns the rights on the object itself and the
+/// rights inherited by both files and subdirectories; a missing DACL grants everything.
+fn exact_sid_rights(path: &Path, sid: PSID) -> Result<(u32, u32), String> {
+    // Handle-bound, like every other DACL read of an access root: the path is opened once without
+    // following links and the descriptor is read from that handle.
+    let directory = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("sandbox: inspect path for exact-SID rights: {error}"))?
+        .is_dir();
+    let file = open_stable_path(
+        path,
+        directory,
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 || descriptor.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor) };
+        }
+        return Err(format!(
+            "sandbox: read DACL for exact-SID rights: code {result}"
+        ));
+    }
+    let _descriptor = Local(descriptor);
+    if dacl.is_null() {
+        return Ok((u32::MAX, u32::MAX));
+    }
+    let inherited_by_both = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8;
+    let (mut allowed, mut denied, mut child_allowed, mut child_denied) = (0u32, 0u32, 0u32, 0u32);
+    let count = unsafe { (*dacl).AceCount };
+    for index in 0..u32::from(count) {
+        let mut ace = null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+            return Err("sandbox: unreadable ACE while computing exact-SID rights".into());
+        }
+        let header = unsafe { *ace.cast::<ACE_HEADER>() };
+        let is_allow = u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE;
+        let is_deny = u32::from(header.AceType) == ACCESS_DENIED_ACE_TYPE;
+        if !is_allow && !is_deny {
+            continue;
+        }
+        if usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
+            return Err("sandbox: truncated ACE while computing exact-SID rights".into());
+        }
+        // Allowed and denied ACEs share one layout: header, mask, then the inline SID.
+        let ace_sid: PSID =
+            unsafe { (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast() };
+        if unsafe { IsValidSid(ace_sid) } == 0 {
+            continue;
+        }
+        // The SID must lie wholly inside the ACE: header (4) + mask (4) + SID.
+        if unsafe { GetLengthSid(ace_sid) } as usize + 8 > usize::from(header.AceSize) {
+            return Err(
+                "sandbox: ACE SID overruns its ACE while computing exact-SID rights".into(),
+            );
+        }
+        if unsafe { EqualSid(ace_sid, sid) } == 0 {
+            continue;
+        }
+        let mask = map_file_access_mask(unsafe { (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask });
+        if header.AceFlags & INHERIT_ONLY_ACE as u8 == 0 {
+            if is_allow {
+                allowed |= mask;
+            } else {
+                denied |= mask;
+            }
+        }
+        if header.AceFlags & inherited_by_both == inherited_by_both {
+            if is_allow {
+                child_allowed |= mask;
+            } else {
+                child_denied |= mask;
+            }
+        }
+    }
+    Ok((allowed & !denied, child_allowed & !child_denied))
+}
+
+/// Whether `ALL APPLICATION PACKAGES` already reads and executes the whole tree under `path`
+/// (an explicit inheritable ACE), so no grant is needed there.
+fn all_packages_read_tree(path: &Path) -> bool {
+    let Ok(all_packages) = sid_from_string("S-1-15-2-1") else {
+        return false;
+    };
+    let required = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    exact_sid_rights(path, all_packages.0)
+        .is_ok_and(|(own, children)| own & required == required && children & required == required)
 }
 
 fn effective_path_rights(path: &Path, sid: PSID) -> Result<u32, String> {
@@ -3850,12 +4476,16 @@ fn grant_access_root(
         } else {
             !FILE_DELETE_CHILD
         };
-    update_access_ace(
+    // A non-inheriting directory grant (workspace ancestors, drive root) must never fall back to a
+    // propagating DACL write: that re-walks the whole subtree under the global ACL mutex.
+    let local_only = directory && !inherit_to_children;
+    update_access_ace_with(
         &file,
         directory && inherit_to_children,
         grants.sid(),
         GRANT_ACCESS,
         permissions,
+        local_only,
     )?;
     if crate::fs::windows_file_identity(&file)
         .map_err(|error| format!("sandbox: recheck access-root identity: {error}"))?
@@ -3867,6 +4497,7 @@ fn grant_access_root(
         file,
         directory,
         acl_mutated: true,
+        local_only,
     });
     Ok(())
 }
@@ -3965,6 +4596,17 @@ fn update_access_ace(
     mode: windows_sys::Win32::Security::Authorization::ACCESS_MODE,
     permissions: u32,
 ) -> Result<(), String> {
+    update_access_ace_with(file, directory, sid, mode, permissions, false)
+}
+
+fn update_access_ace_with(
+    file: &File,
+    directory: bool,
+    sid: PSID,
+    mode: windows_sys::Win32::Security::Authorization::ACCESS_MODE,
+    permissions: u32,
+    require_local: bool,
+) -> Result<(), String> {
     let permissions = if mode == REVOKE_ACCESS {
         0
     } else {
@@ -3986,7 +4628,9 @@ fn update_access_ace(
         mode,
         permissions,
         inheritance,
-        if is_directory {
+        if is_directory && require_local {
+            DirectoryAcePropagation::RequireLocal
+        } else if is_directory {
             DirectoryAcePropagation::SkipWhenLocal
         } else {
             DirectoryAcePropagation::Always
@@ -4008,6 +4652,12 @@ fn update_access_ace(
 enum DirectoryAcePropagation {
     Always,
     SkipWhenLocal,
+    /// Never propagate: the change must be classified local (a non-inheriting ACE for the one
+    /// profile SID) or it is refused with an error. A revoke that finds no explicit ACE for the
+    /// SID has nothing to remove and succeeds.
+    RequireLocal,
+    /// Write through `SetKernelObjectSecurity` unconditionally (a device object, never a tree).
+    KernelOnly,
 }
 
 fn update_handle_ace(
@@ -4062,9 +4712,26 @@ fn update_handle_ace_with_propagation(
         return Err(format!("sandbox: read handle-bound DACL: code {result}"));
     }
     let _descriptor = Local(descriptor);
-    let local_directory_change = propagation == DirectoryAcePropagation::SkipWhenLocal
-        && object_type == SE_FILE_OBJECT
+    let classified_local = object_type == SE_FILE_OBJECT
         && unsafe { directory_ace_change_is_local(dacl, sid, mode, inheritance) };
+    let local_directory_change = match propagation {
+        DirectoryAcePropagation::Always => false,
+        DirectoryAcePropagation::SkipWhenLocal => classified_local,
+        DirectoryAcePropagation::KernelOnly => true,
+        DirectoryAcePropagation::RequireLocal => {
+            if !classified_local {
+                if mode == REVOKE_ACCESS
+                    && unsafe { explicit_ace_count_for_sid(dacl, sid) } == Some(0)
+                {
+                    return Ok(());
+                }
+                return Err(
+                    "sandbox: refusing a DACL change that would propagate to children".into(),
+                );
+            }
+            true
+        }
+    };
     let trustee = TRUSTEE_W {
         pMultipleTrustee: null_mut(),
         MultipleTrusteeOperation: 0,
@@ -4109,6 +4776,42 @@ fn update_handle_ace_with_propagation(
         ));
     }
     Ok(())
+}
+
+/// Explicit (non-inherited) allow/deny ACEs naming `sid`; `None` when the DACL holds an ACE this
+/// parser cannot classify.
+///
+/// # Safety
+/// `dacl` must be null or point to a valid ACL owned by a live security descriptor.
+unsafe fn explicit_ace_count_for_sid(dacl: *const ACL, sid: PSID) -> Option<usize> {
+    if dacl.is_null() || sid.is_null() {
+        return None;
+    }
+    let mut count = 0usize;
+    for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+        let mut ace = null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+            return None;
+        }
+        let header = unsafe { *ace.cast::<ACE_HEADER>() };
+        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
+            && u32::from(header.AceType) != ACCESS_DENIED_ACE_TYPE
+        {
+            return None;
+        }
+        if usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
+            return None;
+        }
+        if header.AceFlags & INHERITED_ACE as u8 != 0 {
+            continue;
+        }
+        let ace_sid: PSID =
+            unsafe { (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast() };
+        if unsafe { IsValidSid(ace_sid) } != 0 && unsafe { EqualSid(ace_sid, sid) } != 0 {
+            count += 1;
+        }
+    }
+    Some(count)
 }
 
 /// Classifies a pending ACE change on a directory DACL as local to that directory.
@@ -4333,6 +5036,7 @@ fn create_appcontainer_profile(
     read_roots: &[PathBuf],
     write_roots: &[PathBuf],
     journal_extra_roots: &[PathBuf],
+    extras: &JournalExtras,
     job_name: &str,
 ) -> Result<AppContainerProfile, String> {
     preflight_witness::mark(30); // setup_profile_root
@@ -4450,6 +5154,9 @@ fn create_appcontainer_profile(
             sid: profile.text.clone(),
             job_name: job_name.to_string(),
             roots,
+            ancestor_roots: extras.ancestor_roots.clone(),
+            optional_roots: extras.optional_roots.clone(),
+            null_device: extras.null_device,
         };
         let payload = serde_json::to_vec(&journal)
             .map_err(|error| format!("sandbox: encode AppContainer cleanup journal: {error}"))?;
@@ -5107,18 +5814,54 @@ fn sweep_stale_profile_journal(
     // tool directory, unplugged drive) carries no ACE, so it is already clean.
     // A root that exists but cannot be inspected still fails closed, naming
     // the root so the operator can repair it.
-    let mut roots = Vec::new();
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+    enum RootKind {
+        /// Inheritable read or write root: a missing ACE at the root may still leave inherited
+        /// ACEs below it after a killed propagating revoke, so it is always revoked.
+        Required,
+        /// A best-effort toolchain root: a revoke the unelevated launcher cannot perform is
+        /// retained, never fatal.
+        Optional,
+        /// A non-inheriting ancestor or drive root: revoked locally, only where an ACE exists.
+        Ancestor,
+    }
+    let mut roots: Vec<(PathBuf, RootKind)> = Vec::new();
     for root in super::roots_present_on_disk(&journal.roots, journal_root.path()) {
-        roots.extend(
-            canonicalize_access_roots([root.as_path()], journal_root.path())
-                .map_err(|error| format!("{error}: {}", root.display()))?,
-        );
+        let kind = if journal.ancestor_roots.contains(&root) {
+            RootKind::Ancestor
+        } else if journal.optional_roots.contains(&root) {
+            RootKind::Optional
+        } else {
+            RootKind::Required
+        };
+        // A launch may have granted name listing on a drive root, which no access root can be.
+        if is_plain_drive_root(&root) {
+            roots.push((canonical_traverse_root(&root)?, kind));
+            continue;
+        }
+        for canonical in canonicalize_access_roots([root.as_path()], journal_root.path())
+            .map_err(|error| format!("{error}: {}", root.display()))?
+        {
+            roots.push((canonical, kind));
+        }
     }
     roots.sort();
     roots.dedup();
-    for root in roots {
+    // A grant this launcher cannot withdraw (an ACE written by an elevated session on a system
+    // directory) must not make every later launch fail: the journal is retained for a launcher
+    // that can, and the doctor reports it.
+    let mut retained = false;
+    for (root, kind) in roots {
         ensure_preflight_cleanup_deadline(deadline)?;
-        let stale_effective = effective_path_rights(&root, sid.0)?;
+        let best_effort = kind != RootKind::Required;
+        let stale_effective = match effective_path_rights(&root, sid.0) {
+            Ok(rights) => rights,
+            Err(_) if best_effort => {
+                retained = true;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         // Older version-2 journals may name a protected executable even though no ACE was ever
         // applied to it. Never request WRITE_DAC there; fail closed if the unique stale SID has
         // unexpectedly acquired any effective access.
@@ -5138,14 +5881,77 @@ fn sweep_stale_profile_journal(
         if stale_effective == 0 {
             continue;
         }
-        revoke_tree_until(&root, sid.0, deadline)
-            .map_err(|error| format!("{error}: {}", root.display()))?;
+        if kind == RootKind::Ancestor {
+            // `effective_path_rights` folds `Everyone` into the stale SID's rights, so it cannot
+            // tell whether an ACE for that SID exists. A non-inheriting ancestor is revoked only
+            // where an explicit ACE names the stale SID, and only by a change that cannot
+            // propagate to children (a whole drive for a drive-root ancestor).
+            let removed = exact_sid_rights(&root, sid.0).and_then(|(own, _)| {
+                if own == 0 {
+                    return Ok(());
+                }
+                revoke_local_ancestor(&root, sid.0)
+            });
+            if removed.is_err() {
+                retained = true;
+            }
+            continue;
+        }
+        // Required and optional roots are inheritable: the propagating revoke also repairs a
+        // grant whose root ACE is gone but whose descendants still carry the inherited ACE.
+        match revoke_tree_until(&root, sid.0, deadline) {
+            Ok(()) => {}
+            Err(_) if kind == RootKind::Optional => retained = true,
+            Err(error) => return Err(format!("{error}: {}", root.display())),
+        }
+    }
+    if journal.null_device {
+        let revoked = if process_is_elevated() {
+            open_null_device()
+                .map(|file| change_null_device_ace(&file, sid.0, false).is_ok())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if !revoked {
+            retained = true;
+        }
+    }
+    if retained {
+        RETAINED_STALE_JOURNALS.fetch_add(1, Ordering::AcqRel);
+        tracing::warn!(
+            "sandbox: an earlier session's access grants could not be withdrawn by this launcher; \
+             they are retained until an elevated launch (see --doctor)"
+        );
     }
     ensure_preflight_cleanup_deadline(deadline)?;
     delete_appcontainer_profile(&name)?;
     drop(lease);
     ensure_preflight_cleanup_deadline(deadline)?;
+    if retained {
+        // Keep the journal: its roots and SID are the only record a later elevated launch can
+        // use to remove the remaining grants.
+        return Ok(());
+    }
     journal_root.remove_file(path, "remove stale AppContainer journal")
+}
+
+/// Stale journals this process found that it could not fully clear (reported by `--doctor`).
+static RETAINED_STALE_JOURNALS: AtomicUsize = AtomicUsize::new(0);
+
+pub(crate) fn retained_stale_journals() -> usize {
+    RETAINED_STALE_JOURNALS.load(Ordering::Acquire)
+}
+
+/// Remove the stale SID's non-inheriting ACE from one ancestor without any child propagation.
+fn revoke_local_ancestor(root: &Path, sid: PSID) -> Result<(), String> {
+    let file = open_stable_path(
+        root,
+        true,
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
+    update_access_ace_with(&file, false, sid, REVOKE_ACCESS, 0, true)
 }
 
 fn sweep_stale_profile_intent(
@@ -7219,6 +8025,167 @@ mod tests {
         assert!(diagnostic.chars().count() <= MAX_PREFLIGHT_DIAGNOSTIC_CHARS + 3);
     }
 
+    #[test]
+    fn a_concurrent_sessions_preflight_root_is_not_preserved_recovery_state() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root =
+            std::env::temp_dir().join(format!("{PREFLIGHT_ROOT_PREFIX}{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        // Young but leaseless (a crashed or half-created root) is NOT skipped: fail closed.
+        assert!(!preflight_root_is_possibly_live(&root));
+        // A held exclusive lease is a live session.
+        let lease = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(root.join(PREFLIGHT_OWNER_FILE))
+            .unwrap();
+        assert!(preflight_root_is_possibly_live(&root));
+        drop(lease);
+        std::fs::remove_dir_all(&root).unwrap();
+        // The owner finished and removed the root while it was being inspected.
+        assert!(preflight_root_is_possibly_live(&root));
+    }
+
+    #[test]
+    fn the_preflight_serial_mutex_excludes_a_second_holder_until_released() {
+        let first = PreflightSerialGuard::acquire(Instant::now() + Duration::from_secs(5)).unwrap();
+        let second = std::thread::spawn(|| {
+            PreflightSerialGuard::acquire(Instant::now() + Duration::from_millis(300)).is_err()
+        })
+        .join()
+        .unwrap();
+        assert!(
+            second,
+            "a second session must wait while the first holds the mutex"
+        );
+        drop(first);
+        let again = std::thread::spawn(|| {
+            PreflightSerialGuard::acquire(Instant::now() + Duration::from_secs(5)).is_ok()
+        })
+        .join()
+        .unwrap();
+        assert!(again);
+    }
+
+    #[test]
+    fn exact_sid_rights_ignore_everyone_and_report_own_and_inherited_aces() {
+        let dir = std::env::temp_dir().join(format!("mini-agent-exact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let file = open_stable_path(
+            &dir,
+            true,
+            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        .unwrap();
+        let sid = sid_from_string("S-1-5-21-111-222-333-4444").unwrap();
+        assert_eq!(exact_sid_rights(&dir, sid.0).unwrap(), (0, 0));
+        // Non-inheriting list ACE: own rights only, nothing inherited.
+        update_access_ace_with(
+            &file,
+            false,
+            sid.0,
+            GRANT_ACCESS,
+            ANCESTOR_NAME_ACCESS,
+            true,
+        )
+        .unwrap();
+        let (own, inherited) = exact_sid_rights(&dir, sid.0).unwrap();
+        assert_eq!(own & ANCESTOR_NAME_ACCESS, ANCESTOR_NAME_ACCESS);
+        assert_eq!(inherited, 0);
+        update_access_ace_with(&file, false, sid.0, REVOKE_ACCESS, 0, true).unwrap();
+        assert_eq!(exact_sid_rights(&dir, sid.0).unwrap(), (0, 0));
+        // Inheritable read ACE reports inherited rights for files and subdirectories.
+        update_access_ace(&file, true, sid.0, GRANT_ACCESS, FILE_GENERIC_READ).unwrap();
+        let (own, inherited) = exact_sid_rights(&dir, sid.0).unwrap();
+        assert_eq!(own & FILE_GENERIC_READ, FILE_GENERIC_READ);
+        assert_eq!(inherited & FILE_GENERIC_READ, FILE_GENERIC_READ);
+        update_access_ace(&file, true, sid.0, REVOKE_ACCESS, 0).unwrap();
+        drop(file);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_ancestor_grant_and_revoke_never_change_a_childs_dacl() {
+        let parent = std::env::temp_dir().join(format!("mini-agent-anc-{}", uuid::Uuid::new_v4()));
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        let sid = sid_from_string("S-1-5-21-111-222-333-5555").unwrap();
+        let before = dacl_ace_count(&child);
+        let handle = open_stable_path(
+            &parent,
+            true,
+            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        .unwrap();
+        update_access_ace_with(
+            &handle,
+            false,
+            sid.0,
+            GRANT_ACCESS,
+            ANCESTOR_NAME_ACCESS,
+            true,
+        )
+        .unwrap();
+        assert_eq!(dacl_ace_count(&child), before, "grant reached the child");
+        assert_eq!(exact_sid_rights(&child, sid.0).unwrap(), (0, 0));
+        revoke_local_ancestor(&parent, sid.0).unwrap();
+        assert_eq!(exact_sid_rights(&parent, sid.0).unwrap(), (0, 0));
+        assert_eq!(dacl_ace_count(&child), before, "revoke reached the child");
+        // A revoke with nothing to remove is a no-op, never a propagating write.
+        revoke_local_ancestor(&parent, sid.0).unwrap();
+        drop(handle);
+        std::fs::remove_dir_all(&parent).unwrap();
+    }
+
+    fn dacl_ace_count(path: &Path) -> u16 {
+        let file = open_stable_path(
+            path,
+            true,
+            READ_CONTROL | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        .unwrap();
+        let mut dacl = null_mut();
+        let mut descriptor = null_mut();
+        let result = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(result, 0);
+        let _descriptor = Local(descriptor);
+        unsafe { (*dacl).AceCount }
+    }
+
+    #[test]
+    fn the_nul_device_ace_is_granted_and_revoked_only_when_elevated() {
+        let sid = sid_from_string("S-1-5-21-111-222-333-6666").unwrap();
+        if !process_is_elevated() {
+            // Unelevated runners must be refused by the kernel, not silently succeed.
+            if let Some(file) = open_null_device() {
+                assert!(change_null_device_ace(&file, sid.0, true).is_err());
+            }
+            return;
+        }
+        let file = open_null_device().expect("elevated process opens the NUL device DACL");
+        change_null_device_ace(&file, sid.0, true).unwrap();
+        let access = std::fs::OpenOptions::new().read(true).open("\\\\.\\NUL");
+        assert!(access.is_ok());
+        change_null_device_ace(&file, sid.0, false).unwrap();
+        // Revoking again finds nothing to remove and still succeeds.
+        change_null_device_ace(&file, sid.0, false).unwrap();
+    }
+
     fn installed_sandbox_test_executable() -> PathBuf {
         let path = std::env::var_os("MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE")
             .expect("set MINI_AGENT_TEST_WINDOWS_SANDBOX_EXE to a cargo-installed debug binary");
@@ -8002,6 +8969,7 @@ mod tests {
             &[workspace],
             &[],
             &[],
+            &JournalExtras::default(),
             &format!("{JOB_NAME_PREFIX}{}", uuid::Uuid::new_v4().simple()),
         )
         .expect("create real profile through publication stages");
