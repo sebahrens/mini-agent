@@ -130,6 +130,10 @@ pub(crate) enum IsolationOutcome {
         branch: String,
         worktree: PathBuf,
         base: String,
+        /// Whether the parent checkout had uncommitted changes when the
+        /// worktree was created (`None`: could not be determined). They are
+        /// never part of the branch.
+        parent_dirty: Option<bool>,
         commits: Vec<String>,
         diff_stat: String,
     },
@@ -159,16 +163,18 @@ impl IsolationOutcome {
                 branch,
                 worktree,
                 base,
+                parent_dirty,
                 commits,
                 diff_stat,
             } => {
+                let parent_note = parent_dirty_sentence(*parent_dirty);
                 let commits = commits
                     .iter()
                     .map(|commit| format!("  - {commit}"))
                     .collect::<Vec<_>>()
                     .join("\n");
                 format!(
-                    "\n\n## Isolated worktree\n- Branch: `{branch}`\n- Worktree: {}\n- Base commit: {base}\n- Commits:\n{commits}\n- Diff stat:\n```\n{diff_stat}\n```\nNothing was applied to the parent workspace. Review the branch, then merge it explicitly (for example `git merge {branch}` from the parent, or switch with /worktree and use /wt-merge).",
+                    "\n\n## Isolated worktree\n- Branch: `{branch}`\n- Worktree: {}\n- Base commit: {base}\n- {parent_note}\n- Commits:\n{commits}\n- Diff stat:\n```\n{diff_stat}\n```\nNothing was applied to the parent workspace. Review the branch, then merge it explicitly (for example `git merge {branch}` from the parent, or switch with /worktree and use /wt-merge).",
                     worktree.display()
                 )
             }
@@ -201,6 +207,31 @@ pub(crate) fn validate_base_ref(base: &str) -> Result<(), String> {
 }
 
 #[cfg(feature = "git-worktree")]
+/// One sentence on what the isolated worktree lacks from the parent checkout.
+fn parent_dirty_sentence(parent_dirty: Option<bool>) -> &'static str {
+    match parent_dirty {
+        Some(true) => {
+            "The parent checkout had uncommitted changes when the worktree was created; the worktree does not contain them."
+        }
+        Some(false) => {
+            "The parent checkout had no uncommitted changes when the worktree was created."
+        }
+        None => {
+            "Whether the parent checkout had uncommitted changes could not be determined; the worktree never contains them."
+        }
+    }
+}
+
+/// Host note placed in an isolated child's first message (mini-agent-kzzul):
+/// it works on a private branch cut from a commit, not on the parent checkout.
+#[cfg_attr(not(feature = "git-worktree"), allow(dead_code))]
+fn child_note_text(branch: &str, base: &str, parent_dirty: Option<bool>) -> String {
+    format!(
+        "[host note: you work in an isolated git worktree on branch `{branch}`, created from commit {base}. {} Your edits reach the parent checkout only when your branch is merged.]",
+        parent_dirty_sentence(parent_dirty)
+    )
+}
+
 pub(crate) use real::prepare;
 #[cfg(not(feature = "git-worktree"))]
 pub(crate) use stub::prepare;
@@ -214,6 +245,10 @@ mod stub {
     impl IsolatedWorktree {
         pub(crate) async fn finish(self) -> IsolationOutcome {
             IsolationOutcome::Unchanged
+        }
+
+        pub(crate) fn child_note(&self) -> String {
+            String::new()
         }
     }
 
@@ -239,6 +274,7 @@ mod real {
     pub(crate) struct IsolatedWorktree {
         info: WorktreeInfo,
         base: String,
+        parent_dirty: Option<bool>,
         armed: bool,
         notes: super::AbandonedNotes,
     }
@@ -316,6 +352,11 @@ mod real {
     }
 
     impl IsolatedWorktree {
+        /// The host note for the child's first message.
+        pub(crate) fn child_note(&self) -> String {
+            super::child_note_text(&self.info.branch, &self.base, self.parent_dirty)
+        }
+
         #[cfg(test)]
         pub(crate) fn path(&self) -> &std::path::Path {
             &self.info.worktree_path
@@ -360,6 +401,7 @@ mod real {
                         branch,
                         worktree,
                         base: self.base.clone(),
+                        parent_dirty: self.parent_dirty,
                         commits: report.commits,
                         diff_stat: report.diff_stat,
                     }
@@ -419,6 +461,7 @@ mod real {
             .map(|(_, info)| IsolatedWorktree {
                 info,
                 base: String::new(),
+                parent_dirty: None,
                 armed: true,
                 notes: create_plan.abandoned.clone(),
             });
@@ -436,6 +479,9 @@ mod real {
             .map_err(|_| "worktree creation task stopped before returning".to_string())??;
         let derived = async {
             owned.base = git_worktree::head_oid(&owned.info.worktree_path).await?;
+            owned.parent_dirty = git_worktree::worktree_has_uncommitted(&plan.parent_root)
+                .await
+                .ok();
             let binding = crate::paths::WorkspaceBinding::capture(&owned.info.worktree_path)
                 .map_err(|error| format!("cannot bind the isolated worktree: {error}"))?;
             let denied = [

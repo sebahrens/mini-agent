@@ -5670,6 +5670,41 @@ wait
             fixture.assert_parent_untouched();
         }
 
+        // mini-agent-kzzul: the child and the parent are told what the
+        // worktree lacks.
+        #[tokio::test]
+        async fn isolated_child_note_names_the_base_and_whether_the_parent_is_dirty() {
+            let clean = Fixture::new("isolation-note-clean");
+            let (worktree, authorization) = prepare(&clean.plan, &clean.parent()).await.unwrap();
+            let note = worktree.child_note();
+            assert!(note.contains(&clean.head), "{note}");
+            assert!(note.contains("no uncommitted changes"), "{note}");
+            edit_tracked_file(&authorization, "alpha").await;
+            let outcome = worktree.finish().await;
+            assert!(
+                outcome.render().contains("no uncommitted changes"),
+                "{}",
+                outcome.render()
+            );
+
+            let dirty = Fixture::new("isolation-note-dirty");
+            std::fs::write(dirty.root().join("wip.txt"), "unsaved").unwrap();
+            let (worktree, authorization) = prepare(&dirty.plan, &dirty.parent()).await.unwrap();
+            let note = worktree.child_note();
+            assert!(
+                note.contains("had uncommitted changes when the worktree was created"),
+                "{note}"
+            );
+            assert!(!worktree.path().join("wip.txt").exists());
+            edit_tracked_file(&authorization, "beta").await;
+            let outcome = worktree.finish().await;
+            assert!(
+                outcome.render().contains("does not contain them"),
+                "{}",
+                outcome.render()
+            );
+        }
+
         #[tokio::test]
         async fn isolated_child_cannot_write_the_parent_workspace() {
             let fixture = Fixture::new("isolation-no-parent-write");

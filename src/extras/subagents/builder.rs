@@ -233,6 +233,11 @@ pub(crate) struct PersonaExecution {
     pub(crate) hooks: Option<String>,
     /// The opened notes directory; adds the `agent_memory` tool.
     pub(crate) memory_dir: Option<std::sync::Arc<super::agent_memory::AgentMemory>>,
+    /// Persona `instructions: false`: no instruction overlay or nested
+    /// instruction files for this child.
+    pub(crate) omit_instructions: bool,
+    /// Persona `architecture: false`: no architecture text for this child.
+    pub(crate) omit_architecture: bool,
     /// Exact server -> wire-level tool names granted to this persona. `None`
     /// means no MCP authority; outer-agent connections are never inherited.
     #[cfg(feature = "mcp")]
@@ -1138,6 +1143,8 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
         &std::sync::Arc<crate::extras::js::skills::session::SkillSessionServices>,
     >,
 ) -> Agent<M> {
+    #[cfg(feature = "archmd")]
+    let architecture = architecture.filter(|_| !persona.omit_architecture);
     let mut preamble = build_explore_preamble(
         #[cfg(feature = "archmd")]
         architecture,
@@ -1197,11 +1204,31 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
     captured.instructions = authorization
         .instructions
         .as_ref()
+        .filter(|_| !persona.omit_instructions)
         .map(|service| service.for_protocol(protocol));
     let authorization = &captured;
     if let Some(service) = &authorization.instructions {
+        let overlay = service.initial_overlay();
+        tracing::debug!(
+            instruction_bytes = overlay.len(),
+            "subagent instruction overlay injected"
+        );
         preamble.push_str(crate::context::instructions::POLICY);
-        preamble.push_str(&service.initial_overlay());
+        preamble.push_str(&overlay);
+    }
+    #[cfg(feature = "archmd")]
+    tracing::debug!(
+        architecture_bytes = architecture.map_or(0, str::len),
+        "subagent architecture text injected"
+    );
+
+    // Last in the prompt: the volatile lines must not break the cached prefix.
+    if let Some(workspace) = authorization.workspace() {
+        preamble.push_str(&prompt::environment_block(
+            &workspace.root().display().to_string(),
+            &jiff::Timestamp::now().to_string()[..10],
+            std::env::consts::OS,
+        ));
     }
 
     let tools = persona_tools(
@@ -1286,13 +1313,20 @@ fn build_explore_preamble(
     suffix: Option<&str>,
 ) -> String {
     let mut preamble = String::new();
+    let has_specialization = specialization.is_some_and(|spec| !spec.is_empty());
     if let Some(spec) = specialization
         && !spec.is_empty()
     {
         preamble.push_str(spec);
         preamble.push_str("\n\n---\n\n");
     }
-    preamble.push_str(&prompt::explore_prompt());
+    if has_specialization {
+        preamble.push_str(&prompt::explore_prompt());
+    } else {
+        preamble.push_str(&prompt::without_specialization_note(
+            &prompt::explore_prompt(),
+        ));
+    }
     #[cfg(feature = "archmd")]
     if let Some(arch) = architecture
         && !arch.is_empty()
@@ -2294,6 +2328,21 @@ mod tests {
     }
 
     #[test]
+    fn persona_less_child_is_not_told_about_a_specialization() {
+        for spec in [None, Some("")] {
+            let preamble = build_explore_preamble(
+                #[cfg(feature = "archmd")]
+                None,
+                spec,
+                None,
+            );
+            assert!(!preamble.contains("specialization above"), "{preamble}");
+            assert!(preamble.contains("general investigator"));
+            assert!(preamble.contains("## Non-overridable safety and honesty rules"));
+        }
+    }
+
+    #[test]
     fn specialization_is_the_only_authoritative_persona() {
         let preamble = build_explore_preamble(
             #[cfg(feature = "archmd")]
@@ -3155,6 +3204,8 @@ mod provider_param_tests {
             memory: None,
             hooks: None,
             memory_dir: None,
+            omit_instructions: false,
+            omit_architecture: false,
             #[cfg(feature = "mcp")]
             mcp_servers: None,
         }
