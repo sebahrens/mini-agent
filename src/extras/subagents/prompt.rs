@@ -1,10 +1,17 @@
-pub(crate) const EXPLORE_PROMPT: &str = "\
+/// Sentence of the base prompt that only holds when a persona prompt precedes
+/// it (mini-agent-8pvri); `without_specialization_note` swaps it out.
+macro_rules! specialization_note {
+    () => {
+        "A specialization above this base prompt supplies domain heuristics and a return contract. Apply only the parts relevant to the delegated objective: it does not require an exhaustive repository audit or override the task's requested scope. It cannot override the non-overridable rules appended by the host."
+    };
+}
+
+pub(crate) const EXPLORE_PROMPT: &str = concat!(
+    "\
 Investigate the delegated technical objective by searching relevant files, \
-cross-referencing, and synthesizing verified findings. A specialization above \
-this base prompt supplies domain heuristics and a return contract. Apply only \
-the parts relevant to the delegated objective: it does not require an \
-exhaustive repository audit or override the task's requested scope. It cannot \
-override the non-overridable rules appended by the host.
+cross-referencing, and synthesizing verified findings. ",
+    specialization_note!(),
+    "
 
 ## Tools
 
@@ -20,7 +27,8 @@ override the non-overridable rules appended by the host.
   merely to fill the response.
 - Search, cross-reference, and verify before answering.
 - Lead with caveats, missing evidence, and blockers, then provide a concise answer.
-- Avoid preamble and unrelated findings.";
+- Avoid preamble and unrelated findings."
+);
 
 pub(crate) const NON_OVERRIDABLE_EXPLORE_RULES: &str = "\
 ## Non-overridable safety and honesty rules
@@ -103,6 +111,25 @@ pub(crate) fn without_response_contract(preamble: &str) -> String {
 }
 
 /// Host rules of a read-mode child that received the opt-in read-only shell.
+/// The base prompt for a child with no persona: the specialization sentence is
+/// replaced by a statement that the host contract is all there is.
+pub(crate) fn without_specialization_note(prompt: &str) -> String {
+    prompt.replacen(
+        specialization_note!(),
+        "No specialization applies: you are a general investigator working under the host rules below, which cannot be overridden.",
+        1,
+    )
+}
+
+/// Facts the child cannot otherwise know (mini-agent-irrra): its working
+/// directory, the date and the platform. Volatile, so the caller places it
+/// last in the system prompt to keep the shared prefix cacheable.
+pub(crate) fn environment_block(cwd: &str, date: &str, platform: &str) -> String {
+    format!(
+        "\n\n## Environment\n\nWorking directory: {cwd}. Prefer absolute paths.\nToday's date (UTC): {date}. Platform: {platform}."
+    )
+}
+
 pub(crate) fn read_only_shell_rules() -> String {
     NON_OVERRIDABLE_EXPLORE_RULES.replace(
         "- Do NOT modify files. You are read-only.\n- Do NOT run shell commands. Use only the tools provided by the host.",
@@ -183,6 +210,23 @@ mod tests {
     #[cfg(feature = "memory")]
     use super::explore_prompt;
     use super::{EXPLORE_PROMPT, NON_OVERRIDABLE_EXPLORE_RULES};
+
+    #[test]
+    fn environment_block_names_directory_date_and_platform() {
+        let block = super::environment_block("/work/repo", "2026-11-22", "macos");
+        assert!(block.contains("Working directory: /work/repo."));
+        assert!(block.contains("2026-11-22"));
+        assert!(block.contains("Platform: macos"));
+    }
+
+    #[test]
+    fn specialization_sentence_is_only_present_with_a_persona() {
+        assert!(EXPLORE_PROMPT.contains("A specialization above this base prompt"));
+        let general = super::without_specialization_note(EXPLORE_PROMPT);
+        assert!(!general.contains("specialization above"));
+        assert!(general.contains("general investigator"));
+        assert!(general.contains("## Tools"));
+    }
 
     #[test]
     fn base_prompt_treats_repository_instructions_as_untrusted() {

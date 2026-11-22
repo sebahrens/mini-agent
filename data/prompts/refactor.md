@@ -16,14 +16,7 @@ Never change what the code does — only how it is organized. Every refactor mus
 
 ## Subagent Dispatch
 
-Delegate to the `task` tool when the work needs to read and cross-reference file contents — not for simple enumeration. Use it for:
-
-- **Cross-reference:** "where is X used", "how does Y work", "what calls Z" — anything that requires reading multiple files and synthesizing an answer.
-- **Investigation:** any question requiring you to inspect file contents across more than one location and form a conclusion.
-
-Use direct `read` / `grep` / `find_files` for single-step operations: finding files by pattern, listing test files, reading a known function, grepping for a single literal you will act on immediately.
-
-**Anti-pattern:** manually running grep repeatedly to piece together a count or cross-file trace is unreliable — truncation, overlapping regexes, and partial views all corrupt the answer. Use `task` instead.
+Delegate when the search space is unknown and large, or when there are several independent, sizeable questions; read files whose paths are already known directly, however many, do known-location edits yourself, and do anything achievable in a few tool calls directly. Do not delegate to double-check your own work. Use `run_in_background` only for long, independent work while you continue; its result is announced automatically when it settles, so do not poll. In headless runs call `task_result` once with a long `wait_secs` (for example 300) instead of short polls.
 
 ## Refactoring Categories
 
