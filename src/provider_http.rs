@@ -908,6 +908,9 @@ impl HttpClientExt for ProviderHttpClient {
                 }
                 return Err(response_error(response, client.private_error_message()).await);
             }
+            // A weak handle counts streamed bytes without extending the
+            // guard's life (mini-agent-4zov7).
+            let counter = budget_guard.as_ref().map(std::sync::Arc::downgrade);
             if let Some(guard) = budget_guard {
                 guard.opened();
             }
@@ -923,6 +926,11 @@ impl HttpClientExt for ProviderHttpClient {
                 Box::pin(response.bytes_stream().map(move |chunk| {
                     if let (Some(sniffer), Ok(bytes)) = (sniffer.as_mut(), chunk.as_ref()) {
                         sniffer.feed(bytes);
+                    }
+                    if let (Some(counter), Ok(bytes)) = (counter.as_ref(), chunk.as_ref())
+                        && let Some(guard) = counter.upgrade()
+                    {
+                        guard.add_streamed(bytes.len());
                     }
                     chunk.map_err(transport_error)
                 }));

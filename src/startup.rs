@@ -4143,9 +4143,25 @@ impl Startup {
                     crate::print::HeadlessStopReason::Completed
                 }
             };
+            // A run stopped by a turn or budget limit names the limit in
+            // `stop_detail`, and `result` falls back to that explanation when
+            // the model had written no closing text (mini-agent-qpci0).
+            let stop_detail = if matches!(
+                stop_reason,
+                crate::print::HeadlessStopReason::MaxTurns
+                    | crate::print::HeadlessStopReason::Budget
+            ) {
+                failure.as_ref().map(|error| format!("{error:#}"))
+            } else {
+                None
+            };
             let result_text =
                 if matches!(stop_reason, crate::print::HeadlessStopReason::Interrupted) {
                     crate::print::interrupted_result(&response)
+                } else if response.trim().is_empty()
+                    && let Some(detail) = &stop_detail
+                {
+                    detail.clone()
                 } else {
                     response.to_string()
                 };
@@ -4163,6 +4179,9 @@ impl Startup {
             let mut rendered: serde_json::Value = serde_json::from_str(&rendered)?;
             if let Some(question) = &pending_question {
                 rendered["pending_question"] = serde_json::to_value(question)?;
+            }
+            if let Some(detail) = &stop_detail {
+                rendered["stop_detail"] = detail.clone().into();
             }
             if schema.is_some() {
                 rendered["result_json"] = schema_outcome
@@ -4641,9 +4660,10 @@ pub(crate) async fn run_goal_rounds_for_loop(
         .snapshot()
         .map(|goal| crate::print::HeadlessStopReason::for_goal(goal.status));
     match stop_reason {
-        // A loop reaching its iteration cap is the ordinary end of a loop, not
-        // a failure, and has always exited zero.
-        Some(crate::print::HeadlessStopReason::GoalBudgetLimited) | None => Ok(()),
+        // A loop that spent its iteration cap with the validation still
+        // failing is not done: it exits 24 like a budget-limited goal, so CI
+        // can tell an exhausted loop from a passing one (mini-agent-u0t2v).
+        None => Ok(()),
         Some(reason) if reason.exit_code() == 0 => Ok(()),
         Some(reason) => Err(crate::print::HeadlessGoalExit(reason).into()),
     }
@@ -5684,8 +5704,11 @@ async fn run_headless_goal_rounds_inner(
 
             let RoundOutcome::Relaunch { relaunch, line } = outcome else {
                 if let RoundOutcome::Stopped { line, .. } = outcome
-                    && let Err(error) =
-                        crate::print::headless_stderr_async(format!("{line}\n")).await
+                    && let Err(error) = crate::print::headless_stderr_async(format!(
+                        "{}\n",
+                        driver::headless_line(&line)
+                    ))
+                    .await
                 {
                     turn.failure = Some(error);
                 }

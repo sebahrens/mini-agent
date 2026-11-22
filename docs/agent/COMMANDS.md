@@ -455,7 +455,9 @@ Interrupting during a validator ends the loop cleanly and reports
 `goal: interrupted during verification`; the round's work is saved first, and
 the interrupted round is not counted against the goal. A loop that stops for a
 reason of its own — blocked, waiting on you, or stalled — exits with that
-reason's code rather than reporting success. `/goal status` describes a running loop, and round records
+reason's code rather than reporting success. A loop that spends `--loop-max` iterations without the objective met
+(validator still failing) exits `24` like a budget-limited goal and names `--loop-max` and `--goal-resume` on
+stderr; only a met loop exits `0`. `/goal status` describes a running loop, and round records
 are written under the goal transcript directory rather than a separate one.
 
 `--loop-plan <path>` selects the plan used for both reading progress and the

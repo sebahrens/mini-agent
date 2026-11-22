@@ -3570,3 +3570,17 @@ fn configured_alias_mapping_keeps_raw_mcp_inputs_and_stored_alias_grants_unmodif
         "canonicalizing config keys must not revive an ignored persisted runtime alias grant"
     );
 }
+
+/// mini-agent-j0ea2: read-only mode's always-denied edit tools are not offered.
+#[test]
+fn read_only_mode_marks_edit_tools_as_always_denied() {
+    let readonly = make_checker(SecurityMode::ReadOnly);
+    for tool in ["write", "edit", "notebook_edit"] {
+        assert!(readonly.tool_always_denied(tool), "{tool}");
+    }
+    for tool in ["read", "grep", "shell", "git"] {
+        assert!(!readonly.tool_always_denied(tool), "{tool}");
+    }
+    let standard = make_checker(SecurityMode::Standard);
+    assert!(!standard.tool_always_denied("write"));
+}
