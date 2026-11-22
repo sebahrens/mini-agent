@@ -406,6 +406,7 @@ configured provider endpoints win endpoint environment fallbacks.
 | `GIT_CONFIG_GLOBAL` | Explicit operator Git configuration source. Its bounded include graph is captured before project/model effects; the exact platform null device disables that source. Repository-owned sources cannot grant executable authority. |
 | `EDITOR` | Editor command fallback after config `editor`; otherwise the command is `editor`. |
 | `RUST_LOG` | Standard tracing filter for stderr; explicit `--log-level` wins. File logging remains controlled by `--verbose`/`--log-file`. |
+| `PROCESSOR_IDENTIFIER` | Read on Windows only, to detect an x64 build running under emulation on an ARM64 host; the result is a one-line startup notice pointing to the native ARM64 archive. Set by Windows; not a setting. |
 | `RUST_BACKTRACE` | Set to `1` or `full` to keep the full error report (with backtrace) when `--js-runtime-check` or `--git-runtime-check` fails; otherwise those checks print only the error chain on stderr and exit 1. |
 | `MINI_AGENT_ACP_API_KEY` | ACP TCP authentication key; non-empty environment value wins the `api_key` of the matching `acp_servers` TCP entry. |
 | `MINI_AGENT_ACP_TLS_CERT`, `MINI_AGENT_ACP_TLS_KEY` | ACP TCP TLS certificate/key paths, supplied together; the remote listener requires TLS unless the explicit insecure-remote override below is enabled. |
