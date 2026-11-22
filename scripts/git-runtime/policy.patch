@@ -266,7 +266,23 @@
  
  	/*
  	 * Internally, `_wopen()` uses the `CreateFile()` API with CREATE_NEW,
-@@ -1076,10 +1114,16 @@
+@@ -966,6 +1004,15 @@
+ 		return NULL;
+ 	}
+ 	file = _wfopen(wfilename, wotype);
++	if (!file && errno == EACCES && filename && !strcmp(filename, "/dev/null")) {
++		/* mini-agent: an AppContainer may not open the NUL device by name. */
++		int sink = mingw_open_null_sink(0);
++		if (sink >= 0) {
++			file = _fdopen(sink, otype);
++			if (!file)
++				close(sink);
++		}
++	}
+ 	if (!file && GetLastError() == ERROR_INVALID_NAME)
+ 		errno = ENOENT;
+ 	if (file && hide && set_hidden_flag(wfilename, 1))
+@@ -1076,10 +1123,16 @@
  			errno = err_win_to_posix(GetLastError());
  			return -1;
  		}
@@ -287,7 +303,7 @@
  		}
  		CloseHandle(hnd);
  	}
-@@ -1237,6 +1281,32 @@
+@@ -1237,6 +1290,32 @@
  	return 0;
  }
  
@@ -320,21 +336,21 @@
  int mingw_lstat(const char *file_name, struct stat *buf)
  {
  	WIN32_FILE_ATTRIBUTE_DATA fdata;
-@@ -1279,6 +1349,13 @@
- 		return 0;
- 	}
- 
+@@ -1276,6 +1355,13 @@
+ 		filetime_to_timespec(&(fdata.ftLastAccessTime), &(buf->st_atim));
+ 		filetime_to_timespec(&(fdata.ftLastWriteTime), &(buf->st_mtim));
+ 		filetime_to_timespec(&(fdata.ftCreationTime), &(buf->st_ctim));
++		return 0;
++	}
++
 +	if (GetLastError() == ERROR_ACCESS_DENIED && is_denied_cwd_ancestor(wfilename)) {
 +		memset(buf, 0, sizeof(*buf));
 +		buf->st_nlink = 1;
 +		buf->st_mode = S_IFDIR | 0755;
-+		return 0;
-+	}
-+
- 	switch (GetLastError()) {
- 	case ERROR_ACCESS_DENIED:
- 	case ERROR_SHARING_VIOLATION:
-@@ -1561,10 +1638,20 @@
+ 		return 0;
+ 	}
+ 
+@@ -1561,10 +1647,20 @@
  	if (hnd != INVALID_HANDLE_VALUE) {
  		ret = GetFinalPathNameByHandleW(hnd, wpointer, ARRAY_SIZE(wpointer), 0);
  		CloseHandle(hnd);
@@ -428,3 +444,20 @@
  		strvec_push(&conn->args, cmd.buf);
  
  		if (start_command(conn))
+--- a/builtin/clone.c
++++ b/builtin/clone.c
+@@ -1013,6 +1013,14 @@
+ 
+ 	argc = parse_options(argc, argv, prefix, builtin_clone_options,
+ 			     builtin_clone_usage, 0);
++#ifdef GIT_WINDOWS_NATIVE
++	/*
++	 * mini-agent: hard links between a local source and the clone would
++	 * leave multi-link files in the workspace, which the AppContainer
++	 * launcher refuses to make writable; always copy.
++	 */
++	option_no_hardlinks = 1;
++#endif
+ 
+ 	if (argc > 2)
+ 		usage_msg_opt(_("Too many arguments."),

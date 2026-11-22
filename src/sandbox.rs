@@ -803,18 +803,25 @@ pub(crate) fn powershell_workspace_drive_prelude(root: &str) -> String {
 /// wrapper is ignored: the cmdlet then behaves as it did before.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn powershell_path_proxy_prelude() -> String {
-    concat!(
-        "try { foreach ($__n in 'Remove-Item','Move-Item','Copy-Item','Rename-Item') { ",
-        "$__c = Get-Command $__n -CommandType Cmdlet -ErrorAction Stop; ",
-        "$__m = [System.Management.Automation.CommandMetadata]::new($__c); ",
-        "$__p = [System.Management.Automation.ProxyCommand]; ",
-        "$__fix = 'foreach ($__k in ''Path'',''LiteralPath'',''Destination'') { if ($PSBoundParameters.ContainsKey($__k)) { ",
-        "$PSBoundParameters[$__k] = [string[]]@($PSBoundParameters[$__k] | ForEach-Object { ",
-        "if ([System.IO.Path]::IsPathRooted($_) -or $_ -match ''^[A-Za-z0-9_]+:'') { $_ } else { Join-Path (Get-Location).ProviderPath $_ } }) } }; '; ",
-        "$__b = $__p::GetCmdletBindingAttribute($__m) + ' param(' + $__p::GetParamBlock($__m) + ') begin { ' + $__fix + $__p::GetBegin($__m) + ' } process { ' + $__p::GetProcess($__m) + ' } end { ' + $__p::GetEnd($__m) + ' }'; ",
-        "Set-Item -Path ('function:global:' + $__n) -Value ([scriptblock]::Create($__b)) } } catch {}; "
-    )
-    .to_string()
+    // Rewrites the bound `-Path`, `-LiteralPath` and `-Destination` values in place, keeping each
+    // parameter's own type (`Move-Item -Destination` is a string, `Remove-Item -Path` an array). A
+    // `ws:` value maps onto the drive's root; a rooted or otherwise drive-qualified value is kept.
+    let rewrite = r#"foreach ($__k in 'Path','LiteralPath','Destination') { if ($PSBoundParameters.ContainsKey($__k)) { $__v = $PSBoundParameters[$__k]; $__r = @($__v | ForEach-Object { if ($_ -match '^__WS__:[\\/]*(.*)$') { Join-Path (Get-PSDrive __WS__).Root $Matches[1] } elseif ([System.IO.Path]::IsPathRooted($_) -or $_ -match '^[A-Za-z0-9_]+:') { $_ } else { Join-Path (Get-Location).ProviderPath $_ } }); $PSBoundParameters[$__k] = if ($__v -is [array]) { [string[]]$__r } else { [string]$__r[0] } } }; "#
+        .replace("__WS__", POWERSHELL_WORKSPACE_DRIVE)
+        .replace('\'', "''");
+    let mut prelude = String::from(
+        "try { foreach ($__n in 'Remove-Item','Move-Item','Copy-Item','Rename-Item') { \
+         $__c = Get-Command $__n -CommandType Cmdlet -ErrorAction Stop; \
+         $__m = [System.Management.Automation.CommandMetadata]::new($__c); \
+         $__p = [System.Management.Automation.ProxyCommand]; \
+         $__fix = '",
+    );
+    prelude.push_str(&rewrite);
+    prelude.push_str(
+        "'; $__b = $__p::GetCmdletBindingAttribute($__m) + ' param(' + $__p::GetParamBlock($__m) + ') begin { ' + $__fix + $__p::GetBegin($__m) + ' } process { ' + $__p::GetProcess($__m) + ' } end { ' + $__p::GetEnd($__m) + ' }'; \
+         Set-Item -Path ('function:global:' + $__n) -Value ([scriptblock]::Create($__b)) } } catch {}; ",
+    );
+    prelude
 }
 
 /// Statements binding `git` and `git.exe` to the bundled Git executable at `exe`.

@@ -21,7 +21,7 @@ import tarfile
 import tempfile
 
 SOURCE_SHA256 = "26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3"
-PATCH_SHA256 = "fcf92383f917e3057e00de6132f9b70ff20d47b7f89e7fea98980f16250042e2"
+PATCH_SHA256 = "5cf43fd6f1bab0b4fec5042d20a662e9e0f056431de1a00edd026569d4954ae2"
 POLICY = "mini-agent-executable-scope-v3-env"
 TARGETS = (
     "x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu",
