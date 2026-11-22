@@ -301,7 +301,7 @@ class GitRuntimeCiTests(unittest.TestCase):
             self.assertIn(package, self.action)
         self.assertIn("shell: msys2 {0}", self.action)
         self.assertIn("/usr/bin/python3 scripts/build-git-runtime-windows.py", self.action)
-        self.assertEqual(self.action.count("scripts/build-git-runtime-windows.py"), 1)
+        self.assertEqual(self.action.count("/usr/bin/python3 scripts/build-git-runtime-windows.py"), 1)
         self.assertIn("set -euo pipefail", self.action)
         self.assertIn('test -s "$owned/bundle/bundle.manifest"', self.action)
         self.assertIn('bundle=$(/usr/bin/cygpath -am "$owned/bundle")', self.action)
