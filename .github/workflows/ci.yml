@@ -1129,6 +1129,41 @@ jobs:
           fi
           cargo test --locked ${{ matrix.features }} "$filter" -- --test-threads=1
 
+  # Native Windows ARM64 compile gate (mini-agent-nvnkx.143). The release
+  # workflow ships an aarch64-pc-windows-msvc archive, so the default-feature
+  # suite and the CLANGARM64 guarded Git runtime must keep compiling on a
+  # windows-11-arm runner. Compile only: the runtime checks run in the release
+  # build-windows/archive-smoke jobs.
+  windows-arm64-compile:
+    if: needs.changes.outputs.code == 'true' && github.event_name != 'schedule' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox') && needs.changes.outputs.windows == 'true'
+    needs: changes
+    runs-on: windows-11-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Prepare guarded Git runtime
+        uses: ./.github/actions/prepare-git-runtime
+        with:
+          target: aarch64-pc-windows-msvc
+
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        run: echo "key=${RUNNER_OS}-${RUNNER_ARCH}-${ImageOS:-unknown}-default" >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          rustflags: ''
+          target: aarch64-pc-windows-msvc
+          cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-on-failure: true
+
+      - name: Compile the Windows ARM64 default feature suite
+        shell: bash
+        run: cargo test --locked --no-run
+
   linux-sandbox-policy:
     if: needs.changes.outputs.code == 'true' && (github.event_name != 'workflow_dispatch' || inputs.scope != 'windows-general-sandbox')
     needs: changes
@@ -3505,6 +3540,7 @@ jobs:
       - parallel-test-smoke
       - windows-default-compile
       - windows-hooks-compile
+      - windows-arm64-compile
       - linux-sandbox-policy
       - macos-worker-containment-gate
       - windows-worker-launcher-unit

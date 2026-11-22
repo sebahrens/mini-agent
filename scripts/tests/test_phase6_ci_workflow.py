@@ -894,6 +894,32 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("-- --list", run_step)
         self.assertIn('-lt 1', run_step)
 
+    def test_windows_arm64_compiles_natively_and_gates_ci_success(self) -> None:
+        # mini-agent-nvnkx.143: the release ships aarch64-pc-windows-msvc, so
+        # the default-feature suite and the CLANGARM64 Git runtime must compile
+        # on a native windows-11-arm runner under the same scope rules as the
+        # other Windows compile jobs.
+        body = job_body(self.workflow, "windows-arm64-compile")
+        header = body.split("    steps:\n", 1)[0]
+        self.assertIn("runs-on: windows-11-arm", header)
+        self.assertIn("needs: changes", header)
+        self.assertIn("timeout-minutes:", header)
+        self.assertNotIn("continue-on-error", header)
+        self.assertIn("needs.changes.outputs.windows == 'true'", header)
+        condition = re.search(r"(?m)^    if: (.*)$", header).group(1)
+        hooks = job_body(self.workflow, "windows-hooks-compile")
+        hooks_condition = re.search(r"(?m)^    if: (.*)$", hooks).group(1)
+        self.assertEqual(hooks_condition, condition)
+        prepare = body.split("uses: ./.github/actions/prepare-git-runtime", 1)[1].split("- name:", 1)[0]
+        self.assertIn("target: aarch64-pc-windows-msvc", prepare)
+        rust = body.split("- name: Install Rust\n", 1)[1].split("- name:", 1)[0]
+        self.assertIn("target: aarch64-pc-windows-msvc", rust)
+        self.assertLess(body.index("prepare-git-runtime"), body.index("cargo test"))
+        self.assertIn("cargo test --locked --no-run", body)
+        self.assertNotIn("--release", body)
+        aggregate = self.workflow.split("\n  ci-success:\n", 1)[1]
+        self.assertIn("      - windows-arm64-compile\n", aggregate)
+
     def test_parallel_smoke_runs_the_default_suite_unserialised_on_linux_and_macos(
         self,
     ) -> None:
