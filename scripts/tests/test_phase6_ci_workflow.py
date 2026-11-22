@@ -186,6 +186,14 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     rust,
                 )
                 self.assertNotRegex(rust, r"(?m)^          cache: false")
+                # Pull requests restore main's caches and never save their own.
+                save_if = re.search(r"(?m)^          cache-save-if: (.*)$", rust)
+                self.assertIsNotNone(save_if, f"{name} must declare cache-save-if")
+                self.assertTrue(
+                    save_if.group(1) == '"false"'
+                    or save_if.group(1).startswith("${{ github.ref == 'refs/heads/main'"),
+                    save_if.group(1),
+                )
 
     def test_containment_gates_stay_uncached_for_clean_room_evidence(self) -> None:
         for name in self.CLEAN_ROOM_CONTAINMENT_JOBS:
