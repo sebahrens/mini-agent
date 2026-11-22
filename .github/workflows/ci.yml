@@ -499,6 +499,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
 
       - name: Run Clippy (${{ matrix.features }})
         if: steps.fp.outputs.skip != 'true'
@@ -619,6 +622,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
 
       - name: Show the toolchain in use
         if: steps.fp.outputs.skip != 'true'
@@ -738,6 +744,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
 
       - name: Run Clippy (--all-features)
         if: steps.fp.outputs.skip != 'true'
@@ -828,6 +837,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
       - name: Test the default suite with the standard parallel runner
         if: steps.fp.outputs.skip != 'true'
         run: cargo test --locked
@@ -883,6 +895,9 @@ jobs:
         with:
           rustflags: ''
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
       # Runtime policy is sharded into the Windows path, private-storage,
       # process-lifecycle, launcher, sandbox, and containment jobs below. The
       # full libtest also contains Unix-only integration fixtures, so this gate
@@ -1093,6 +1108,9 @@ jobs:
         with:
           rustflags: ''
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
       # bash, not the default pwsh: PowerShell turns an unquoted
       # `hooks,advisor,...` into an array and passes each name separately.
       - name: Compile the Windows hooks feature suite (${{ matrix.features }})
@@ -2773,8 +2791,24 @@ jobs:
         shell: bash
         run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
+      # Each feature row compiles a different dependency graph, so it gets its
+      # own cache key; without it the four rows of one OS share a key and fight
+      # over a single reservation (mini-agent-4tq4t). ImageOS keeps runner
+      # images apart.
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_ROW: ${{ matrix.feature.name }}
+        run: |
+          slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-platform-paths-${slug:-default}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-on-failure: true
 
       - name: Test deterministic and real platform path acceptance
         shell: bash
@@ -3170,6 +3204,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
 
       - name: Test MCP stdio lifecycle and ACP startup cancellation
         if: steps.fp.outputs.skip != 'true'
@@ -3233,6 +3270,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
 
       - name: Test Windows atomic publication and sharing contracts
         if: matrix.os == 'windows-latest' && steps.fp.outputs.skip != 'true'
