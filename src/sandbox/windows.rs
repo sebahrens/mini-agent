@@ -564,6 +564,53 @@ impl Drop for AclMutationGuard {
     }
 }
 
+/// How long a session waits for other sessions' production preflights to finish: a full
+/// preflight is bounded by about 50 s, so this admits several queued sessions while still
+/// failing closed on a wedged holder.
+const PREFLIGHT_SERIAL_WAIT: Duration = Duration::from_secs(300);
+const PREFLIGHT_SERIAL_MUTEX_NAME: &str = "Global\\mini-agent-general-sandbox-preflight-v1";
+
+/// Cross-process owner-only mutex serialising the production preflight. It is always taken
+/// before the ACL-mutation and profile-control mutexes (never while holding either), so it
+/// cannot deadlock with them; an abandoned holder (a killed session) releases it.
+struct PreflightSerialGuard(Handle);
+
+impl PreflightSerialGuard {
+    fn acquire(deadline: Instant) -> Result<Self, String> {
+        let name = wide_string(PREFLIGHT_SERIAL_MUTEX_NAME);
+        let mut security =
+            OwnerOnlyKernelSecurity::new(MUTEX_ALL_ACCESS, "production-preflight mutex")?;
+        let attributes = security.attributes();
+        let mutex = Handle::created(
+            unsafe { CreateMutexW(&attributes, 0, name.as_ptr()) },
+            "open cross-process production-preflight mutex",
+        )?;
+        attest_owner_only_kernel_object(
+            mutex.raw(),
+            security.user_sid(),
+            MUTEX_ALL_ACCESS,
+            "production-preflight mutex",
+        )?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let wait_ms = remaining.as_millis().clamp(1, u32::MAX as u128) as u32;
+        match unsafe { WaitForSingleObject(mutex.raw(), wait_ms) } {
+            WAIT_OBJECT_0 | WAIT_ABANDONED_0 => Ok(Self(mutex)),
+            WAIT_TIMEOUT => {
+                Err("sandbox: timed out waiting for another session's production preflight".into())
+            }
+            _ => Err(last_error(
+                "wait for cross-process production-preflight mutex",
+            )),
+        }
+    }
+}
+
+impl Drop for PreflightSerialGuard {
+    fn drop(&mut self) {
+        unsafe { ReleaseMutex(self.0.raw()) };
+    }
+}
+
 struct ProfileControlGuard(Handle);
 
 impl ProfileControlGuard {
@@ -873,7 +920,20 @@ fn general_sandbox_preflight_observed(
 ) -> &'static Result<(), String> {
     cached_general_sandbox_availability(&GENERAL_SANDBOX_AVAILABLE, || {
         let started = Instant::now();
-        let result = run_production_preflight(diagnostics);
+        // Resolve the PATH toolchains in the background while the preflight runs, so the first
+        // shell launch does not pay for walking the candidate trees.
+        let _ = std::thread::Builder::new()
+            .name("windows-toolchain-discovery".into())
+            .spawn(|| {
+                let _ = discovered_toolchain_roots();
+            });
+        // Concurrent sessions run one production preflight at a time: each one grants and revokes
+        // ACEs on the shared executable and attests that none survived, and overlapping runs
+        // raced that attestation (an ACE appeared to survive a clean exit).
+        let result = match PreflightSerialGuard::acquire(Instant::now() + PREFLIGHT_SERIAL_WAIT) {
+            Ok(_serial) => run_production_preflight(diagnostics),
+            Err(error) => Err(error),
+        };
         let reason = result
             .as_ref()
             .err()
@@ -1995,9 +2055,13 @@ fn recover_verified_preflight_profiles(cache: &Path, deadline: Instant) -> Resul
 
 /// What a model-shell launch adds to the container beyond the explicit roots.
 #[derive(Clone, Copy)]
-pub(crate) struct ShellLaunchOptions {
-    /// Grant read/execute on the host `PATH` toolchains (`windows_toolchains`).
+pub(crate) struct ShellLaunchOptions<'a> {
+    /// Grant read/execute on the host `PATH` toolchains (`windows_toolchains`) that
+    /// [`Self::command`] names.
     pub(crate) toolchain_discovery: bool,
+    /// The shell script being launched; only the toolchains it names are granted, because each
+    /// grant costs one ACE write and one revoke per object below the root on every launch.
+    pub(crate) command: &'a str,
 }
 
 pub(crate) fn build_shell_helper(
@@ -2011,7 +2075,7 @@ pub(crate) fn build_shell_helper(
     configured_write_roots: &[PathBuf],
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
     extra_env: &[(String, String)],
-    shell_options: Option<ShellLaunchOptions>,
+    shell_options: Option<ShellLaunchOptions<'_>>,
 ) -> Result<tokio::process::Command, String> {
     let program = resolve_program(shell, cwd)?;
     let arguments = prefix_args
@@ -2172,7 +2236,7 @@ fn build_helper_configured(
     configured_write_roots: &[PathBuf],
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
     extra_env: &[(String, String)],
-    shell_options: Option<ShellLaunchOptions>,
+    shell_options: Option<ShellLaunchOptions<'_>>,
 ) -> Result<tokio::process::Command, String> {
     build_helper_with_ready_roots_and_env(
         program,
@@ -2286,8 +2350,8 @@ impl LaunchRequest {
     /// into the read-root set. The proposals never overlap a writable root, the workspace, the
     /// application cache or its private control root, so the closed explicit-root policy is
     /// re-validated over the merged set and any conflict stays a hard error.
-    fn add_toolchain_read_roots(&mut self) -> Result<(), String> {
-        let proposed = discovered_toolchain_roots();
+    fn add_toolchain_read_roots(&mut self, command: &str) -> Result<(), String> {
+        let proposed = windows_toolchains::mentioned_roots(discovered_toolchain_roots(), command);
         if proposed.is_empty() {
             return Ok(());
         }
@@ -2296,7 +2360,7 @@ impl LaunchRequest {
         excluded.extend(private_control_root_candidate(&self.cache).ok());
         excluded.extend(self.write_roots.iter().cloned());
         excluded.extend(self.configured_write_roots.iter().cloned());
-        let mut optional: Vec<PathBuf> = windows_toolchains::without_overlaps(proposed, &excluded)
+        let mut optional: Vec<PathBuf> = windows_toolchains::without_overlaps(&proposed, &excluded)
             .into_iter()
             .filter(|root| !self.configured_read_roots.contains(root))
             .filter(|root| reject_remote_access_path(root).is_ok())
@@ -2329,8 +2393,8 @@ impl LaunchRequest {
 }
 
 /// The proposed toolchain roots of this process, resolved once from the host `PATH`.
-fn discovered_toolchain_roots() -> &'static [PathBuf] {
-    static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+fn discovered_toolchain_roots() -> &'static [windows_toolchains::Toolchain] {
+    static ROOTS: OnceLock<Vec<windows_toolchains::Toolchain>> = OnceLock::new();
     ROOTS.get_or_init(|| {
         windows_toolchains::DiscoveryEnvironment::from_process()
             .map(|mut environment| {
@@ -2378,7 +2442,7 @@ fn build_helper_with_ready_roots_and_env(
     workspace: Option<&Path>,
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
     extra_env: &[(String, String)],
-    shell_options: Option<ShellLaunchOptions>,
+    shell_options: Option<ShellLaunchOptions<'_>>,
 ) -> Result<tokio::process::Command, String> {
     let mut request = prepare_launch_request(
         program,
@@ -2394,7 +2458,7 @@ fn build_helper_with_ready_roots_and_env(
         // Only model-shell launches get the PATH toolchains and the NUL device.
         request.null_device = true;
         if options.toolchain_discovery {
-            request.add_toolchain_read_roots()?;
+            request.add_toolchain_read_roots(options.command)?;
         }
     }
     request.extra_env = extra_env.to_vec();

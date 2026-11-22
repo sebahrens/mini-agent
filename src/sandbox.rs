@@ -4797,6 +4797,7 @@ impl Sandbox {
                 &self.shell_env_extra(),
                 Some(windows::ShellLaunchOptions {
                     toolchain_discovery: self.windows_toolchain_discovery,
+                    command,
                 }),
             )
             .map(ExecutionCommand::appcontainer_helper);

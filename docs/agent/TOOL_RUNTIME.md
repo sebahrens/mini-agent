@@ -133,7 +133,9 @@ Interpreters and build tools installed outside `Program Files` (a runner tool
 cache, `C:\Python312`, a Chocolatey or Scoop directory) are on `PATH` but are not
 readable by the container. Unless `windows-appcontainer-toolchain-discovery` is
 `false`, the shell grants read and execute (never write) on the install
-directory of each well-known command the host `PATH` resolves, within the size
+directory of each well-known command the host `PATH` resolves that the launched command
+names (each grant writes and revokes one ACE per object below the root, so a command that
+uses no toolchain pays nothing), within the size
 and exclusion rules documented in `docs/agent/CONFIG.md` (the same idea as
 `sandbox-toolchain-roots` on Linux). The grant is best effort per root: a root
 whose DACL the user cannot change is skipped, never an error. A failed command

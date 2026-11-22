@@ -266,9 +266,105 @@ fn judge(
     Ok(entries)
 }
 
+/// A proposed read/execute root and the command words that make a launch need it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Toolchain {
+    pub(crate) root: PathBuf,
+    /// Lower-case command stems (`python`, `pip`, `pytest`, ...) of the executables in the
+    /// `PATH` directory the root was resolved from, and of the root itself.
+    triggers: Vec<String>,
+}
+
+/// Upper bound on trigger words kept per toolchain.
+const MAX_TRIGGERS: usize = 1024;
+
+fn executable_stem(name: &str, extensions: &[String]) -> Option<String> {
+    let lowered = name.to_ascii_lowercase();
+    for extension in extensions {
+        if let Some(stem) = lowered.strip_suffix(&extension.to_ascii_lowercase())
+            && !stem.is_empty()
+        {
+            return Some(stem.to_string());
+        }
+    }
+    // Extensionless launchers (`npm`, `pip3`) are commands too.
+    (!lowered.contains('.') && !lowered.is_empty()).then_some(lowered)
+}
+
+fn collect_triggers(directory: &Path, extensions: &[String], into: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if into.len() >= MAX_TRIGGERS {
+            return;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_file())
+            && let Some(stem) = executable_stem(&entry.file_name().to_string_lossy(), extensions)
+            && !into.contains(&stem)
+        {
+            into.push(stem);
+        }
+    }
+}
+
+/// Command words of a shell script: split at whitespace and shell punctuation, reduced to the
+/// final path component without its executable suffix, lower-cased.
+pub(crate) fn command_words(script: &str) -> Vec<String> {
+    script
+        .split(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    ';' | '&'
+                        | '|'
+                        | '('
+                        | ')'
+                        | '<'
+                        | '>'
+                        | '"'
+                        | '\''
+                        | '='
+                        | ','
+                        | '`'
+                        | '{'
+                        | '}'
+                )
+        })
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let trimmed = word.trim_end_matches(['\\', '/']);
+            let leaf = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
+            let lowered = leaf.to_ascii_lowercase();
+            [".exe", ".cmd", ".bat", ".com", ".ps1"]
+                .iter()
+                .find_map(|suffix| lowered.strip_suffix(suffix))
+                .map(str::to_string)
+                .unwrap_or(lowered)
+        })
+        .collect()
+}
+
+/// The roots of the toolchains `script` names: a launch only pays for the grants its command
+/// can use. A command that reaches a tool indirectly (`make test` running Python) names none of
+/// them; the failure note then points at `windows-appcontainer-read-roots`.
+pub(crate) fn mentioned_roots(toolchains: &[Toolchain], script: &str) -> Vec<PathBuf> {
+    let words = command_words(script);
+    toolchains
+        .iter()
+        .filter(|toolchain| {
+            toolchain
+                .triggers
+                .iter()
+                .any(|trigger| words.iter().any(|word| word == trigger))
+        })
+        .map(|toolchain| toolchain.root.clone())
+        .collect()
+}
+
 /// The read/execute roots to propose, deduplicated and without nested entries. Each root is a
 /// canonical directory; nothing here touches an ACL.
-pub(crate) fn discover(environment: &DiscoveryEnvironment) -> Vec<PathBuf> {
+pub(crate) fn discover(environment: &DiscoveryEnvironment) -> Vec<Toolchain> {
     discover_within(
         environment,
         MAX_DISCOVERED_ROOT_ENTRIES,
@@ -280,8 +376,8 @@ fn discover_within(
     environment: &DiscoveryEnvironment,
     root_limit: usize,
     total_limit: usize,
-) -> Vec<PathBuf> {
-    let mut proposed: Vec<(PathBuf, usize)> = Vec::new();
+) -> Vec<Toolchain> {
+    let mut proposed: Vec<(Toolchain, usize)> = Vec::new();
     for name in TOOLCHAIN_COMMANDS {
         let Some(executable) = resolve_on_path(name, &environment.path, &environment.extensions)
         else {
@@ -295,7 +391,7 @@ fn discover_within(
         };
         if proposed
             .iter()
-            .any(|(known, _)| same_or_inside(&directory, known))
+            .any(|(known, _)| same_or_inside(&directory, &known.root))
         {
             continue;
         }
@@ -303,7 +399,7 @@ fn discover_within(
             // A broader accepted root replaces the narrower ones it contains.
             let replaced: usize = proposed
                 .iter()
-                .filter(|(known, _)| same_or_inside(known, &directory))
+                .filter(|(known, _)| same_or_inside(&known.root, &directory))
                 .map(|(_, count)| count)
                 .sum();
             let total: usize = proposed.iter().map(|(_, count)| count).sum();
@@ -315,8 +411,28 @@ fn discover_within(
         });
         match verdict {
             Ok(entries) => {
-                proposed.retain(|(known, _)| !same_or_inside(known, &directory));
-                proposed.push((directory, entries));
+                // A broader root also answers to the commands of the narrower ones it absorbs.
+                let mut triggers = vec![(*name).to_string()];
+                for (known, _) in proposed
+                    .iter()
+                    .filter(|(known, _)| same_or_inside(&known.root, &directory))
+                {
+                    triggers.extend(known.triggers.iter().cloned());
+                }
+                proposed.retain(|(known, _)| !same_or_inside(&known.root, &directory));
+                if let Some(path_directory) = executable.parent() {
+                    collect_triggers(path_directory, &environment.extensions, &mut triggers);
+                }
+                collect_triggers(&directory, &environment.extensions, &mut triggers);
+                triggers.sort();
+                triggers.dedup();
+                proposed.push((
+                    Toolchain {
+                        root: directory,
+                        triggers,
+                    },
+                    entries,
+                ));
             }
             Err(reason) => {
                 tracing::debug!(
@@ -330,9 +446,12 @@ fn discover_within(
             break;
         }
     }
-    let mut roots: Vec<PathBuf> = proposed.into_iter().map(|(root, _)| root).collect();
-    roots.sort();
-    roots
+    let mut toolchains: Vec<Toolchain> = proposed
+        .into_iter()
+        .map(|(toolchain, _)| toolchain)
+        .collect();
+    toolchains.sort_by(|left, right| left.root.cmp(&right.root));
+    toolchains
 }
 
 /// The proposals that overlap none of `excluded` (the workspace, the application cache and its
@@ -353,6 +472,24 @@ pub(crate) fn without_overlaps(proposed: &[PathBuf], excluded: &[PathBuf]) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn roots(environment: &DiscoveryEnvironment) -> Vec<PathBuf> {
+        discover(environment)
+            .into_iter()
+            .map(|toolchain| toolchain.root)
+            .collect()
+    }
+
+    fn roots_within(
+        environment: &DiscoveryEnvironment,
+        root_limit: usize,
+        total_limit: usize,
+    ) -> Vec<PathBuf> {
+        discover_within(environment, root_limit, total_limit)
+            .into_iter()
+            .map(|toolchain| toolchain.root)
+            .collect()
+    }
 
     struct Fixture {
         root: PathBuf,
@@ -399,7 +536,7 @@ mod tests {
         let fixture = Fixture::new();
         let python = fixture.tool("tools/python312", "python");
         let environment = fixture.environment(std::slice::from_ref(&python));
-        assert_eq!(discover(&environment), vec![python]);
+        assert_eq!(roots(&environment), vec![python]);
     }
 
     #[test]
@@ -408,7 +545,7 @@ mod tests {
         let scripts = fixture.tool("tools/python312/Scripts", "pip");
         let root = scripts.parent().unwrap().to_path_buf();
         let environment = fixture.environment(&[scripts]);
-        assert_eq!(discover(&environment), vec![root]);
+        assert_eq!(roots(&environment), vec![root]);
     }
 
     #[test]
@@ -416,11 +553,11 @@ mod tests {
         let fixture = Fixture::new();
         let ruby_bin = fixture.tool("tools/ruby33/bin", "ruby");
         let ruby_root = ruby_bin.parent().unwrap().to_path_buf();
-        assert_eq!(discover(&fixture.environment(&[ruby_bin])), vec![ruby_root]);
+        assert_eq!(roots(&fixture.environment(&[ruby_bin])), vec![ruby_root]);
         let cargo_bin = fixture.tool("home/me/.cargo/bin", "cargo");
         let mut environment = fixture.environment(std::slice::from_ref(&cargo_bin));
         environment.home = Some(fixture.canonical().join("elsewhere"));
-        assert_eq!(discover(&environment), vec![cargo_bin]);
+        assert_eq!(roots(&environment), vec![cargo_bin]);
     }
 
     #[test]
@@ -429,7 +566,7 @@ mod tests {
         let python = fixture.tool("tools/python312", "python");
         let scripts = fixture.tool("tools/python312/Scripts", "pip");
         let environment = fixture.environment(&[scripts, python.clone()]);
-        assert_eq!(discover(&environment), vec![python]);
+        assert_eq!(roots(&environment), vec![python]);
     }
 
     #[test]
@@ -437,7 +574,7 @@ mod tests {
         let fixture = Fixture::new();
         let other = fixture.tool("tools/other", "curl");
         let environment = fixture.environment(&[other]);
-        assert!(discover(&environment).is_empty());
+        assert!(roots(&environment).is_empty());
     }
 
     #[test]
@@ -448,9 +585,9 @@ mod tests {
         let mut environment = fixture.environment(&[windows, node.clone()]);
         environment.protected_roots = vec![fixture.canonical().join("Windows")];
         // An explicit all-packages ACE keeps the readable tree out; without one it is proposed.
-        assert_eq!(discover(&environment), vec![node.clone()]);
+        assert_eq!(roots(&environment), vec![node.clone()]);
         environment.already_readable = Some(|path| path.ends_with("nodejs"));
-        assert!(discover(&environment).is_empty());
+        assert!(roots(&environment).is_empty());
     }
 
     #[test]
@@ -459,10 +596,10 @@ mod tests {
         let home = fixture.tool("home/me", "python");
         let mut environment = fixture.environment(std::slice::from_ref(&home));
         environment.home = Some(home);
-        assert!(discover(&environment).is_empty());
+        assert!(roots(&environment).is_empty());
         let ancestor = fixture.tool("home", "node");
         assert!(
-            discover(&fixture.environment(&[ancestor])).is_empty(),
+            roots(&fixture.environment(&[ancestor])).is_empty(),
             "an ancestor of the home directory contains it"
         );
     }
@@ -472,7 +609,7 @@ mod tests {
         let fixture = Fixture::new();
         let tools = fixture.tool("tools/mixed", "python");
         std::fs::create_dir(tools.join(".ssh")).unwrap();
-        assert!(discover(&fixture.environment(&[tools])).is_empty());
+        assert!(roots(&fixture.environment(&[tools])).is_empty());
     }
 
     #[test]
@@ -481,7 +618,7 @@ mod tests {
         let roaming = fixture.tool("home/me/AppData/Roaming", "node");
         let mut environment = fixture.environment(&[roaming]);
         environment.home = None;
-        assert!(discover(&environment).is_empty());
+        assert!(roots(&environment).is_empty());
     }
 
     #[test]
@@ -547,8 +684,8 @@ mod tests {
         }
         let environment = fixture.environment(&[node.clone(), python.clone()]);
         // Each tree holds 7 entries: both fit in 20, only the first listed command fits in 10.
-        assert_eq!(discover_within(&environment, 100, 20).len(), 2);
-        assert_eq!(discover_within(&environment, 100, 10), vec![python]);
+        assert_eq!(roots_within(&environment, 100, 20).len(), 2);
+        assert_eq!(roots_within(&environment, 100, 10), vec![python]);
     }
 
     #[test]
@@ -562,7 +699,7 @@ mod tests {
         {
             directories.push(fixture.tool(&format!("t{index}"), name));
         }
-        let proposed = discover(&fixture.environment(&directories));
+        let proposed = roots(&fixture.environment(&directories));
         assert_eq!(proposed.len(), MAX_DISCOVERED_ROOTS);
     }
 
@@ -574,6 +711,52 @@ mod tests {
         let relative = PathBuf::from("relative-tools");
         environment.path =
             std::env::join_paths([PathBuf::new(), relative, python.clone()]).expect("joinable");
-        assert_eq!(discover(&environment), vec![python]);
+        assert_eq!(roots(&environment), vec![python]);
+    }
+
+    #[test]
+    fn command_words_reduce_to_lower_case_command_stems() {
+        assert_eq!(
+            command_words(
+                "C:\\Python312\\Python.EXE -m pytest tests/ && npm.cmd test; (node x.js)"
+            ),
+            [
+                "python", "-m", "pytest", "tests", "npm", "test", "node", "x.js"
+            ]
+        );
+        assert_eq!(
+            command_words("FOO=1 ./run.sh|tee"),
+            ["foo", "1", "run.sh", "tee"]
+        );
+        assert!(command_words("   ").is_empty());
+    }
+
+    #[test]
+    fn only_the_toolchains_a_command_names_are_granted() {
+        let fixture = Fixture::new();
+        let python = fixture.tool("tools/python312", "python");
+        std::fs::write(python.join("pytest"), b"x").unwrap();
+        let node = fixture.tool("tools/node", "node");
+        let environment = fixture.environment(&[python.clone(), node.clone()]);
+        let toolchains = discover(&environment);
+        assert_eq!(toolchains.len(), 2);
+        assert_eq!(
+            mentioned_roots(&toolchains, "Get-ChildItem"),
+            Vec::<PathBuf>::new()
+        );
+        assert_eq!(
+            mentioned_roots(&toolchains, "python -V"),
+            vec![python.clone()]
+        );
+        // A tool that only lives in the same directory also names its toolchain.
+        assert_eq!(
+            mentioned_roots(&toolchains, "pytest -x"),
+            vec![python.clone()]
+        );
+        let mut both = mentioned_roots(&toolchains, "node a.js; python b.py");
+        both.sort();
+        let mut expected = vec![python, node];
+        expected.sort();
+        assert_eq!(both, expected);
     }
 }
