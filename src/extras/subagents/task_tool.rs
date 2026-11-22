@@ -3148,6 +3148,15 @@ impl ChildPlan {
             let continuation_retry = config.retry.clone();
             let continuation_events = event_tx.clone();
             let evidence_ids = evidence_enabled.then(|| evidence.len());
+            let child_stop = if run.deadline_exceeded {
+                "deadline"
+            } else if run.turn_budget_exhausted {
+                "turn_budget"
+            } else if run.response.is_err() {
+                "failed"
+            } else {
+                "completed"
+            };
             let finished = finish_child_run_with(
                 run,
                 || task_budget.exhausted(),
@@ -3199,7 +3208,9 @@ impl ChildPlan {
                 }
                 _ => None,
             };
+            let (child_turns, child_tool_calls) = (child_details.turns, child_details.tool_calls);
             details_sink.record(child_details);
+            let (repair_used, writeup_used) = (finished.repair_used, finished.writeup_used);
             let violations = finished.response.as_ref().ok().map(|response| {
                 finished
                     .known_violations
@@ -3212,6 +3223,16 @@ impl ChildPlan {
             let withheld = match (&finished.response, &violations) {
                 (Ok(response), Some(v)) => report_withheld_by_host(response, v),
                 _ => false,
+            };
+            let contract_outcome = match &violations {
+                _ if report_policy.free_form => super::telemetry::ContractOutcome::Plain,
+                Some(v) if v.is_empty() && repair_used => {
+                    super::telemetry::ContractOutcome::Repaired
+                }
+                Some(v) if v.is_empty() => super::telemetry::ContractOutcome::Pass,
+                Some(_) if withheld => super::telemetry::ContractOutcome::Unstructured,
+                Some(_) => super::telemetry::ContractOutcome::Normalized,
+                None => super::telemetry::ContractOutcome::None,
             };
             let output = finished.response.map(|response| {
                 enforce_validated_report_contract(
@@ -3329,6 +3350,28 @@ impl ChildPlan {
                 let total = report_ledgers.iter().fold(Usage::new(), |sum, ledger| {
                     usage_saturating_add(sum, ledger.total())
                 });
+                super::telemetry::record(
+                    pool.session_id(),
+                    super::telemetry::ChildTelemetry {
+                        agent: report_name.to_string(),
+                        contract: contract_outcome,
+                        repair_used,
+                        host_replaced: matches!(
+                            contract_outcome,
+                            super::telemetry::ContractOutcome::Normalized
+                                | super::telemetry::ContractOutcome::Unstructured
+                        ),
+                        writeup_used,
+                        stop: child_stop,
+                        turns: child_turns,
+                        tool_calls: child_tool_calls,
+                        input_tokens: total.input_tokens,
+                        output_tokens: total.output_tokens,
+                        cached_input_tokens: total.cached_input_tokens,
+                        total_tokens: total.total_tokens,
+                        cost_units,
+                    },
+                );
                 if total.has_values() {
                     super::record_child_usage(pool.session_id(), &report_name, total.into());
                 }
@@ -3512,6 +3555,10 @@ struct FinishedChild {
     /// Contract violations of `response`, when it was validated.
     known_violations: Option<Vec<&'static str>>,
     details: ChildDetails,
+    /// The contract repair turn ran (mini-agent-964ao).
+    repair_used: bool,
+    /// A tool-free write-up turn ran (turn budget, deadline, empty final).
+    writeup_used: bool,
 }
 
 /// Complete a child's run: write up an exhausted turn budget, then repair a
@@ -3604,6 +3651,8 @@ where
         unverified: None,
         evidence: None,
     };
+    let mut repair_used = false;
+    let mut writeup_used = false;
     if (run.turn_budget_exhausted || run.deadline_exceeded) && run.response.is_ok() {
         let mut written_up = false;
         let mut narration = run.response.clone().unwrap_or_default();
@@ -3627,6 +3676,7 @@ where
             let writeup =
                 continue_tool_free(Continuation::WriteUp, prompt, run.history.clone()).await;
             run.usage = usage_saturating_add(run.usage, writeup.usage);
+            writeup_used = true;
             if let Ok(text) = writeup.response
                 && !text.trim().is_empty()
             {
@@ -3658,6 +3708,7 @@ where
         )
         .await;
         run.usage = usage_saturating_add(run.usage, writeup.usage);
+        writeup_used = true;
         if let Ok(text) = writeup.response
             && !text.trim().is_empty()
         {
@@ -3683,6 +3734,7 @@ where
                 std::mem::take(&mut run.history),
             )
             .await;
+            repair_used = true;
             run.usage = usage_saturating_add(run.usage, repair.usage);
             let (selected, selected_violations) = select_repaired_report_with_violations(
                 response,
@@ -3711,6 +3763,8 @@ where
         response: run.response,
         known_violations,
         details,
+        repair_used,
+        writeup_used,
     }
 }
 

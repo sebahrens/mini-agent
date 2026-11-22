@@ -817,6 +817,15 @@ task_unverified_bytes`, default 6 KiB, at most 16 KiB) is kept for the user:
 `/tasks result <id>` prints it marked unverified. Neither the log nor the raw
 text is part of `task_result` output or any other model-visible text.
 
+Each finished child also records delegation telemetry for the session (kept for
+at most 256 children; later ones are only counted): how its final text stood
+against the contract (`pass`, `repaired`, `normalized`, `unstructured`, `plain`),
+whether the repair or a write-up turn ran, its stop reason (`completed`,
+`turn_budget`, `deadline`, `failed`), turns, tool calls, tokens, cached input
+tokens and cost units. A headless JSON result aggregates it as
+`subagent_delegation` next to `subagent_usage`. The delegated-versus-direct lane
+that consumes it is described in [HARNESS_EVAL.md](HARNESS_EVAL.md).
+
 ### Evidence handles
 
 With `task_evidence = true` (the default), the host also records every tool

@@ -21,6 +21,7 @@ pub(crate) mod prompt;
 pub(crate) mod read_only_shell;
 pub(crate) mod resume;
 pub(crate) mod task_tool;
+pub(crate) mod telemetry;
 
 #[derive(Clone)]
 pub(crate) struct SubagentConfig {

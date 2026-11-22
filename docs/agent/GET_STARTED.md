@@ -584,7 +584,7 @@ The object is the first and only line on stdout. `duration_ms` is the wall clock
 multi-turn stream-json run, since the previous `result`), `num_turns` counts the provider rounds in
 the run's transcript (assistant messages; 0 when no model round ran, such as an explicit `!command`
 or a preflight failure), and `is_error` is `true` for every `stop_reason` other than `completed`
-(a met goal, `goal_met`, is not an error). `usage` and the cost include delegated `task` children, listed per child in `subagent_usage`; `total_cost_usd` repeats `cost` under Claude Code's
+(a met goal, `goal_met`, is not an error). `usage` and the cost include delegated `task` children, listed per child in `subagent_usage`, with a `subagent_delegation` object beside it (children run, `contract_pass`/`contract_repaired`/`contract_normalized`/`contract_unstructured`, `repair_used`, `host_replaced`, `writeup_used`, `stopped_turn_budget`/`stopped_deadline`/`failed`, turns, tool calls, tokens, cached tokens, cost units, and one row per child); `total_cost_usd` repeats `cost` under Claude Code's
 result-message name; `cost` stays. `usage` and `cost` cover the turn's requests and
 an automatic compaction that ran before the turn. `result` is the text of the turn's final
 completion: text the agent wrote before a tool call is saved as its own message in the session but
