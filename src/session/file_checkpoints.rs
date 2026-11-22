@@ -66,8 +66,8 @@ impl Limits {
     }
 }
 /// Whether this platform can publish a checked replacement or retirement of a
-/// workspace file. Windows has no compare-and-replace primitive (see
-/// `paths::exchange_relative`), so file rewind is refused there; capturing
+/// workspace file. Windows can replace (see `paths::exchange_relative`) but has
+/// no checked retirement, so file rewind is refused there; capturing
 /// preimages that can never be restored would only consume the session limits.
 pub(crate) const FILE_RESTORE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
 static LIMITS: std::sync::RwLock<Limits> = std::sync::RwLock::new(Limits::DEFAULT);

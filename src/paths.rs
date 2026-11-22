@@ -1282,24 +1282,50 @@ fn rename_no_replace_relative(
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows exchange: see [`crate::fs::windows_exchange_open_file_relative`] for
+/// the guarantee and the residual window (the target name is briefly absent).
+#[cfg(windows)]
+fn exchange_relative(
+    directory: &cap_std::fs::Dir,
+    replacement: &OsStr,
+    target: &OsStr,
+) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let directory = directory.try_clone()?.into_std_file();
+    let new = crate::fs::windows_open_leaf_relative(
+        &directory,
+        replacement,
+        DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
+    crate::fs::windows_exchange_open_file_relative(&directory, &new, replacement, target)
+}
+
+#[cfg(windows)]
+fn rename_no_replace_relative(
+    directory: &cap_std::fs::Dir,
+    source: &OsStr,
+    target: &OsStr,
+) -> io::Result<()> {
+    let directory = directory.try_clone()?.into_std_file();
+    crate::fs::windows_rename_no_replace_relative(&directory, source, target)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn exchange_relative(
     _directory: &cap_std::fs::Dir,
     _replacement: &OsStr,
     _target: &OsStr,
 ) -> io::Result<()> {
-    // Windows rename APIs can replace or refuse an existing name, but cannot
-    // condition replacement on that name still identifying `expected`.
-    // Oplocks coordinate breaks; they do not add that compare operand. Keep
-    // existing-file writes closed until Windows exposes an equivalent atomic
-    // name exchange or compare-and-replace operation.
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "atomic compare-and-replace is unsupported on this platform",
     ))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 fn rename_no_replace_relative(
     _directory: &cap_std::fs::Dir,
     _source: &OsStr,
@@ -2125,6 +2151,204 @@ mod windows_workspace_binding_tests {
         drop(raced_identity);
         drop(expected);
         drop(binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    fn residue(root: &Path) -> Vec<String> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".mini-agent-") || name.starts_with(".zswrite"))
+            .collect()
+    }
+
+    fn capture(
+        root: &Path,
+        name: &str,
+    ) -> (
+        WorkspaceBinding,
+        crate::fs::CheckedMetadata,
+        crate::fs::ContentDigest,
+    ) {
+        let binding = WorkspaceBinding::capture(root).unwrap();
+        let file = binding.open_relative(Path::new(name)).unwrap();
+        let expected = crate::fs::checked_file_metadata(&file).unwrap();
+        drop(file);
+        let base = crate::fs::ContentDigest::of(&std::fs::read(root.join(name)).unwrap());
+        (binding, expected, base)
+    }
+
+    #[test]
+    fn checked_replace_publishes_an_unchanged_file_and_keeps_crlf() {
+        let root = temp_root("replace-ok");
+        std::fs::write(root.join("report.py"), b"count = 0\r\nprint(count)\r\n").unwrap();
+        let (binding, expected, base) = capture(&root, "report.py");
+
+        binding
+            .replace_relative_atomic_expecting(
+                Path::new("report.py"),
+                b"count = 1\r\nprint(count)\r\n",
+                &expected,
+                &base,
+            )
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join("report.py")).unwrap(),
+            b"count = 1\r\nprint(count)\r\n"
+        );
+        assert!(residue(&root).is_empty(), "{:?}", residue(&root));
+        drop(binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checked_replace_refuses_content_changed_after_the_read() {
+        let root = temp_root("replace-stale");
+        std::fs::write(root.join("a.txt"), b"before").unwrap();
+        let (binding, expected, base) = capture(&root, "a.txt");
+        std::fs::write(root.join("a.txt"), b"edited elsewhere").unwrap();
+
+        let error = binding
+            .replace_relative_atomic_expecting(Path::new("a.txt"), b"agent", &expected, &base)
+            .expect_err("a file changed after the read must not be replaced");
+
+        assert_eq!(
+            std::fs::read(root.join("a.txt")).unwrap(),
+            b"edited elsewhere"
+        );
+        assert!(!error.to_string().is_empty());
+        assert!(residue(&root).is_empty(), "{:?}", residue(&root));
+        drop(binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checked_replace_rolls_back_a_rewrite_after_the_last_check() {
+        let root = temp_root("replace-rewrite");
+        let target = root.join("a.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let (binding, expected, base) = capture(&root, "a.txt");
+
+        let result = binding.replace_relative_atomic_with_hook(
+            Path::new("a.txt"),
+            b"agent",
+            &expected,
+            Some(&base),
+            || std::fs::write(&target, b"concurrent editor").unwrap(),
+        );
+
+        assert!(
+            result.is_err(),
+            "an in-place rewrite must not be overwritten"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"concurrent editor");
+        assert!(residue(&root).is_empty(), "{:?}", residue(&root));
+        drop(binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checked_replace_refuses_a_name_swapped_for_a_symlink() {
+        let root = temp_root("replace-link");
+        let target = root.join("a.txt");
+        let outside = root.join("outside.txt");
+        std::fs::write(&target, b"before").unwrap();
+        std::fs::write(&outside, b"outside").unwrap();
+        let (binding, expected, base) = capture(&root, "a.txt");
+
+        let result = binding.replace_relative_atomic_with_hook(
+            Path::new("a.txt"),
+            b"agent",
+            &expected,
+            Some(&base),
+            || {
+                std::fs::remove_file(&target).unwrap();
+                // Needs the symlink privilege or developer mode; the swap is
+                // still refused without it because the name then holds a
+                // different file.
+                if std::os::windows::fs::symlink_file(&outside, &target).is_err() {
+                    std::fs::write(&target, b"other file").unwrap();
+                }
+            },
+        );
+
+        assert!(result.is_err(), "a swapped name must not be replaced");
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+        assert!(std::fs::symlink_metadata(&target).is_ok());
+        assert!(residue(&root).is_empty(), "{:?}", residue(&root));
+        drop(binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checked_replace_refuses_a_file_held_open_for_writing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = temp_root("replace-held");
+        let target = root.join("a.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let (binding, expected, base) = capture(&root, "a.txt");
+        // Another program that keeps the file open for writing (sharing
+        // everything) is a concurrent writer the exchange must not race.
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(7)
+            .open(&target)
+            .unwrap();
+
+        let result = binding.replace_relative_atomic_expecting(
+            Path::new("a.txt"),
+            b"agent",
+            &expected,
+            &base,
+        );
+
+        drop(writer);
+        assert!(
+            result.is_err(),
+            "a concurrently open writer must block publication"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"before");
+        assert!(residue(&root).is_empty(), "{:?}", residue(&root));
+        drop(binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn no_replace_rename_refuses_an_existing_name() {
+        let root = temp_root("no-replace");
+        std::fs::write(root.join("src.txt"), b"source").unwrap();
+        std::fs::write(root.join("dst.txt"), b"existing").unwrap();
+        let directory =
+            cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()).unwrap();
+
+        let error = super::rename_no_replace_relative(
+            &directory,
+            std::ffi::OsStr::new("src.txt"),
+            std::ffi::OsStr::new("dst.txt"),
+        )
+        .expect_err("an occupied name must not be replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists, "{error}");
+        assert_eq!(std::fs::read(root.join("dst.txt")).unwrap(), b"existing");
+        assert_eq!(std::fs::read(root.join("src.txt")).unwrap(), b"source");
+
+        super::rename_no_replace_relative(
+            &directory,
+            std::ffi::OsStr::new("src.txt"),
+            std::ffi::OsStr::new("free.txt"),
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(root.join("free.txt")).unwrap(), b"source");
+        assert!(!root.join("src.txt").exists());
+
+        let missing = super::rename_no_replace_relative(
+            &directory,
+            std::ffi::OsStr::new("absent.txt"),
+            std::ffi::OsStr::new("other.txt"),
+        )
+        .expect_err("a missing source is NotFound");
+        assert_eq!(missing.kind(), std::io::ErrorKind::NotFound, "{missing}");
+        drop(directory);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

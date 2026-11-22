@@ -14,7 +14,7 @@ use super::CredentialReport;
 pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 /// Upper bound for one `tool --version` probe through the sandbox.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_DETAIL_CHARS: usize = 240;
+const MAX_DETAIL_CHARS: usize = 400;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Outcome {
@@ -50,9 +50,32 @@ fn bounded(text: impl AsRef<str>) -> String {
     out
 }
 
+/// Windows canonicalisation returns the `\\?\` verbatim spelling of a plain path;
+/// strip it, unify separators, and compare drive-letter paths case-insensitively
+/// so the same file is not reported as a symlink.
+fn same_executable_path(invoked: &Path, canonical: &Path) -> bool {
+    if invoked == canonical {
+        return true;
+    }
+    let normalize = |path: &Path| {
+        let text = path.to_string_lossy().replace('/', "\\");
+        let text = match text.strip_prefix(r"\\?\UNC\") {
+            Some(rest) => format!(r"\\{rest}"),
+            None => text.strip_prefix(r"\\?\").unwrap_or(&text).to_string(),
+        };
+        let drive = text.as_bytes().get(1) == Some(&b':');
+        if drive {
+            text.to_ascii_lowercase()
+        } else {
+            text
+        }
+    };
+    normalize(invoked) == normalize(canonical)
+}
+
 /// Warn when the invoked executable path differs from its canonical path.
 pub(crate) fn install_layout(invoked: &Path, canonical: &Path) -> Outcome {
-    if invoked == canonical {
+    if same_executable_path(invoked, canonical) {
         Outcome::Pass(format!("launched from {}", invoked.display()))
     } else {
         Outcome::Warn(bounded(format!(
@@ -267,6 +290,19 @@ pub(crate) async fn run_all(
         )
         .with_bwrap_read_roots(cli.resolve_sandbox_toolchain_roots(cfg))
         .with_workspace_binding(workspace);
+    // Doctor is read-only: run the sandboxed probes against a throwaway cache
+    // rather than creating `<cache>/sandbox-runtime` in the user's profile.
+    let scratch = std::env::temp_dir().join(format!(
+        "mini-agent-doctor-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    ));
+    let sandbox = match sandbox.clone().with_ephemeral_cache_dir(&scratch) {
+        Ok(pinned) => pinned,
+        Err(_) => sandbox,
+    };
     let probe = sandbox.clone();
     let matrix = tokio::time::timeout(
         CHECK_TIMEOUT,
@@ -302,6 +338,7 @@ pub(crate) async fn run_all(
     if cli.tool_is_eligible(cfg, "js") {
         checks.push(Check::of("js worker", js_worker().await));
     }
+    let _ = std::fs::remove_dir_all(&scratch);
     checks
 }
 
@@ -383,6 +420,20 @@ mod tests {
             panic!("{linked:?}")
         };
         assert!(text.contains("/c/bin/mini-agent") && text.contains("symlink"));
+    }
+
+    #[test]
+    fn verbatim_prefix_and_case_do_not_count_as_a_symlink() {
+        let plain = Path::new(r"D:\a\_temp\ma\bin\mini-agent.exe");
+        let verbatim = Path::new(r"\\?\d:\a\_temp\ma\bin\mini-agent.exe");
+        assert!(matches!(install_layout(plain, verbatim), Outcome::Pass(_)));
+        let unc = Path::new(r"\\?\UNC\host\share\mini-agent.exe");
+        assert!(same_executable_path(
+            Path::new(r"\\host\share\mini-agent.exe"),
+            unc
+        ));
+        let other = Path::new(r"\\?\D:\elsewhere\mini-agent.exe");
+        assert!(matches!(install_layout(plain, other), Outcome::Warn(_)));
     }
 
     #[test]

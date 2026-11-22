@@ -1486,6 +1486,15 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
                 ask_tx.clone(),
             ) {
                 Ok(tool) => base_tools.push(Box::new(tool)),
+                Err(error)
+                    if sandbox.policy() != crate::sandbox::SandboxPolicy::RequiredAndAvailable =>
+                {
+                    // The structured tool runs Git only inside the sandbox (mini-agent-hrlqc).
+                    tracing::warn!(
+                        %error,
+                        "structured Git tool unavailable: it needs the sandbox, which is not active (--no-sandbox); run git through the shell tool"
+                    );
+                }
                 Err(error) => tracing::warn!(%error, "structured Git tool unavailable"),
             }
         }

@@ -2037,6 +2037,78 @@ fn guarded_runtime_dir_of(program: &Path) -> Option<PathBuf> {
         .find(|protected| protected == dir)
 }
 
+/// Judge the contained Git probe (`git rev-parse --git-dir`, which resolves the working
+/// directory first). Git exiting 128 with "not a git repository" proves the executable, its
+/// DLL closure and the working directory all work in the container; the workspace need not be
+/// a repository. Upstream Git resolves the working directory with
+/// `GetFinalPathNameByHandleW(VOLUME_NAME_DOS)`, which an AppContainer is denied, and fails
+/// with "Unable to read current working directory": that is reported by name instead of an
+/// opaque exit code, and the tool is not offered because every operation would fail.
+#[cfg(any(test, feature = "git-worktree"))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn classify_git_probe(exit_code: Option<i32>, stderr: &str) -> Result<(), String> {
+    if exit_code == Some(0) {
+        return Ok(());
+    }
+    if stderr.contains("Unable to read current working directory") {
+        return Err(
+            "the guarded Git cannot resolve its working directory inside the Windows \
+             AppContainer (Git calls GetFinalPathNameByHandleW with a DOS volume name, which \
+             the container is denied); the structured git tool is unavailable until the \
+             bundled Git carries a fallback, use git through the shell tool"
+                .to_string(),
+        );
+    }
+    if exit_code == Some(128) && stderr.contains("not a git repository") {
+        return Ok(());
+    }
+    let sanitized: String = stderr
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(160)
+        .collect();
+    Err(format!(
+        "bound Windows AppContainer Git probe was rejected (exit_code={}){}",
+        exit_code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+        if sanitized.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", sanitized.trim())
+        }
+    ))
+}
+
+/// Regular files directly inside the guarded runtime `directory`, sorted and
+/// bounded; links and subdirectories are never granted.
+#[cfg(any(test, feature = "git-worktree"))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn runtime_file_roots(directory: &Path) -> Vec<PathBuf> {
+    const MAX_RUNTIME_FILES: usize = 64;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    files.truncate(MAX_RUNTIME_FILES);
+    files
+}
+
+/// `configured` with each runtime file appended once.
+#[cfg(any(test, feature = "git-worktree"))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn with_runtime_read_roots(configured: &[PathBuf], runtime_files: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = configured.to_vec();
+    for file in runtime_files {
+        if !roots.contains(&file) {
+            roots.push(file);
+        }
+    }
+    roots
+}
+
 /// The workspace Git metadata binds for a bubblewrap launch rooted at the
 /// canonical `workspace_root`; unsupported descriptor binding denies launch.
 fn bwrap_git_metadata_binds(
@@ -4474,6 +4546,20 @@ impl Sandbox {
             .as_ref()
     }
 
+    /// Pin this sandbox's runtime cache to `dir` (created private) instead of
+    /// the application cache. Read-only diagnostics use an ephemeral directory
+    /// so a sandboxed probe never creates `sandbox-runtime` in the user's cache.
+    pub(crate) fn with_ephemeral_cache_dir(self, dir: &Path) -> Result<Self, String> {
+        crate::fs::ensure_private_directory(dir).map_err(|error| error.to_string())?;
+        crate::fs::ensure_private_directory(&dir.join("tmp")).map_err(|error| error.to_string())?;
+        let canonical = dir.canonicalize().map_err(|error| error.to_string())?;
+        *self
+            .cached_cache_dir
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(canonical));
+        Ok(self)
+    }
+
     /// Test seam: pin this sandbox's cache directory without touching the
     /// process-global `ZS_CACHE_DIR`, which concurrent readers would observe.
     #[cfg(test)]
@@ -5359,6 +5445,21 @@ impl Sandbox {
         Ok(cmd)
     }
 
+    /// Configured AppContainer read roots plus, when `program` lives in the
+    /// guarded Git runtime, every file of that runtime directory. The payload is
+    /// flat: git.exe loads its DLL closure and helpers from beside itself. The
+    /// files carry protected private DACLs, so a grant on the directory is not
+    /// inherited and the container is otherwise granted only the executable;
+    /// without per-file grants the launch fails with 0xC0000135/0xC0000022.
+    #[cfg(any(test, feature = "git-worktree"))]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn git_service_read_roots(&self, program: &Path) -> Vec<PathBuf> {
+        let runtime_files = guarded_runtime_dir_of(program)
+            .map(|dir| runtime_file_roots(&dir))
+            .unwrap_or_default();
+        with_runtime_read_roots(&self.windows_appcontainer_read_roots, runtime_files)
+    }
+
     #[cfg(any(test, feature = "git-worktree"))]
     pub(crate) fn wrap_git_workspace_service(
         &self,
@@ -5378,13 +5479,14 @@ impl Sandbox {
             let cwd = canonical_non_root(workspace.root(), "workspace-service working directory")?;
             let cache_dir = self.get_cached_cache_dir()?;
             self.retain_canonical_git_write_roots(&cwd)?;
+            let read_roots = self.git_service_read_roots(program);
             return windows::build_git_direct_helper(
                 program,
                 args,
                 &cwd,
                 &cwd,
                 &cache_dir,
-                &self.windows_appcontainer_read_roots,
+                &read_roots,
                 &self.windows_appcontainer_write_roots,
             )
             .map(ExecutionCommand::appcontainer_helper)
@@ -5450,13 +5552,14 @@ impl Sandbox {
             let cache_dir = self
                 .get_cached_cache_dir()
                 .map_err(|_| "application cache is unavailable".to_string())?;
+            let read_roots = self.git_service_read_roots(program);
             return windows::verify_git_direct_command(
                 program,
                 args,
                 workspace.root(),
                 workspace.root(),
                 &cache_dir,
-                &self.windows_appcontainer_read_roots,
+                &read_roots,
                 &self.windows_appcontainer_write_roots,
             );
         }
@@ -11630,6 +11733,46 @@ mod sandbox_tests {
             )
             .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
+    }
+
+    #[test]
+    fn git_probe_classification_names_the_getcwd_failure() {
+        assert!(classify_git_probe(Some(0), "").is_ok());
+        assert!(
+            classify_git_probe(Some(128), "fatal: not a git repository (or any parent)\n").is_ok()
+        );
+        let cwd = classify_git_probe(
+            Some(128),
+            "fatal: Unable to read current working directory: No such file or directory\n",
+        )
+        .unwrap_err();
+        assert!(cwd.contains("GetFinalPathNameByHandleW") && cwd.contains("shell tool"));
+        let other = classify_git_probe(Some(-1073741515), "").unwrap_err();
+        assert!(other.ends_with("(exit_code=-1073741515)"));
+        let noisy = classify_git_probe(Some(1), "boom\n\u{1b}[31mred").unwrap_err();
+        assert!(!noisy.contains('\n') && !noisy.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn git_service_read_roots_grant_each_runtime_file_once() {
+        let (_scratch, root) = canonical_scratch();
+        std::fs::write(root.join("git.exe"), b"x").unwrap();
+        std::fs::write(root.join("libcurl.dll"), b"x").unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        let files = runtime_file_roots(&root);
+        assert_eq!(files, vec![root.join("git.exe"), root.join("libcurl.dll")]);
+        let configured = vec![PathBuf::from("configured"), root.join("git.exe")];
+        let roots = with_runtime_read_roots(&configured, files.clone());
+        assert_eq!(
+            roots,
+            vec![
+                PathBuf::from("configured"),
+                root.join("git.exe"),
+                root.join("libcurl.dll")
+            ]
+        );
+        assert_eq!(with_runtime_read_roots(&roots, files), roots);
+        assert!(runtime_file_roots(&root.join("missing")).is_empty());
     }
 
     #[cfg(unix)]

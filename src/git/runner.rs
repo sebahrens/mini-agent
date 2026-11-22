@@ -294,7 +294,7 @@ impl GitRunner {
         self.validate()?;
         sandbox.verify_git_workspace_service_capability(
             self.program.as_path(),
-            &["--version".to_string()],
+            &["rev-parse".to_string(), "--git-dir".to_string()],
             workspace,
         )
     }

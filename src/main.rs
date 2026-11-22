@@ -597,7 +597,10 @@ async fn run_one_shot(
         OneShot::JsRuntimeCheck => {
             let workspace = env.workspace.clone();
             git::global_snapshot::wait_initialized().await;
-            startup::heap_future(|| extras::js::verify_runtime(workspace)).await?;
+            if let Err(error) = startup::heap_future(|| extras::js::verify_runtime(workspace)).await
+            {
+                return self_check_failed(error);
+            }
             println!("JS runtime check: PASS (2)");
             Ok(())
         }
@@ -675,10 +678,14 @@ async fn run_one_shot(
                 )
                 .with_bwrap_read_roots(cli.resolve_sandbox_toolchain_roots(cfg))
                 .with_workspace_binding(workspace.clone());
-            let verification =
-                startup::heap_future(|| git::tool::GitTool::verify_runtime(workspace, sandbox))
-                    .await
-                    .map_err(anyhow::Error::msg)?;
+            let verification = match startup::heap_future(|| {
+                git::tool::GitTool::verify_runtime(workspace, sandbox)
+            })
+            .await
+            {
+                Ok(verification) => verification,
+                Err(error) => return self_check_failed(anyhow::Error::msg(error)),
+            };
             println!("Git runtime check: PASS ({})", verification["operation"]);
             Ok(())
         }
@@ -698,6 +705,22 @@ async fn run_one_shot(
             Ok(())
         }
     }
+}
+
+/// A failed `--js-runtime-check` / `--git-runtime-check` prints its error chain
+/// on stderr and exits 1, without the stack trace Rust appends to an `Error:` returned
+/// from `main`; those lines are for a person reading why a capability is
+/// unavailable. `RUST_BACKTRACE=1` or `full` keeps the full report.
+#[cfg(any(feature = "js", feature = "git-worktree"))]
+fn self_check_failed(error: anyhow::Error) -> anyhow::Result<()> {
+    if matches!(
+        std::env::var("RUST_BACKTRACE").as_deref(),
+        Ok("1") | Ok("full")
+    ) {
+        return Err(error);
+    }
+    eprintln!("Error: {error:#}");
+    std::process::exit(1);
 }
 
 /// Run the verification-only `--*-check` flags that need nothing but the

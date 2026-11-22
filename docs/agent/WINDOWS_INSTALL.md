@@ -77,3 +77,13 @@ configuration. Verify that the MSI installs without elevation, a new PowerShell 
 If VS Code is installed for that user, confirm the mini-agent extension appears in the Extensions
 view. Uninstall from **Installed apps** and confirm a new PowerShell no longer resolves
 `mini-agent.exe`.
+
+## Supported install locations for the JavaScript tool
+
+The `js` tool starts only when `mini-agent.exe` sits in a supported location: under
+`%USERPROFILE%` or `%LOCALAPPDATA%` (the per-user MSI default), `%CARGO_HOME%\bin` (default
+`%USERPROFILE%\.cargo\bin`), a cargo `target\debug` or `target\release` directory, `%TEMP%`/`%TMP%`,
+or Program Files, ProgramData and the Windows directory (machine-wide installs). Anywhere else, such as
+`cargo install --root D:\tools`, the startup warning, `--js-runtime-check` and `--doctor` report
+`<path> is not a supported install location for the JavaScript tool`. Copy the executable to one of
+these locations; the check is a containment gate and is not bypassed.

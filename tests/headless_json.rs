@@ -79,7 +79,11 @@ fn doctor_cli_is_read_only_with_missing_invalid_and_configured_credentials_and_n
         text.contains("fingerprint:") && text.contains("credential source:"),
         "{text}"
     );
-    assert_eq!(std::fs::read_dir(&root.0).unwrap().count(), 0);
+    let created: Vec<_> = std::fs::read_dir(&root.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert!(created.is_empty(), "doctor created {created:?}");
 
     // Seed through the ordinary private writer, including the native Windows
     // ACL; doctor itself must never create or repair this file.

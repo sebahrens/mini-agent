@@ -3342,6 +3342,15 @@ mod feasibility {
                 "worker-preflight executable is not an exact file".to_string(),
             ));
         }
+        // The helper rejects this same classification (stage AclPath, exit code 100), which
+        // surfaces only as an opaque exit code. Explain the refusal here without relaxing it.
+        if matches!(helper_command, PreflightHelperCommand::Production)
+            && classify_install_location(&executable) == InstallLocation::Unsupported
+        {
+            return Err(GateError(
+                crate::sandbox::worker::unsupported_install_location_message(&executable),
+            ));
+        }
         let mutation = crate::sandbox::windows::AclMutationGuard::acquire_until(run_deadline)
             .map_err(|error| GateError(format!("serialize worker preflight ACL: {error}")))?;
         let image_lock = lock_executable_image(&executable)?;

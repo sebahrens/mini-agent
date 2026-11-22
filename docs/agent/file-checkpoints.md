@@ -60,9 +60,9 @@ Existing files use the same checked atomic replacement as native tools. Created
 files are moved into an exclusively-created private sibling retirement directory,
 validated there, and deleted only if their identity and content still match.
 A raced foreign object is retained and create-only rollback never overwrites a
-newer file. Windows has no atomic compare-and-replace primitive (see
-`paths::exchange_relative`), so checked workspace replacement/retirement is
-unsupported there: file rewind is refused up front, no preimages are captured (the
+newer file. Windows has no atomic name exchange; `paths::exchange_relative` emulates
+checked replacement there with handle-bound moves (the target name is briefly absent),
+but checked retirement (`retire_relative_expecting`) is still unsupported, so file rewind is refused up front, no preimages are captured (the
 first edit says so once), and conversation-only rewind remains available.
 
 `/rewind` also offers **Restore unchanged files only**: every selected file whose

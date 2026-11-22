@@ -2198,24 +2198,34 @@ pub(crate) fn verify_git_direct_command(
         configured_read_roots,
         configured_write_roots,
     )?;
+    // Git's own stderr is the only closed diagnostic kept: it is bounded, sanitized, and read
+    // from a parent-owned file that is removed again; the child never receives a path to it.
+    let diagnostics = cache.join(format!(
+        "git-probe-{}-{}.txt",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    ));
+    let stderr = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&diagnostics)
+        .map_err(|error| format!("sandbox: create Git probe diagnostics: {error}"))?;
     command
         .as_std_mut()
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::from(stderr));
     let started = Instant::now();
     let run_deadline = started + GENERAL_PREFLIGHT_RUN_TIMEOUT;
     let cleanup_deadline = run_deadline + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT;
-    let outcome = run_bounded_preflight_helper(&mut command, run_deadline, cleanup_deadline, None)?;
-    if outcome.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "bound Windows AppContainer Git probe was rejected (exit_code={})",
-            outcome
-                .code()
-                .map_or_else(|| "unknown".to_string(), |code| code.to_string())
-        ))
-    }
+    let outcome = run_bounded_preflight_helper(&mut command, run_deadline, cleanup_deadline, None);
+    let text = std::fs::read(&diagnostics)
+        .map(|bytes| String::from_utf8_lossy(&bytes[..bytes.len().min(2048)]).into_owned())
+        .unwrap_or_default();
+    let _ = std::fs::remove_file(&diagnostics);
+    let outcome = outcome?;
+    crate::sandbox::classify_git_probe(outcome.code(), &text)
 }
 
 fn build_helper(

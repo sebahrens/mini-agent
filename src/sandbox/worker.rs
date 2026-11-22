@@ -299,6 +299,20 @@ pub(crate) fn containment_status() -> WorkerContainmentStatus {
     ProductionWorkerLauncher.containment_status()
 }
 
+/// The preflight diagnostic for an executable outside every supported Windows
+/// install location. It names the rejected path (without the `\\?\` verbatim
+/// prefix) and the accepted locations, instead of a bare helper exit code.
+#[cfg_attr(not(all(windows, feature = "js")), allow(dead_code))]
+pub(crate) fn unsupported_install_location_message(executable: &std::path::Path) -> String {
+    let shown = executable.to_string_lossy();
+    let shown = shown.strip_prefix(r"\\?\").unwrap_or(&shown);
+    format!(
+        "{shown} is not a supported install location for the JavaScript tool; install it under \
+         %LOCALAPPDATA%, %USERPROFILE%, %CARGO_HOME%\\bin, %TEMP% or Program Files \
+         (docs/agent/WINDOWS_INSTALL.md)"
+    )
+}
+
 /// Observe only an already completed full preflight. This never starts or waits
 /// for a probe and cannot upgrade an unverified runtime to available.
 #[cfg(feature = "js")]
@@ -898,6 +912,24 @@ fn child_stderr_file(pipe: std::process::ChildStderr) -> File {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn unsupported_install_location_message_names_path_and_locations() {
+        let message = super::unsupported_install_location_message(std::path::Path::new(
+            r"\\?\D:\a\_temp\ma\bin\mini-agent.exe",
+        ));
+        assert!(message.starts_with(r"D:\a\_temp\ma\bin\mini-agent.exe is not"));
+        assert!(!message.contains(r"\\?\"));
+        for needle in [
+            "%LOCALAPPDATA%",
+            "%CARGO_HOME%",
+            "Program Files",
+            "WINDOWS_INSTALL.md",
+        ] {
+            assert!(message.contains(needle), "{needle}");
+        }
+        assert!(message.chars().count() < 260);
+    }
     use super::*;
     use std::io::{BufRead, BufReader};
 
