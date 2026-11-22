@@ -30,12 +30,15 @@ PROFILES = {
     "x86_64-pc-windows-msvc": {
         "msystem": "UCRT64", "prefix": "/ucrt64", "compiler": "gcc", "machine": 0x8664,
         "triples": frozenset({"x86_64-w64-mingw32"}), "arch": "AMD64",
-        "package_prefix": "mingw-w64-ucrt-x86_64",
+        "package_prefix": "mingw-w64-ucrt-x86_64", "powershell_timeout": 30,
     },
     "aarch64-pc-windows-msvc": {
         "msystem": "CLANGARM64", "prefix": "/clangarm64", "compiler": "clang", "machine": 0xAA64,
         "triples": frozenset({"aarch64-w64-windows-gnu", "aarch64-w64-mingw32"}), "arch": "ARM64",
         "package_prefix": "mingw-w64-clang-aarch64",
+        # The MSYS2 userland on Windows ARM64 is x64 under emulation; its first PowerShell/.NET
+        # start measured well above 30 s on hosted runners.
+        "powershell_timeout": 300,
     },
 }
 # Windows 10+ system contracts only. Every other import must be bundled.
@@ -102,7 +105,7 @@ def validate_cache_acl(record: dict) -> None:
         seen.add(rule["sid"])
 
 
-def private_directory(path: Path, env: dict[str, str]) -> None:
+def private_directory(path: Path, env: dict[str, str], timeout: int = 30) -> None:
     # Reject MSYS symlinks before invoking native APIs; native reparse points
     # are independently rejected after opening the actual Windows path.
     if path.is_symlink() or (path.exists() and not stat.S_ISDIR(path.lstat().st_mode)):
@@ -116,7 +119,7 @@ def private_directory(path: Path, env: dict[str, str]) -> None:
         raise ValueError("Windows cache security paths are unavailable")
     security_env = env.copy()
     security_env["MINI_AGENT_GIT_BUILD_DIRECTORY"] = windows_path
-    response = subprocess.run([powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PRIVATE_CACHE_SCRIPT], env=security_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=True)
+    response = subprocess.run([powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PRIVATE_CACHE_SCRIPT], env=security_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=True)
     if len(response.stdout) > 16384:
         raise ValueError("Native cache security record exceeds bound")
     validate_cache_acl(json.loads(response.stdout))
@@ -326,9 +329,9 @@ def bootstrap(*, output: Path, source_archive: Path, policy_patch: Path, cache_r
     require_pcre2_header(toolchain_prefix, env, target)
     cache_root = cache_root.absolute()
     cache_root.parent.mkdir(parents=True, exist_ok=True)
-    private_directory(cache_root, env)
+    private_directory(cache_root, env, profile["powershell_timeout"])
     native_cache = cache_root / target
-    private_directory(native_cache, env)
+    private_directory(native_cache, env, profile["powershell_timeout"])
     # Fresh build only: CI provisions the compiler and DLLs explicitly. No cache
     # can retain an obsolete dependency package across a toolchain update.
     # Every build owns fresh staging; no shared cached artifact is consumed,
