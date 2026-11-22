@@ -5703,7 +5703,13 @@ async fn run_headless_goal_rounds_inner(
                         cfg.resolve_keep_recent_tool_results(),
                     )
                 }
-                driver::HistoryMode::Empty => std::sync::Arc::from(Vec::new()),
+                driver::HistoryMode::Empty => {
+                    // The earlier tool results are gone from this round's
+                    // context, so reads of the same files must be allowed
+                    // again (mini-agent-hs2tc).
+                    session.read_tracker.clear();
+                    std::sync::Arc::from(Vec::new())
+                }
             };
 
             // The wrap-up round is asked to summarize and stop, so it runs on

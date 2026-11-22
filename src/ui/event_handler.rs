@@ -1274,7 +1274,12 @@ async fn finish_goal_round(
                 }
                 // A restarted round is deliberately amnesiac: its prompt
                 // carries the objective and a harness-built summary instead.
-                driver::HistoryMode::Empty => std::sync::Arc::from(Vec::new()),
+                driver::HistoryMode::Empty => {
+                    // The earlier tool results are no longer in context, so
+                    // the repeated-read guard must forget them (mini-agent-hs2tc).
+                    ui.session.read_tracker.clear();
+                    std::sync::Arc::from(Vec::new())
+                }
             };
             run.agent = Some(
                 ui.agent_build_ctx()
