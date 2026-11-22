@@ -2040,6 +2040,7 @@ pub(crate) fn build_git_direct_helper(
     )
 }
 
+#[cfg(feature = "git-worktree")]
 pub(crate) fn verify_git_direct_command(
     program: &Path,
     arguments: &[String],

@@ -126,12 +126,13 @@ fn print_config_stays_unprobed_and_explicit_check_fails_without_stderr_tokens() 
         "the nested runtime check must fail"
     );
     let reason = String::from_utf8_lossy(&check.stderr);
+    // The self-check reports the cached containment preflight's actionable reason (see
+    // `extras::js::verify_runtime`); the closed worker error is the fallback when the status
+    // is not yet unavailable.
     assert!(
-        reason.contains("JavaScript runtime self-check could not execute"),
-        "{reason}"
-    );
-    assert!(
-        reason.contains("JavaScript worker containment is unavailable"),
+        reason.contains("JavaScript runtime self-check: containment is unavailable")
+            || (reason.contains("JavaScript runtime self-check could not execute")
+                && reason.contains("JavaScript worker containment is unavailable")),
         "{reason}"
     );
     assert_no_failure_tokens("--js-runtime-check", &check);

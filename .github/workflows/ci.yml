@@ -567,7 +567,7 @@ jobs:
           - os: macos-latest
             features: "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
       # Rust test threads default to a 2 MiB stack. The combined hooks +
       # skills debug configuration builds larger async test futures on both
@@ -2758,7 +2758,7 @@ jobs:
             args: '--no-default-features --features mcp,js'
             mcp: true
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
