@@ -782,6 +782,15 @@ pub(crate) fn powershell_workspace_drive_prelude(root: &str) -> String {
     )
 }
 
+/// Statements binding `git` and `git.exe` to the bundled Git executable at `exe`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn powershell_git_alias_prelude(exe: &str) -> String {
+    let exe = exe.replace('\'', "''");
+    format!(
+        "try {{ Set-Alias -Name git -Value '{exe}' -Scope Global -Option AllScope -Force -ErrorAction Stop; Set-Alias -Name git.exe -Value '{exe}' -Scope Global -Option AllScope -Force -ErrorAction Stop }} catch {{}}; "
+    )
+}
+
 /// Render a Windows path for text pasted into a shell command: `canonicalize`
 /// returns the verbatim `\\?\C:\dir` (or `\\?\UNC\host\share`) spelling,
 /// which cmd.exe rejects as a current directory and Git Bash mangles.
@@ -5084,22 +5093,12 @@ impl Sandbox {
         #[cfg(target_os = "windows")]
         if self.backend == "appcontainer" {
             let cache_dir = self.get_cached_cache_dir()?;
-            let drive_script;
-            let script = if self.uses_powershell_workspace_drive() {
-                drive_script = format!(
-                    "{}{command}",
-                    powershell_workspace_drive_prelude(&strip_verbatim_prefix(
-                        &cwd.to_string_lossy()
-                    ))
-                );
-                drive_script.as_str()
-            } else {
-                command
-            };
             #[cfg_attr(not(feature = "git-worktree"), allow(unused_mut))]
             let mut read_roots = self.windows_appcontainer_read_roots.clone();
             #[cfg_attr(not(feature = "git-worktree"), allow(unused_mut))]
             let mut shell_env = self.shell_env_extra();
+            #[allow(unused_mut)]
+            let mut git_alias: Option<PathBuf> = None;
             #[cfg(feature = "git-worktree")]
             if let Some(runtime) = bundled_git_dir_for_shell(command) {
                 // The host Git cannot open /dev/null inside the container; the bundled Git falls
@@ -5115,7 +5114,24 @@ impl Sandbox {
                 if let Ok(joined) = joined {
                     shell_env.push(("PATH".to_string(), joined.to_string_lossy().into_owned()));
                 }
+                git_alias = Some(windows::child_process_path(&runtime.join("git.exe")));
             }
+            let drive_script;
+            let script = if self.uses_powershell_workspace_drive() {
+                // PowerShell finds commands by listing each PATH directory, which the container
+                // may not do for the runtime directory (its files are granted one by one), so the
+                // bundled Git is also bound by alias.
+                let mut prelude = powershell_workspace_drive_prelude(&strip_verbatim_prefix(
+                    &cwd.to_string_lossy(),
+                ));
+                if let Some(exe) = &git_alias {
+                    prelude.push_str(&powershell_git_alias_prelude(&exe.to_string_lossy()));
+                }
+                drive_script = format!("{prelude}{command}");
+                drive_script.as_str()
+            } else {
+                command
+            };
             return windows::build_shell_helper(
                 &self.shell,
                 &self.shell_prefix_args,
@@ -12725,6 +12741,17 @@ echo COMMITTED"#;
             prelude.ends_with("catch {}; "),
             "a failed drive must not stop the command"
         );
+    }
+
+    #[test]
+    fn powershell_git_alias_binds_both_names_and_quotes_the_path() {
+        let alias = powershell_git_alias_prelude(r"C:\rt\o'brien\git.exe");
+        assert!(
+            alias.contains(r"-Name git -Value 'C:\rt\o''brien\git.exe'"),
+            "{alias}"
+        );
+        assert!(alias.contains("-Name git.exe -Value"), "{alias}");
+        assert!(alias.ends_with("catch {}; "), "{alias}");
     }
 
     #[test]

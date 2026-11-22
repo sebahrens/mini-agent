@@ -173,6 +173,8 @@ const APPCONTAINER_PROFILE_PREFIX: &str = "mini-agent.general.";
 const REQUEST_PIPE_BUFFER: u32 = 512;
 const MAX_REQUEST_FEEDERS: usize = 16;
 const MAX_CLEANUP_ATTESTATION_ENTRIES: usize = 250_000;
+/// Bound on the read-only scan that looks for ACEs left below an already-revoked stale root.
+const MAX_STALE_REPAIR_SCAN_ENTRIES: usize = 20_000;
 const MAX_ACCESS_ROOTS: usize = 128;
 const MAX_STALE_PROFILE_RECOVERIES_PER_LAUNCH: usize = 64;
 const PREFLIGHT_ROOT_PREFIX: &str = "mini-agent-windows-sandbox-preflight-";
@@ -7408,6 +7410,59 @@ fn attest_tree_has_no_explicit_sid(root: &Path, sid: PSID) -> Result<(), String>
     Ok(())
 }
 
+/// Whether the DACL of `path` holds an access-allowed ACE for `sid`, explicit or inherited
+/// (`GetExplicitEntriesFromAcl` omits inherited ACEs, which are all a killed revoke leaves below
+/// a root).
+fn path_has_any_allow_ace_for_sid(path: &Path, sid: PSID) -> Result<bool, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect ACE-scan path: {error}"))?;
+    let file = open_stable_path(
+        path,
+        metadata.is_dir(),
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor = null_mut();
+    let result = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 || descriptor.is_null() {
+        return Err(format!("read ACE-scan DACL: code {result}"));
+    }
+    let _descriptor = Local(descriptor);
+    if dacl.is_null() {
+        return Ok(false);
+    }
+    for index in 0..u32::from(unsafe { (*dacl).AceCount }) {
+        let mut ace = null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+            return Err("read ACE-scan entry failed".into());
+        }
+        let header = unsafe { *ace.cast::<ACE_HEADER>() };
+        if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE
+            || usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>()
+        {
+            continue;
+        }
+        let ace_sid: PSID =
+            unsafe { (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast() };
+        if unsafe { IsValidSid(ace_sid) } != 0 && unsafe { EqualSid(ace_sid, sid) } != 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Whether any object at or below `root` carries an ACE naming `sid`. Read-only and bounded:
 /// links are never followed, and an error or an exceeded bound answers `false`.
 fn tree_carries_explicit_sid(root: &Path, sid: PSID) -> bool {
@@ -7415,7 +7470,7 @@ fn tree_carries_explicit_sid(root: &Path, sid: PSID) -> bool {
     let mut seen = 0usize;
     while let Some(path) = pending.pop() {
         seen += 1;
-        if seen > MAX_CLEANUP_ATTESTATION_ENTRIES {
+        if seen > MAX_STALE_REPAIR_SCAN_ENTRIES {
             return false;
         }
         let Ok(metadata) = std::fs::symlink_metadata(&path) else {
@@ -7424,7 +7479,7 @@ fn tree_carries_explicit_sid(root: &Path, sid: PSID) -> bool {
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
             continue;
         }
-        if access_path_has_explicit_sid(&path, sid).unwrap_or(false) {
+        if path_has_any_allow_ace_for_sid(&path, sid).unwrap_or(false) {
             return true;
         }
         if metadata.is_dir()

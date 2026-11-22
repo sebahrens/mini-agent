@@ -2516,6 +2516,16 @@ pub(crate) fn sandbox_failure_note(
             " Windows tools resolve the working directory by listing each parent directory, which the container may not do by default; setting `windows-appcontainer-ancestor-listing = true` (global config) lets it list the names, sizes and timestamps in each parent of the workspace, and system-owned parents such as `C:\\Users` and the drive root need an elevated launcher (restart required).",
         );
     }
+    if sandbox.backend_name() == "appcontainer"
+        && !sandbox.windows_ancestor_listing()
+        && sandbox.shell_capability().map(|shell| shell.dialect())
+            == Some(crate::sandbox::ShellDialect::Cmd)
+        && lowered.contains("access is denied")
+    {
+        note.push_str(
+            " In cmd.exe `dir` cannot enumerate directories here; `for %f in (*) do @echo %f` (files) and `for /d %d in (*) do @echo %d` (directories) work, as does PowerShell Get-ChildItem.",
+        );
+    }
     if let Some(hint) = &toolchain_hint {
         note.push(' ');
         note.push_str(hint);
