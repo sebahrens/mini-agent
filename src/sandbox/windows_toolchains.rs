@@ -18,7 +18,7 @@
 //!   readable, and their DACLs are not ours to rewrite);
 //! * the drive root, the user profile and its ancestors, directories that directly hold
 //!   credential folders (`.ssh`, `.aws`, ...), and trees larger than
-//!   [`MAX_DISCOVERED_ROOT_ENTRIES`] are skipped, so an unusual `PATH` entry cannot expose a home
+//!   [`MAX_DISCOVERED_ROOT_ENTRIES`] (or that overrun [`MAX_DISCOVERED_TOTAL_ENTRIES`] in all) are skipped, so an unusual `PATH` entry cannot expose a home
 //!   directory or make every launch walk an enormous tree;
 //! * at most [`MAX_DISCOVERED_ROOTS`] roots are proposed.
 //!
@@ -40,7 +40,12 @@ pub(crate) const MAX_DISCOVERED_ROOTS: usize = 8;
 
 /// A proposed tree larger than this is skipped: every launch grants and revokes an ACE
 /// on every object below the root.
-pub(crate) const MAX_DISCOVERED_ROOT_ENTRIES: usize = 20_000;
+pub(crate) const MAX_DISCOVERED_ROOT_ENTRIES: usize = 10_000;
+
+/// Upper bound on the objects below all proposed roots together; a proposal that would exceed it
+/// is skipped (the earlier entries of [`TOOLCHAIN_COMMANDS`] win). Every shell launch writes and
+/// later revokes one ACE per object, so this bounds the per-command latency the default adds.
+pub(crate) const MAX_DISCOVERED_TOTAL_ENTRIES: usize = 12_000;
 
 /// Directory names that mark a credential store; a proposed root may not directly contain one.
 const CREDENTIAL_DIRECTORIES: &[&str] = &[
@@ -60,6 +65,7 @@ const CREDENTIAL_DIRECTORIES: &[&str] = &[
 /// Directory names that are never proposed as a whole.
 const BROAD_DIRECTORY_NAMES: &[&str] = &[
     "appdata",
+    "windowsapps",
     "local",
     "locallow",
     "roaming",
@@ -185,6 +191,7 @@ pub(crate) enum Rejection {
     ContainsHomeOrAncestor,
     ContainsCredentials,
     TooLarge,
+    OverBudget,
 }
 
 fn credential_child_present(directory: &Path) -> bool {
@@ -214,7 +221,12 @@ pub(crate) fn bounded_entry_count(root: &Path, limit: usize) -> usize {
     count
 }
 
-fn judge(directory: &Path, environment: &DiscoveryEnvironment) -> Result<(), Rejection> {
+/// The entry count of an acceptable proposal.
+fn judge(
+    directory: &Path,
+    environment: &DiscoveryEnvironment,
+    entry_limit: usize,
+) -> Result<usize, Rejection> {
     if !std::fs::symlink_metadata(directory).is_ok_and(|meta| meta.is_dir()) {
         return Err(Rejection::NotADirectory);
     }
@@ -239,16 +251,29 @@ fn judge(directory: &Path, environment: &DiscoveryEnvironment) -> Result<(), Rej
     if credential_child_present(directory) {
         return Err(Rejection::ContainsCredentials);
     }
-    if bounded_entry_count(directory, MAX_DISCOVERED_ROOT_ENTRIES) > MAX_DISCOVERED_ROOT_ENTRIES {
+    let entries = bounded_entry_count(directory, entry_limit);
+    if entries > entry_limit {
         return Err(Rejection::TooLarge);
     }
-    Ok(())
+    Ok(entries)
 }
 
 /// The read/execute roots to propose, deduplicated and without nested entries. Each root is a
 /// canonical directory; nothing here touches an ACL.
 pub(crate) fn discover(environment: &DiscoveryEnvironment) -> Vec<PathBuf> {
-    let mut proposed: Vec<PathBuf> = Vec::new();
+    discover_within(
+        environment,
+        MAX_DISCOVERED_ROOT_ENTRIES,
+        MAX_DISCOVERED_TOTAL_ENTRIES,
+    )
+}
+
+fn discover_within(
+    environment: &DiscoveryEnvironment,
+    root_limit: usize,
+    total_limit: usize,
+) -> Vec<PathBuf> {
+    let mut proposed: Vec<(PathBuf, usize)> = Vec::new();
     for name in TOOLCHAIN_COMMANDS {
         let Some(executable) = resolve_on_path(name, &environment.path, &environment.extensions)
         else {
@@ -262,15 +287,28 @@ pub(crate) fn discover(environment: &DiscoveryEnvironment) -> Vec<PathBuf> {
         };
         if proposed
             .iter()
-            .any(|known| same_or_inside(&directory, known))
+            .any(|(known, _)| same_or_inside(&directory, known))
         {
             continue;
         }
-        match judge(&directory, environment) {
-            Ok(()) => {
-                // A broader accepted root replaces the narrower ones it contains.
-                proposed.retain(|known| !same_or_inside(known, &directory));
-                proposed.push(directory);
+        let verdict = judge(&directory, environment, root_limit).and_then(|entries| {
+            // A broader accepted root replaces the narrower ones it contains.
+            let replaced: usize = proposed
+                .iter()
+                .filter(|(known, _)| same_or_inside(known, &directory))
+                .map(|(_, count)| count)
+                .sum();
+            let total: usize = proposed.iter().map(|(_, count)| count).sum();
+            if total - replaced + entries > total_limit {
+                Err(Rejection::OverBudget)
+            } else {
+                Ok(entries)
+            }
+        });
+        match verdict {
+            Ok(entries) => {
+                proposed.retain(|(known, _)| !same_or_inside(known, &directory));
+                proposed.push((directory, entries));
             }
             Err(reason) => {
                 tracing::debug!(
@@ -284,8 +322,9 @@ pub(crate) fn discover(environment: &DiscoveryEnvironment) -> Vec<PathBuf> {
             break;
         }
     }
-    proposed.sort();
-    proposed
+    let mut roots: Vec<PathBuf> = proposed.into_iter().map(|(root, _)| root).collect();
+    roots.sort();
+    roots
 }
 
 /// The proposals that overlap none of `excluded` (the workspace, the application cache and its
@@ -462,7 +501,41 @@ mod tests {
         }
         assert!(bounded_entry_count(&tools, 4) > 4);
         assert!(bounded_entry_count(&tools, 100) <= 100);
-        assert!(judge(&tools, &fixture.environment(std::slice::from_ref(&tools))).is_ok());
+        assert!(
+            judge(
+                &tools,
+                &fixture.environment(std::slice::from_ref(&tools)),
+                100
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            judge(
+                &tools,
+                &fixture.environment(std::slice::from_ref(&tools)),
+                4
+            ),
+            Err(Rejection::TooLarge)
+        );
+        assert!(
+            bounded_entry_count(&tools, MAX_DISCOVERED_ROOT_ENTRIES) <= MAX_DISCOVERED_ROOT_ENTRIES
+        );
+    }
+
+    #[test]
+    fn the_total_entry_budget_keeps_earlier_commands_and_skips_the_rest() {
+        let fixture = Fixture::new();
+        let python = fixture.tool("tools/python312", "python");
+        let node = fixture.tool("tools/node", "node");
+        for directory in [&python, &node] {
+            for index in 0..6 {
+                std::fs::write(directory.join(format!("f{index}")), b"x").unwrap();
+            }
+        }
+        let environment = fixture.environment(&[node.clone(), python.clone()]);
+        // Each tree holds 7 entries: both fit in 20, only the first listed command fits in 10.
+        assert_eq!(discover_within(&environment, 100, 20).len(), 2);
+        assert_eq!(discover_within(&environment, 100, 10), vec![python]);
     }
 
     #[test]

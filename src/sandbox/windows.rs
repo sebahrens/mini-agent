@@ -2270,6 +2270,8 @@ fn prepare_launch_request(
         write_roots,
         configured_read_roots,
         configured_write_roots,
+        optional_read_roots: Vec::new(),
+        null_device: false,
         parent_pid: unsafe { GetCurrentProcessId() },
         parent_created: process_creation_time(unsafe { GetCurrentProcess() })?,
         ready_path,
