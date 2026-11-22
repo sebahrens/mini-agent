@@ -116,6 +116,7 @@ class CiDocsFilterTests(unittest.TestCase):
     def test_plain_documentation_skips_the_matrix(self) -> None:
         self.assertEqual("false", self.classify("README.md", "docs/plans/idea.md"))
         self.assertEqual("false", self.classify(".beads/issues.jsonl", "editors/vscode/README.md"))
+        self.assertEqual("false", self.classify("reports/ci-review.json", "research_notes/a.txt"))
 
     def test_missing_or_ambiguous_pr_ancestry_runs_the_matrix(self) -> None:
         for merge_base in ("", BASE + "\n" + HEAD):

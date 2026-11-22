@@ -53,15 +53,18 @@ permissions:
 env:
   RUSTFLAGS: ''
 
-# A newer push to the same pull request or branch supersedes the older run, so
-# its remaining (macOS and Windows) minutes are not spent on a stale commit.
-# Tag pushes, scheduled drift runs and manual dispatches are never cancelled:
-# a tag run is the release's CI evidence. Scheduled and dispatched runs also
-# get their own group, because they share refs/heads/<default> with branch
-# pushes and would otherwise be cancelled by the next push.
+# A newer push to the same pull request supersedes the older run, so its
+# remaining (macOS and Windows) minutes are not spent on a stale commit.
+# Push runs are never cancelled and never replace one another: each push to a
+# branch or tag gets its own group (keyed by commit), because a group that
+# queues keeps only the newest pending run, and a following docs-only or
+# beads-only push (which skips the build jobs) would then displace the pending
+# code run, leaving a commit without a real ci-success verdict
+# (mini-agent-ydtx1). Scheduled and dispatched runs also get their own group,
+# because they share refs/heads/<default> with other events.
 concurrency:
-  group: ci-${{ github.ref }}-${{ inputs.scope || 'full' }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.event_name || 'push-or-pr' }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')) }}
+  group: ci-${{ github.ref }}-${{ inputs.scope || 'full' }}-${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.event_name || 'push-or-pr' }}${{ github.event_name == 'push' && format('-{0}', github.sha) || '' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # Which jobs need to run for this event.
@@ -496,6 +499,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
 
       - name: Run Clippy (${{ matrix.features }})
         if: steps.fp.outputs.skip != 'true'
@@ -616,6 +622,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
 
       - name: Show the toolchain in use
         if: steps.fp.outputs.skip != 'true'
@@ -735,6 +744,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
 
       - name: Run Clippy (--all-features)
         if: steps.fp.outputs.skip != 'true'
@@ -825,6 +837,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
       - name: Test the default suite with the standard parallel runner
         if: steps.fp.outputs.skip != 'true'
         run: cargo test --locked
@@ -880,6 +895,9 @@ jobs:
         with:
           rustflags: ''
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
       # Runtime policy is sharded into the Windows path, private-storage,
       # process-lifecycle, launcher, sandbox, and containment jobs below. The
       # full libtest also contains Unix-only integration fixtures, so this gate
@@ -1090,6 +1108,9 @@ jobs:
         with:
           rustflags: ''
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
       # bash, not the default pwsh: PowerShell turns an unquoted
       # `hooks,advisor,...` into an array and passes each name separately.
       - name: Compile the Windows hooks feature suite (${{ matrix.features }})
@@ -2757,6 +2778,28 @@ jobs:
           - name: mcp-js
             args: '--no-default-features --features mcp,js'
             mcp: true
+        # macOS runs the default row only. The `test` job already runs the full
+        # suite (these filters included) on macOS for the default and js rows,
+        # and the non-default rows here only re-prove platform-independent cfg
+        # gating that the Linux and Windows rows cover; a macOS minute costs
+        # ten Linux minutes and the three extra cold compiles (14-27 min each)
+        # queue behind the runner limit (mini-agent-nvnkx.8).
+        exclude:
+          - os: macos-latest
+            feature:
+              name: mcp
+              args: '--no-default-features --features mcp'
+              mcp: true
+          - os: macos-latest
+            feature:
+              name: js
+              args: '--no-default-features --features js'
+              mcp: false
+          - os: macos-latest
+            feature:
+              name: mcp-js
+              args: '--no-default-features --features mcp,js'
+              mcp: true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     steps:
@@ -2770,8 +2813,24 @@ jobs:
         shell: bash
         run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
+      # Each feature row compiles a different dependency graph, so it gets its
+      # own cache key; without it the four rows of one OS share a key and fight
+      # over a single reservation (mini-agent-4tq4t). ImageOS keeps runner
+      # images apart.
+      - name: Derive the compiled-dependency cache key
+        id: cache-key
+        shell: bash
+        env:
+          CACHE_ROW: ${{ matrix.feature.name }}
+        run: |
+          slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-platform-paths-${slug:-default}" >> "$GITHUB_OUTPUT"
+
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-on-failure: true
 
       - name: Test deterministic and real platform path acceptance
         shell: bash
@@ -3167,6 +3226,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
 
       - name: Test MCP stdio lifecycle and ACP startup cancellation
         if: steps.fp.outputs.skip != 'true'
@@ -3230,6 +3292,9 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          # Save the compiled dependencies even when a later test step fails:
+          # a red row must not leave the next run to recompile from cold.
+          cache-on-failure: true
 
       - name: Test Windows atomic publication and sharing contracts
         if: matrix.os == 'windows-latest' && steps.fp.outputs.skip != 'true'
