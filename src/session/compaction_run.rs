@@ -176,7 +176,18 @@ where
     let cut_idx = plan.cut_idx;
     let (skipped, messages) = session.compaction_input(cut_idx);
     let fork_history = plan.fork_keep_recent_tool_results.and_then(|keep| {
-        crate::agent::runner::cache_fork_history(session, cut_idx, keep, plan.input_token_budget)
+        match crate::agent::runner::cache_fork_history_checked(
+            session,
+            cut_idx,
+            keep,
+            plan.input_token_budget,
+        ) {
+            Ok(history) => Some(history),
+            Err(reason) => {
+                tracing::debug!("compaction cache fork skipped: {reason}");
+                None
+            }
+        }
     });
     let output = summarize(SummaryRequest {
         model: session.model.to_string(),

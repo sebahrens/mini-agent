@@ -148,6 +148,51 @@ async fn copilot81_device_flow_obeys_initial_interval_pending_and_slow_down_befo
     );
 }
 
+/// Not verified against the live service; behaviour pinned by a stub
+/// (mini-agent-nvnkx.207): the whole sign-in for a user-registered OAuth app
+/// (device code, poll, `/user`, Copilot token exchange) with the client id the
+/// user configured, ending in an actionable refusal and no saved model token
+/// when GitHub refuses the exchange.
+#[tokio::test]
+async fn copilot207_sign_in_with_an_own_oauth_app_explains_a_refused_token_exchange() {
+    let temp = crate::tests::OwnedTestDirectory::new("copilot207-refused");
+    let directory = temp.path().join("credentials");
+    let (listener, profile) = fixture().await;
+    let (p, dir) = (profile.clone(), directory.clone());
+    let sign_in = tokio::spawn(async move { sign_in_profile(p, dir).await });
+    let (socket, headers, body) = request(&listener).await;
+    assert!(headers.starts_with("post /login/device/code "));
+    assert_eq!(body["client_id"], "owned-mini-agent-app");
+    answer(socket,200,json!({"device_code":"PRIVATE_DEVICE","user_code":"OWNED-CODE","verification_uri":profile.url("/login/device",false),"interval":1,"expires_in":30})).await;
+    let (socket, headers, body) = request(&listener).await;
+    assert!(headers.starts_with("post /login/oauth/access_token "));
+    assert_eq!(body["client_id"], "owned-mini-agent-app");
+    answer(socket, 200, grant()).await;
+    let (socket, headers, _) = request(&listener).await;
+    assert!(headers.starts_with("get /user "));
+    answer(socket, 200, json!({"id":7,"login":"owned-user"})).await;
+    let (socket, headers, _) = request(&listener).await;
+    assert!(headers.starts_with("get /copilot_internal/v2/token "));
+    assert!(headers.contains("authorization: token new_github"));
+    assert!(headers.contains("editor-version: mini-agent/"));
+    answer(socket, 404, json!({"message":"Not Found"})).await;
+    let error = sign_in.await.unwrap().err().expect("refused exchange");
+    let text = error.to_string();
+    assert!(text.contains("approved editor integrations"), "{text}");
+    assert!(text.contains("GITHUB_COPILOT_API_TOKEN"), "{text}");
+    assert!(
+        !text.contains("new_github") && !text.contains("PRIVATE_DEVICE"),
+        "{text}"
+    );
+    let saved = LockedStore::open(directory, false).unwrap();
+    assert!(
+        saved
+            .and_then(|locked| locked.data)
+            .is_none_or(|data| data.model.is_none()),
+        "no Copilot model token may be saved after a refusal"
+    );
+}
+
 #[tokio::test]
 async fn copilot81_device_deadline_expires_without_an_early_poll_or_saved_grant() {
     let temp = crate::tests::OwnedTestDirectory::new("copilot81-expiry");

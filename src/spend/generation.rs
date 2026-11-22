@@ -140,7 +140,7 @@ async fn fetch(pending: &Pending, timeout: Duration) -> Option<UsageDelta> {
         request = request.header(http::header::AUTHORIZATION, authorization.clone());
     }
     let mut response = request.send().await.ok()?;
-    if !response.status().is_success() {
+    if response.error_for_status_ref().is_err() {
         return None;
     }
     let mut body = Vec::new();
@@ -190,14 +190,14 @@ static PENDING: std::sync::Mutex<Vec<(String, tokio::task::JoinHandle<()>)>> =
 
 /// Runs `task` (a lookup and its ledger amendment) in the background for
 /// `session_id`; [`settle`] waits for it, bounded by [`TIMEOUT`].
-pub(crate) fn spawn(
+pub(crate) fn run_in_background(
     session_id: &str,
     task: impl std::future::Future<Output = ()> + Send + 'static,
 ) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+    if tokio::runtime::Handle::try_current().is_err() {
         return;
-    };
-    let handle = runtime.spawn(task);
+    }
+    let handle = tokio::task::spawn(task);
     let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
     pending.retain(|(_, handle)| !handle.is_finished());
     pending.push((session_id.to_owned(), handle));

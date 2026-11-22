@@ -309,6 +309,88 @@ async fn bedrock81_real_sdk_key_env_profile_chain_streams_tools_and_usage_withou
     }
 }
 
+/// Not verified against the live service; behaviour pinned by a stub
+/// (mini-agent-nvnkx.208): a rejected Bedrock key (401/403) is a terminal error
+/// that names the key variable, and is not retried.
+#[tokio::test]
+async fn bedrock208_rejected_key_is_a_clear_terminal_error() {
+    use crate::tests::support::loopback_http::asynchronous::respond;
+    for (status, text) in [("401 Unauthorized", 401), ("403 Forbidden", 403)] {
+        let (listener, base) = bind().await;
+        let custom = HashMap::from([(
+            "owned-bedrock".into(),
+            serde_json::from_value::<crate::config::CustomProviderConfig>(
+                json!({"provider_type":"bedrock","base_url":format!("{base}/anthropic"),"inherit_builtin_key":true}),
+            )
+            .unwrap(),
+        )]);
+        let client =
+            crate::provider::create_client_with_env("owned-bedrock", None, &custom, None, |name| {
+                match name {
+                    "AWS_REGION" => Ok("us-east-1".into()),
+                    "AWS_BEARER_TOKEN_BEDROCK" => Ok("REJECTED_BEDROCK_KEY".into()),
+                    _ => Err(VarError::NotPresent),
+                }
+            })
+            .unwrap();
+        let crate::provider::AnyModel::Anthropic(model) =
+            client.completion_model("us.anthropic.owned")
+        else {
+            panic!("must use actual Anthropic Messages converter")
+        };
+        let server = async {
+            let mut requests = 0;
+            // The client may retry; only the first request is asserted on.
+            while let Ok(Ok((mut socket, _))) =
+                tokio::time::timeout(Duration::from_millis(400), listener.accept()).await
+            {
+                let req = read_request(&mut socket).await;
+                if requests == 0 {
+                    assert!(
+                        req.headers
+                            .starts_with("post /anthropic/v1/messages http/1.1")
+                    );
+                    assert!(
+                        req.headers
+                            .contains("\r\nx-api-key: rejected_bedrock_key\r\n")
+                    );
+                }
+                requests += 1;
+                respond(
+                    &mut socket,
+                    status,
+                    "application/json",
+                    r#"{"message":"The security token included in the request is invalid."}"#,
+                )
+                .await;
+            }
+            requests
+        };
+        let client_side = async {
+            let agent = rig::agent::AgentBuilder::new(model).max_tokens(32).build();
+            let mut stream = agent.stream_chat("hello", Vec::<Message>::new()).await;
+            let mut failure = None;
+            while let Some(item) = stream.next().await {
+                if let Err(error) = item {
+                    failure = Some(error);
+                    break;
+                }
+            }
+            failure.expect("a rejected key must fail the request")
+        };
+        let (requests, error) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(server, client_side)
+        })
+        .await
+        .unwrap();
+        assert_eq!(requests, 1, "a {text} must not be retried");
+        let shown = crate::retry::with_provider_error_hint_for(&error, Some("bedrock"));
+        assert!(shown.contains(&text.to_string()), "{shown}");
+        assert!(shown.contains("AWS_BEARER_TOKEN_BEDROCK"), "{shown}");
+        assert!(!shown.contains("REJECTED_BEDROCK_KEY"), "{shown}");
+    }
+}
+
 #[tokio::test]
 async fn bedrock81_process_profiles_are_rejected_before_env_fallback_or_dispatch() {
     for indirect in [false, true] {

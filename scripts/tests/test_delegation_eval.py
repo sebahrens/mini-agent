@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -45,6 +46,45 @@ class DelegationEvalTests(unittest.TestCase):
         self.assertEqual(record["child_tokens"], 500)
         direct = delegation_eval.record_from_result("t", "direct", {}, True)
         self.assertEqual(direct["children"], 0)
+
+    def test_config_puts_task_enabled_at_the_top_level(self) -> None:
+        for arm, value in (("delegated", "true"), ("direct", "false")):
+            text = delegation_eval.config_text(arm)
+            self.assertEqual(text, f"task_enabled = {value}\n")
+            self.assertNotIn("[", text)
+
+    def test_a_rejected_config_fails_loudly(self) -> None:
+        stderr = "Error: config is not valid TOML: unknown field `task_enabled`"
+        self.assertIsNotNone(delegation_eval.config_error(stderr, 2))
+        self.assertIsNone(delegation_eval.config_error(stderr, 0))
+        self.assertIsNone(delegation_eval.config_error("provider failed", 1))
+
+    def test_scratch_root_has_no_symlinked_component(self) -> None:
+        root = delegation_eval.scratch_root()
+        self.assertEqual(root, os.path.realpath(root))
+
+    def test_record_keeps_the_whole_delegation_aggregate(self) -> None:
+        aggregate = {
+            "children": 1,
+            "contract_pass": 0,
+            "contract_repaired": 1,
+            "contract_unstructured": 2,
+            "contract_normalized": 3,
+        }
+        record = delegation_eval.record_from_result(
+            "t", "delegated", {"subagent_delegation": aggregate}, True
+        )
+        self.assertEqual(record["subagent_delegation"], aggregate)
+
+    def test_the_independent_questions_prompt_asks_for_the_oracle_text(self) -> None:
+        task = next(
+            t
+            for t in delegation_eval.load_tasks(delegation_eval.DEFAULT_TASKS)
+            if t["name"] == "independent_questions"
+        )
+        for line in task["expected_files"]["answer.txt"].splitlines():
+            label = line.split(":")[0]
+            self.assertIn(f"`{label}: <count>`", task["prompt"])
 
     def test_compare_reports_ratios_for_complete_pairs_only(self) -> None:
         delegated = {

@@ -26,7 +26,7 @@
     },
     {
       "name": "independent_questions",
-      "prompt": "Answer both questions in answer.txt, one line each: how many TODO markers are in docs/, and how many in src/?",
+      "prompt": "Count the TODO markers in docs/ and in src/, then write answer.txt with exactly two lines: `docs: <count>` and then `src: <count>`.",
       "files": {
         "docs/a.md": "TODO one\nTODO two\n",
         "docs/b.md": "done\n",
