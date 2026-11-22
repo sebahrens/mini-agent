@@ -22,6 +22,11 @@ pub enum Picker {
     History(ListPicker, Box<crate::ui::pickers::history::HistorySearch>),
 }
 
+/// Shown above a slash-command argument picker: Enter fills the value, a
+/// second Enter submits (mini-agent-x4a6f).
+pub(crate) const ARGUMENT_PICKER_HINT: &str =
+    "enter to fill, enter again to run, tab to fill and keep editing";
+
 impl Picker {
     pub fn active(&self) -> bool {
         match self {
@@ -139,6 +144,9 @@ impl Picker {
                 } else {
                     None
                 };
+                if prefix.starts_with('/') && msg.is_none() {
+                    return p.draw_with_hint(out, cols, floor_row, ARGUMENT_PICKER_HINT);
+                }
                 p.draw(out, cols, msg, floor_row)
             }
             Picker::Models(p) => p.draw(out, cols, floor_row),

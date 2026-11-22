@@ -3438,14 +3438,10 @@ impl Startup {
                         })
                     {
                         persistence_failure = Some(error);
-                    } else if let Err(e) = session::chat_history::append_entry(
-                        &session::chat_history::ChatHistoryEntry {
-                            content: msg,
-                            timestamp: session.updated_at.clone(),
-                        },
-                    ) {
-                        eprintln!("warning: failed to append chat history entry: {}", e);
                     }
+                    // Scripted and CI commands stay out of the TUI's Up-arrow
+                    // and Ctrl+R input history, like headless prompts
+                    // (mini-agent-ukk9a, mini-agent-x4a6f).
                 }
                 if let Some((files_changed, pricing)) = json_context {
                     let stop_reason = if run.succeeded() && persistence_failure.is_none() {
@@ -4236,6 +4232,19 @@ impl Startup {
             {
                 return Err(crate::print::HeadlessGoalExit(reason).into());
             }
+        }
+        #[cfg(feature = "goal")]
+        if failure
+            .as_ref()
+            .is_some_and(crate::agent::runner::is_headless_interrupt)
+            && finished_goal
+                .as_ref()
+                .is_some_and(|goal| goal.status == crate::extras::goal::GoalStatus::Active)
+        {
+            crate::print::headless_stderr(format_args!(
+                "{}\n",
+                crate::extras::goal::interrupt_notice(true)
+            ));
         }
         // The turn's own failure wins: a partial persistence failure is
         // reported too, but neither is ever presented as success.

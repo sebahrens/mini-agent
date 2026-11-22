@@ -321,3 +321,34 @@ fn failed_turn_restores_moved_pending_media_without_snapshot_clone() {
     assert_eq!(session.pending_media.len(), 1);
     assert_eq!(session.pending_media[0].size(), 4);
 }
+
+/// mini-agent-27kzu: an interrupt after a tool call completed keeps the turn's
+/// effects in history, so the host "cut off" notice must close it.
+#[test]
+fn interrupt_after_a_completed_tool_call_keeps_the_turn_and_adds_the_host_notice() {
+    let mut session = Session::new("openrouter", "test-model", 128_000, "/workspace");
+    let mut run = AgentRunState::default();
+    let pending_turn = PendingMainTurn::capture(&session, "edit then explain");
+    crate::ui::mark_main_turn_started(&mut session, &mut run, pending_turn);
+    session.add_tool_call_with_id("done-edit", "edit", &serde_json::json!({}));
+    session.add_tool_result_with_id("done-edit", "edit", "applied");
+
+    assert!(crate::ui::preserve_pending_main_turn_progress(
+        &mut run,
+        &mut session
+    ));
+    crate::ui::record_interrupted_turn_notice(&mut session);
+
+    assert!(
+        session
+            .messages
+            .iter()
+            .any(|message| message.role == MessageRole::ToolResult
+                && message.content.contains("applied")),
+        "the completed call's effect stays in history"
+    );
+    let notice = session.messages.last().unwrap();
+    assert_eq!(notice.role, MessageRole::System);
+    assert!(crate::agent::input::is_host_instruction(&notice.content));
+    assert!(notice.content.contains("cut off"), "{}", notice.content);
+}

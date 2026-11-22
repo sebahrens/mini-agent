@@ -1439,6 +1439,12 @@ fn explicit_print_json_reports_command_outcomes_in_one_value() {
                 "{recorded}"
             );
             assert!(recorded.contains(result.trim_end()), "{recorded}");
+            // A scripted `!cmd` never enters the TUI's input history.
+            assert!(
+                !root.0.join("chat_history.json").exists()
+                    && !root.0.join("chat-history.jsonl").exists(),
+                "headless ! command wrote the TUI input history"
+            );
         } else if message == "!" {
             assert!(
                 !root.0.join("sessions").exists(),

@@ -8,6 +8,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- An interrupt (TUI and headless) says explicitly that the goal stays active and names `/goal pause` / `--goal-resume`; a state test pins that an interrupt after a completed tool call keeps the turn and adds the host "cut off" notice (mini-agent-27kzu).
+- Headless `!cmd` no longer enters the TUI input history; argument pickers say "enter to fill, enter again to run" and the two-step Enter is documented as the contract (mini-agent-x4a6f).
 - The budget preflight refusal is no longer skipped in the unit-test binary: a per-run switch replaces the `cfg!(test)` bypass, and `MINI_AGENT_BUDGET_PREFLIGHT=0` still turns it off (mini-agent-bnynh).
 - `--stream-json-schema claude` text messages carry the provider's `stop_reason` (null only when the provider gave none); an interrupted OpenRouter stream's estimated ledger row is replaced by the generation endpoint's counts when it answers within 3 seconds (mini-agent-qqknv).
 - Project instruction files from a workspace whose project config is not trusted are framed as reference-only data again; trusted workspaces keep the standing-instructions framing, and the global `AGENTS.md` is authoritative either way (mini-agent-dqk7m).

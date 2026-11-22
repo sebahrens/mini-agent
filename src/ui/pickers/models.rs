@@ -249,7 +249,7 @@ impl ModelsPicker {
             };
             write!(
                 out,
-                "{}{}  {}   (Tab to switch groups · /models refresh for the latest){}",
+                "{}{}  {}   (Tab switches groups · enter to fill, enter again to run · /models refresh){}",
                 SetForegroundColor(self.color(Color::DarkGrey)),
                 tab("Quick", self.quick.len(), self.group == 0),
                 tab("Provider", self.provider.len(), self.group == 1),
