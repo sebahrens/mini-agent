@@ -2208,6 +2208,10 @@ mod tests {
 
     #[test]
     fn d_cycles_the_default_provider_through_those_with_credentials() {
+        // Hold the suite's process-environment lock so concurrent tests cannot
+        // set or remove provider key variables between the wizard's choice and
+        // the assertion below; both read the same stable environment.
+        let _env = crate::tests::ScopedProcessEnv::set(&[]);
         let cfg = Config {
             api_keys: Some([("anthropic".to_string(), "k".to_string())].into()),
             ..Default::default()
