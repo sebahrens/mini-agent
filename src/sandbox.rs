@@ -2073,6 +2073,26 @@ fn classify_git_probe(exit_code: Option<i32>, stderr: &str) -> Result<(), String
     ))
 }
 
+/// A single-use Git standard-input file; removed when dropped.
+#[cfg(all(target_os = "windows", feature = "git-worktree"))]
+pub(crate) struct GitStdinFile {
+    path: PathBuf,
+}
+
+#[cfg(all(target_os = "windows", feature = "git-worktree"))]
+impl GitStdinFile {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "git-worktree"))]
+impl Drop for GitStdinFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Regular files directly inside the guarded runtime `directory`, sorted and
 /// bounded; links and subdirectories are never granted.
 #[cfg(any(test, feature = "git-worktree"))]
@@ -5431,6 +5451,34 @@ impl Sandbox {
         with_runtime_read_roots(&self.windows_appcontainer_read_roots, runtime_files)
     }
 
+    /// Windows containers cannot receive a caller pipe on stdin. Git commands that read
+    /// standard input instead get a private single-use file in the application cache (a
+    /// read root of the container); the patched guarded Git redirects fd 0 to it.
+    #[cfg(all(target_os = "windows", feature = "git-worktree"))]
+    pub(crate) fn write_git_stdin_file(&self, input: &[u8]) -> Result<GitStdinFile, String> {
+        use std::io::Write as _;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let cache_dir = self.get_cached_cache_dir()?;
+        let path = cache_dir.join(format!(
+            "git-stdin-{}-{}.bin",
+            std::process::id(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|error| format!("sandbox: create Git stdin file: {error}"))?;
+        let written = file.write_all(input).and_then(|()| file.flush());
+        drop(file);
+        // Git rejects the verbatim `\\?\` spelling; the child needs the ordinary path.
+        let guard = GitStdinFile {
+            path: windows::child_process_path(&path),
+        };
+        written.map_err(|error| format!("sandbox: write Git stdin file: {error}"))?;
+        Ok(guard)
+    }
+
     #[cfg(any(test, feature = "git-worktree"))]
     pub(crate) fn wrap_git_workspace_service(
         &self,
@@ -5451,6 +5499,17 @@ impl Sandbox {
             let cache_dir = self.get_cached_cache_dir()?;
             self.retain_canonical_git_write_roots(&cwd)?;
             let read_roots = self.git_service_read_roots(program);
+            // The container's environment is otherwise fixed: carry the runner's
+            // policy variables, the commit identity and the stdin file name.
+            let extra_env = _env
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        name.to_string_lossy().into_owned(),
+                        value.to_string_lossy().into_owned(),
+                    )
+                })
+                .collect::<Vec<_>>();
             return windows::build_git_direct_helper(
                 program,
                 args,
@@ -5459,6 +5518,7 @@ impl Sandbox {
                 &cache_dir,
                 &read_roots,
                 &self.windows_appcontainer_write_roots,
+                &extra_env,
             )
             .map(ExecutionCommand::appcontainer_helper)
             .map(|command| command.retaining_roots(&self.git_write_roots));
@@ -11723,7 +11783,8 @@ mod sandbox_tests {
 
     #[test]
     fn git_service_read_roots_grant_each_runtime_file_once() {
-        let (_scratch, root) = canonical_scratch();
+        let scratch = TempDir::new("runtime-roots");
+        let root = scratch.path().to_path_buf();
         std::fs::write(root.join("git.exe"), b"x").unwrap();
         std::fs::write(root.join("libcurl.dll"), b"x").unwrap();
         std::fs::create_dir(root.join("nested")).unwrap();
