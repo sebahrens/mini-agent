@@ -2041,6 +2041,148 @@ fn a_headless_goal_reports_its_outcome_and_exits_with_it() {
     }
 }
 
+/// mini-agent-hs2tc: a restarted goal round starts from empty history, so the
+/// repeated-read guard must forget what earlier rounds read. The second
+/// round's read of the same file returns its content, not a "was already
+/// read" refusal.
+#[cfg(all(unix, feature = "goal"))]
+#[test]
+fn a_restarted_goal_round_may_read_the_same_file_again() {
+    let root = TempRoot::new();
+    std::fs::write(root.0.join("evidence.txt"), "RESTART_READ_MARKER").unwrap();
+    let read = || {
+        ScriptedReply::Stream(
+            serde_json::json!({"role":"assistant","tool_calls":[{
+                "index":0,"id":"restart-read","type":"function",
+                "function":{"name":"read","arguments":"{\"path\":\"evidence.txt\"}"}
+            }]}),
+            "tool_calls",
+        )
+    };
+    let say = |text: &str| {
+        ScriptedReply::Stream(
+            serde_json::json!({"role":"assistant","content":text}),
+            "stop",
+        )
+    };
+    let server = scripted_provider(
+        &root,
+        "",
+        vec![
+            read(),
+            say("round one done"),
+            read(),
+            say("round two done"),
+            say("wrap up"),
+        ],
+    );
+    let mut command = root.provider_command("read");
+    command.args([
+        "--goal",
+        "read the evidence",
+        "--goal-continuation",
+        "restart",
+        "--goal-max-rounds",
+        "2",
+        "-p",
+        "start",
+    ]);
+    let output = bounded_output(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let bodies = server
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("provider script did not complete: {error}: {stderr}"));
+    // Request 3 is round two's follow-up after its read tool call.
+    let second_round = bodies[3].to_string();
+    assert!(
+        second_round.contains("RESTART_READ_MARKER"),
+        "the restarted round must see the file again: {second_round}"
+    );
+    assert!(
+        !second_round.contains("was already read"),
+        "the read guard leaked across the restart: {second_round}"
+    );
+}
+
+/// mini-agent-zdcj5: a foreground child's start and tool calls appear in the
+/// parent's stream-json between the `task` call and its result, tagged with
+/// the outer call's id.
+#[cfg(all(unix, feature = "subagents"))]
+#[test]
+fn stream_json_reports_subagent_started_and_tool_call_records() {
+    let root = TempRoot::new();
+    std::fs::write(root.0.join("evidence.txt"), "CHILD_EVIDENCE").unwrap();
+    let call = |id: &str, name: &str, arguments: serde_json::Value| {
+        ScriptedReply::Stream(
+            serde_json::json!({"role":"assistant","tool_calls":[{
+                "index":0,"id":id,"type":"function",
+                "function":{"name":name,"arguments":arguments.to_string()}
+            }]}),
+            "tool_calls",
+        )
+    };
+    let say = |text: &str| {
+        ScriptedReply::Stream(
+            serde_json::json!({"role":"assistant","content":text}),
+            "stop",
+        )
+    };
+    let server = scripted_provider(
+        &root,
+        "",
+        vec![
+            call(
+                "outer-task",
+                "task",
+                serde_json::json!({"prompts":["read evidence.txt and report"]}),
+            ),
+            call(
+                "child-read",
+                "read",
+                serde_json::json!({"path":"evidence.txt"}),
+            ),
+            say("child report"),
+            // The unstructured child answer gets one contract repair request.
+            say("child repair"),
+            say("parent done"),
+        ],
+    );
+    let mut command = root.provider_command("read,task");
+    command.args(["-p", "--output", "stream-json", "delegate the reading"]);
+    let output = bounded_output(command);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    server
+        .join()
+        .unwrap()
+        .unwrap_or_else(|error| panic!("{error}: {stderr}"));
+    assert!(output.status.success(), "{stderr}");
+    let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let position = |kind: &str| rows.iter().position(|row| row["type"] == kind);
+    let (call_at, started_at, child_call_at, result_at) = (
+        rows.iter()
+            .position(|row| row["type"] == "tool_call" && row["name"] == "task"),
+        position("subagent_started"),
+        position("subagent_tool_call"),
+        rows.iter()
+            .position(|row| row["type"] == "tool_result" && row["name"] == "task"),
+    );
+    let (Some(call_at), Some(started_at), Some(child_call_at), Some(result_at)) =
+        (call_at, started_at, child_call_at, result_at)
+    else {
+        panic!("missing child records: {rows:#?}\n{stderr}");
+    };
+    assert!(call_at < started_at && started_at < child_call_at && child_call_at < result_at);
+    let outer = &rows[call_at]["id"];
+    assert_eq!(&rows[started_at]["parent_tool_use_id"], outer);
+    assert_eq!(rows[child_call_at]["name"], "read");
+    assert_eq!(&rows[child_call_at]["parent_tool_use_id"], outer);
+}
+
 // mini-agent-4nqvb: `mini-agent -p ... | head` closes stdout early. The run
 // must neither panic nor lose the turn: it finishes and saves the session.
 #[cfg(unix)]

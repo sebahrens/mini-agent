@@ -285,6 +285,9 @@ impl Peer {
         } else {
             &["--no-tools"]
         };
+        Self::start_with_tool_args(roots, tool_args, extra)
+    }
+    fn start_with_tool_args(roots: &Roots, tool_args: &[&str], extra: &[&str]) -> Self {
         let mut child = roots
             .command()
             .args(tool_args)
@@ -642,6 +645,166 @@ fn acp_reloading_a_live_session_keeps_the_permission_mode_the_client_set() {
     peer.request(6, "session/close", serde_json::json!({"sessionId":id}));
     peer.finish();
     assert!(provider.finish().is_empty());
+}
+
+/// A provider that answers `/v1/chat/completions` from a script: each reply is
+/// a streamed delta and finish reason. Returns the request bodies when stopped.
+fn scripted_provider(
+    roots: &Roots,
+    script: Vec<(serde_json::Value, &'static str)>,
+) -> (Arc<AtomicBool>, JoinHandle<Vec<serde_json::Value>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    std::fs::write(roots.0.join("config.toml"), format!(
+        "session_title_model='off'\n[retry]\nmax_attempts=1\n[custom_providers.local-test]\nprovider_type='openai'\nbase_url='http://{}/v1'\napi_key_env='HEADLESS_LOCAL_TEST_KEY'\napi_style='completions'\n", listener.local_addr().unwrap()
+    )).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stopping = stop.clone();
+    let handle = std::thread::spawn(move || {
+        let mut requests = Vec::new();
+        let mut script = script.into_iter();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !stopping.load(Ordering::Acquire) && Instant::now() < deadline {
+            let mut socket = match listener.accept() {
+                Ok((socket, _)) => socket,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("fixture accept: {error}"),
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                socket.read_exact(&mut byte).unwrap();
+                headers.push(byte[0]);
+            }
+            let headers = String::from_utf8(headers).unwrap();
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            socket.read_exact(&mut body).unwrap();
+            if headers.starts_with("GET ") {
+                let body = "{\"data\":[]}";
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                continue;
+            }
+            requests.push(serde_json::from_slice(&body).unwrap());
+            let Some((delta, finish)) = script.next() else {
+                continue;
+            };
+            let chunk = |delta: serde_json::Value, finish: serde_json::Value| {
+                serde_json::json!({"id":"s","object":"chat.completion.chunk","created":1,"model":"test",
+                    "choices":[{"index":0,"delta":delta,"finish_reason":finish}],
+                    "usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}})
+            };
+            let body = format!(
+                "data: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                chunk(delta, serde_json::Value::Null),
+                chunk(serde_json::json!({}), serde_json::json!(finish))
+            );
+            write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        requests
+    });
+    (stop, handle)
+}
+
+/// mini-agent-w7thh: after `session/load` of a live session the read-only mode
+/// still refuses a write: the file is not created and the model is told no.
+#[test]
+fn acp_write_after_session_load_stays_refused_in_readonly_mode() {
+    let roots = Roots::new();
+    let target = roots.0.join("loaded-write.txt");
+    let (stop, provider) = scripted_provider(
+        &roots,
+        vec![
+            (
+                serde_json::json!({"role":"assistant","content":"saved"}),
+                "stop",
+            ),
+            (
+                serde_json::json!({"role":"assistant","tool_calls":[{
+                    "index":0,"id":"w1","type":"function",
+                    "function":{"name":"write","arguments":"{\"path\":\"loaded-write.txt\",\"content\":\"nope\"}"}
+                }]}),
+                "tool_calls",
+            ),
+            (
+                serde_json::json!({"role":"assistant","content":"refused"}),
+                "stop",
+            ),
+        ],
+    );
+    let mut peer = Peer::start_with_tool_args(&roots, &["--tools", "write"], &[]);
+    peer.request(
+        1,
+        "initialize",
+        serde_json::json!({"protocolVersion":1,"clientCapabilities":{}}),
+    );
+    let created = peer.request(
+        2,
+        "session/new",
+        serde_json::json!({"cwd":roots.0,"mcpServers":[]}),
+    );
+    let id = created["sessionId"].as_str().unwrap().to_owned();
+    peer.request(
+        3,
+        "session/prompt",
+        serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":"save this session"}]}),
+    );
+    peer.request(
+        4,
+        "session/set_mode",
+        serde_json::json!({"sessionId":id,"modeId":"readonly"}),
+    );
+    let loaded = peer.request(
+        5,
+        "session/load",
+        serde_json::json!({"sessionId":id,"cwd":roots.0,"mcpServers":[]}),
+    );
+    assert_eq!(loaded["modes"]["currentModeId"], "readonly");
+    peer.request(
+        6,
+        "session/prompt",
+        serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":"write the file"}]}),
+    );
+    peer.request(7, "session/close", serde_json::json!({"sessionId":id}));
+    peer.finish();
+    stop.store(true, Ordering::Release);
+    let requests = provider.join().unwrap();
+    assert!(
+        !target.exists(),
+        "readonly mode must refuse the write after reload"
+    );
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    let tool_result = requests[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|message| message["role"] == "tool")
+        .map(|message| message["content"].to_string())
+        .expect("the model got a tool result");
+    assert!(
+        tool_result.contains("readonly mode does not allow write"),
+        "{tool_result}"
+    );
 }
 
 #[test]
