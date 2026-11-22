@@ -2200,7 +2200,7 @@ const MACRO_IDENTIFIER_NON_PROCESS_SITES: &[(&str, &str, usize, &str)] = &[
     // ACP shell tool-call JSON field and legacy-SSE connect error text: data tokens.
     (
         "src/extras/acp/mod.rs",
-        "\"output\": output,",
+        "\"output\": output.as_str(),",
         1,
         "NON-PROCESS",
     ),
@@ -2517,7 +2517,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/extras/mcp/server.rs",
         &[(
-            "d6d38b65394d86e02f59accaf62ebf13b460f5cddfc3914e71a90e7713f6d042",
+            "122ee07ccdbefaf41685aa7f0908037523679afc44132664234541b4d195baff",
             1,
         )],
     ),
@@ -2546,7 +2546,7 @@ const MACRO_NON_PROCESS_CONTEXTS: &[(&str, &[(&str, usize)])] = &[
     (
         "src/extras/acp/mod.rs",
         &[(
-            "507e238df2f2cf837c9b48e11a7a5d36f84e37aceded84b559884f43dd600358",
+            "d4204cd8ce3ac3baf733e1917f0e7889b66972934a9aeb7112820bacdc81504d",
             1,
         )],
     ),

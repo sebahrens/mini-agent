@@ -11184,7 +11184,7 @@ mod sandbox_tests {
 
     /// Index of the `flag source mount_point` triple whose mount point is
     /// `mount_point`, for any of the given flags.
-    #[cfg(unix)]
+    #[cfg(all(unix, any(not(target_os = "macos"), feature = "hooks")))]
     fn bind_position(args: &[String], flags: &[&str], mount_point: &str) -> Option<usize> {
         args.windows(3)
             .position(|w| flags.contains(&w[0].as_str()) && w[2] == mount_point)
