@@ -66,10 +66,13 @@ impl Limits {
     }
 }
 /// Whether this platform can publish a checked replacement or retirement of a
-/// workspace file. Windows can replace (see `paths::exchange_relative`) but has
-/// no checked retirement, so file rewind is refused there; capturing
-/// preimages that can never be restored would only consume the session limits.
-pub(crate) const FILE_RESTORE_SUPPORTED: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+/// workspace file. Windows does it with handle-bound moves (see
+/// `paths::exchange_relative` and `paths::retire_relative_expecting`).
+pub(crate) const FILE_RESTORE_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "macos", windows));
+/// Whole-workspace snapshots around shell commands remain Unix-only.
+pub(crate) const WORKSPACE_RESTORE_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "macos"));
 static LIMITS: std::sync::RwLock<Limits> = std::sync::RwLock::new(Limits::DEFAULT);
 /// Installs the process-wide checkpoint limits (agent construction).
 #[cfg_attr(test, allow(dead_code))]
@@ -991,7 +994,7 @@ impl FileCheckpoints {
         dir: &Path,
     ) -> anyhow::Result<WorkspaceReport> {
         anyhow::ensure!(
-            FILE_RESTORE_SUPPORTED,
+            WORKSPACE_RESTORE_SUPPORTED,
             "{}",
             SkipReason::Platform.describe()
         );
@@ -1031,7 +1034,7 @@ fn workspace_dir(session: &str) -> PathBuf {
 /// the rewind picker and, with `workspace_snapshots = true`, announced once.
 pub(crate) async fn before_shell(root: &Path) {
     let mode = super::workspace_snapshots::mode();
-    if mode == super::workspace_snapshots::Mode::Off || !FILE_RESTORE_SUPPORTED {
+    if mode == super::workspace_snapshots::Mode::Off || !WORKSPACE_RESTORE_SUPPORTED {
         return;
     }
     let Some(recorder) = current() else { return };

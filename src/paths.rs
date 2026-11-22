@@ -946,7 +946,16 @@ impl WorkspaceBinding {
         expected: &crate::fs::CheckedMetadata,
         base: &crate::fs::ContentDigest,
     ) -> io::Result<()> {
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            self.validate().map_err(io::Error::other)?;
+            let path = self.normalize_relative(path)?;
+            let (parent, name) = self.open_parent(&path, false)?;
+            let directory = parent.try_clone()?.into_std_file();
+            crate::fs::windows_retire_leaf_relative(&directory, &name, expected, base, &path)?;
+            self.validate().map_err(io::Error::other)
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             let _ = (path, expected, base);
             Err(io::Error::new(
@@ -2154,7 +2163,20 @@ mod windows_workspace_binding_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Hidden leftovers. A deleted object stays listed until every handle to
+    /// it (virus scanners and indexers briefly open new files) is closed, so
+    /// allow a short settle time before reporting residue.
     fn residue(root: &Path) -> Vec<String> {
+        for _ in 0..50 {
+            if residue_now(root).is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        residue_now(root)
+    }
+
+    fn residue_now(root: &Path) -> Vec<String> {
         std::fs::read_dir(root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
@@ -2308,6 +2330,86 @@ mod windows_workspace_binding_tests {
             result.is_err(),
             "a concurrently open writer must block publication"
         );
+        assert_eq!(std::fs::read(&target).unwrap(), b"before");
+        assert!(residue(&root).is_empty(), "{:?}", residue(&root));
+        drop(binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retire_removes_an_unchanged_file_and_frees_the_name() {
+        let root = temp_root("retire-ok");
+        std::fs::write(root.join("gone.txt"), b"created by agent").unwrap();
+        let (binding, expected, base) = capture(&root, "gone.txt");
+
+        binding
+            .retire_relative_expecting(Path::new("gone.txt"), &expected, &base)
+            .unwrap();
+
+        assert!(!root.join("gone.txt").exists());
+        assert!(residue(&root).is_empty(), "{:?}", residue(&root));
+        // The name is immediately reusable.
+        std::fs::write(root.join("gone.txt"), b"again").unwrap();
+        drop(binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retire_refuses_content_changed_after_the_read() {
+        let root = temp_root("retire-stale");
+        std::fs::write(root.join("a.txt"), b"before").unwrap();
+        let (binding, expected, base) = capture(&root, "a.txt");
+        std::fs::write(root.join("a.txt"), b"edited elsewhere").unwrap();
+
+        binding
+            .retire_relative_expecting(Path::new("a.txt"), &expected, &base)
+            .expect_err("a changed file must not be retired");
+
+        assert_eq!(
+            std::fs::read(root.join("a.txt")).unwrap(),
+            b"edited elsewhere"
+        );
+        assert!(residue(&root).is_empty(), "{:?}", residue(&root));
+        drop(binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retire_refuses_a_file_held_open_for_writing() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root = temp_root("retire-held");
+        let target = root.join("a.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let (binding, expected, base) = capture(&root, "a.txt");
+        let writer = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(7)
+            .open(&target)
+            .unwrap();
+
+        let result = binding.retire_relative_expecting(Path::new("a.txt"), &expected, &base);
+
+        drop(writer);
+        assert!(result.is_err(), "a concurrent writer must block retirement");
+        assert_eq!(std::fs::read(&target).unwrap(), b"before");
+        assert!(residue(&root).is_empty(), "{:?}", residue(&root));
+        drop(binding);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retire_refuses_a_swapped_file_without_deleting_it() {
+        let root = temp_root("retire-swap");
+        let target = root.join("a.txt");
+        std::fs::write(&target, b"before").unwrap();
+        let (binding, expected, base) = capture(&root, "a.txt");
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&target, b"before").unwrap();
+
+        binding
+            .retire_relative_expecting(Path::new("a.txt"), &expected, &base)
+            .expect_err("a different file object with equal bytes must be kept");
+
         assert_eq!(std::fs::read(&target).unwrap(), b"before");
         assert!(residue(&root).is_empty(), "{:?}", residue(&root));
         drop(binding);

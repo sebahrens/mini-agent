@@ -60,10 +60,13 @@ Existing files use the same checked atomic replacement as native tools. Created
 files are moved into an exclusively-created private sibling retirement directory,
 validated there, and deleted only if their identity and content still match.
 A raced foreign object is retained and create-only rollback never overwrites a
-newer file. Windows has no atomic name exchange; `paths::exchange_relative` emulates
-checked replacement there with handle-bound moves (the target name is briefly absent),
-but checked retirement (`retire_relative_expecting`) is still unsupported, so file rewind is refused up front, no preimages are captured (the
-first edit says so once), and conversation-only rewind remains available.
+newer file. Windows has no atomic name exchange or compare-and-replace; it uses handle-bound
+moves instead (`paths::exchange_relative`, `paths::retire_relative_expecting`,
+`fs::atomic_write_resolved_expecting`): the old file is opened without following links and with
+writers excluded, verified by identity and content on that handle, moved aside by the same
+handle, and the replacement is published create-only (a failure puts the old file back
+create-only; retirement deletes the verified object). The target name is briefly absent. File
+rewind therefore works on Windows; whole-workspace snapshots stay Unix-only.
 
 `/rewind` also offers **Restore unchanged files only**: every selected file whose
 current bytes still match the recorded postimage is restored, files changed since
