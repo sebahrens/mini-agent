@@ -139,12 +139,22 @@ drive) reports `<path> is not a supported install location for the JavaScript to
 ### Git tool unavailable on Windows
 
 The structured `git` tool needs the AppContainer sandbox: with `--no-sandbox` it is not offered
-(`Windows structured Git requires AppContainer`) and git runs only through the shell tool.
-`mini-agent --git-runtime-check` runs the bundled Git inside the container. The runtime directory
-(`<local data>\git-runtime\<id>`) holds `git.exe` and its DLL closure; it is granted to the container
-as read/execute roots, one grant per file (the files have protected private ACLs, so a directory grant
-is not inherited). Exit code `-1073741515` (0xC0000135, DLL not found) from that probe means the
-container could not read a DLL beside `git.exe`.
+(`Windows structured Git requires AppContainer`; run git through the shell tool instead).
+`mini-agent --git-runtime-check` runs the bundled Git inside the container
+(`git rev-parse --git-dir`, which succeeds or reports "not a git repository" when the executable, its
+DLLs and the working directory all work). The runtime directory
+(`<local data>\git-runtime\<id>`) holds `git.exe` and its DLL closure; every file is granted to the
+container as a read/execute root, one grant per file (the files have protected private ACLs, so a
+directory grant would not be inherited). Probe failures:
+
+- Exit code `-1073741515` (0xC0000135) or `-1073741790` (0xC0000022): the container could not read a
+  DLL beside `git.exe`.
+- `fatal: could not open '/dev/null'`: the container has no access to the NUL device (Git opens it
+  first).
+- `cannot resolve its working directory inside the Windows AppContainer`: upstream Git resolves the
+  working directory with `GetFinalPathNameByHandleW` and a DOS volume name, which an AppContainer is
+  denied. The structured tool is withheld because every operation would fail; use git through the
+  shell tool.
 
 ### [sandbox network: blocked host:port (reason)]
 

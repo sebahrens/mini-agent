@@ -2032,6 +2032,47 @@ fn guarded_runtime_dir_of(program: &Path) -> Option<PathBuf> {
         .find(|protected| protected == dir)
 }
 
+/// Judge the contained Git probe (`git rev-parse --git-dir`, which resolves the working
+/// directory first). Git exiting 128 with "not a git repository" proves the executable, its
+/// DLL closure and the working directory all work in the container; the workspace need not be
+/// a repository. Upstream Git resolves the working directory with
+/// `GetFinalPathNameByHandleW(VOLUME_NAME_DOS)`, which an AppContainer is denied, and fails
+/// with "Unable to read current working directory": that is reported by name instead of an
+/// opaque exit code, and the tool is not offered because every operation would fail.
+#[cfg(any(test, feature = "git-worktree"))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn classify_git_probe(exit_code: Option<i32>, stderr: &str) -> Result<(), String> {
+    if exit_code == Some(0) {
+        return Ok(());
+    }
+    if stderr.contains("Unable to read current working directory") {
+        return Err(
+            "the guarded Git cannot resolve its working directory inside the Windows \
+             AppContainer (Git calls GetFinalPathNameByHandleW with a DOS volume name, which \
+             the container is denied); the structured git tool is unavailable until the \
+             bundled Git carries a fallback, use git through the shell tool"
+                .to_string(),
+        );
+    }
+    if exit_code == Some(128) && stderr.contains("not a git repository") {
+        return Ok(());
+    }
+    let sanitized: String = stderr
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(160)
+        .collect();
+    Err(format!(
+        "bound Windows AppContainer Git probe was rejected (exit_code={}){}",
+        exit_code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+        if sanitized.trim().is_empty() {
+            String::new()
+        } else {
+            format!(": {}", sanitized.trim())
+        }
+    ))
+}
+
 /// Regular files directly inside the guarded runtime `directory`, sorted and
 /// bounded; links and subdirectories are never granted.
 #[cfg(any(test, feature = "git-worktree"))]
@@ -11646,6 +11687,24 @@ mod sandbox_tests {
             )
             .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
+    }
+
+    #[test]
+    fn git_probe_classification_names_the_getcwd_failure() {
+        assert!(classify_git_probe(Some(0), "").is_ok());
+        assert!(
+            classify_git_probe(Some(128), "fatal: not a git repository (or any parent)\n").is_ok()
+        );
+        let cwd = classify_git_probe(
+            Some(128),
+            "fatal: Unable to read current working directory: No such file or directory\n",
+        )
+        .unwrap_err();
+        assert!(cwd.contains("GetFinalPathNameByHandleW") && cwd.contains("shell tool"));
+        let other = classify_git_probe(Some(-1073741515), "").unwrap_err();
+        assert!(other.ends_with("(exit_code=-1073741515)"));
+        let noisy = classify_git_probe(Some(1), "boom\n\u{1b}[31mred").unwrap_err();
+        assert!(!noisy.contains('\n') && !noisy.contains('\u{1b}'));
     }
 
     #[test]
