@@ -2163,7 +2163,20 @@ mod windows_workspace_binding_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    /// Hidden leftovers. A deleted object stays listed until every handle to
+    /// it (virus scanners and indexers briefly open new files) is closed, so
+    /// allow a short settle time before reporting residue.
     fn residue(root: &Path) -> Vec<String> {
+        for _ in 0..50 {
+            if residue_now(root).is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        residue_now(root)
+    }
+
+    fn residue_now(root: &Path) -> Vec<String> {
         std::fs::read_dir(root)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
