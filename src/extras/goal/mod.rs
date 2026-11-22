@@ -61,6 +61,16 @@ pub fn parse_goal_command(body: &str) -> GoalCommand<'_> {
         _ => GoalCommand::Objective,
     }
 }
+/// The line printed after an interrupt while a goal is still active: the
+/// interrupt ends the round, not the goal (mini-agent-27kzu).
+pub fn interrupt_notice(headless: bool) -> &'static str {
+    if headless {
+        "goal stays active in this session (an interrupt does not stop it): --goal-resume continues it; /goal pause (resume the session in the TUI) parks it, /goal clear drops it"
+    } else {
+        "goal stays active (an interrupt does not stop it): send a message or /goal resume to continue, /goal pause to park it, /goal clear to drop it"
+    }
+}
+
 pub mod driver;
 pub mod gate;
 pub mod judge;
@@ -1982,5 +1992,22 @@ mod hook_info_tests {
         assert!(current_hook_info().is_some());
         store.clear();
         assert!(current_hook_info().is_none());
+    }
+}
+
+#[cfg(test)]
+mod interrupt_notice_tests {
+    use super::interrupt_notice;
+
+    /// mini-agent-27kzu: both surfaces say the goal stays active and name how
+    /// to stop it.
+    #[test]
+    fn interrupt_notice_says_the_goal_stays_active_and_how_to_stop_it() {
+        for headless in [false, true] {
+            let text = interrupt_notice(headless);
+            assert!(text.contains("stays active"), "{text}");
+            assert!(text.contains("/goal pause"), "{text}");
+        }
+        assert!(interrupt_notice(true).contains("--goal-resume"));
     }
 }

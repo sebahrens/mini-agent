@@ -17,9 +17,13 @@ fixed set of arguments open a second picker after the command is selected.
 Press `Tab` after an exact or partially completed command (including pasted or
 history-recalled input) to show and filter every valid choice. Commands whose
 argument is free-form print their dedicated usage when it is omitted.
-In an argument picker, `Enter` selects the highlighted value and submits the
-complete command in the same key event; `Tab` selects it without submitting so
-the command can still be edited. Typing a space after an exact free-form command
+In an argument picker, `Enter` fills the highlighted value into the input and a
+second `Enter` runs the command (the picker's hint line says "enter to fill, enter
+again to run"; the `/model` picker's header says the same); `Tab` fills it too
+and keeps editing. This two-step contract is deliberate (pinned by the picker test
+`argument_enter_and_tab_select_without_submitting`): a value pick never runs a
+command, such as a model switch, in the same key event. `/undo` is the one
+exception and runs on `Enter`. Typing a space after an exact free-form command
 such as `/add` closes command completion and starts ordinary argument entry.
 
 While the main agent is running, `/help` (including `/help keys`), bare `/model`,

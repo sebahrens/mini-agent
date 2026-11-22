@@ -4819,6 +4819,17 @@ impl<'a> App<'a> {
             "interrupted (changes may be partial; review with git diff)",
             C_ERROR,
         )?;
+        #[cfg(feature = "goal")]
+        if self
+            .ui
+            .session
+            .goal_store
+            .snapshot()
+            .is_some_and(|goal| goal.status == crate::extras::goal::GoalStatus::Active)
+        {
+            self.renderer
+                .write_line(crate::extras::goal::interrupt_notice(false), C_AGENT)?;
+        }
         let jobs = self.ui.sandbox.running_background_job_count();
         if jobs > 0 {
             self.renderer.write_line(

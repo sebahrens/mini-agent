@@ -1137,6 +1137,26 @@ mod tests {
         }
     }
 
+    // mini-agent-x4a6f: Enter fills, a second Enter runs, and the picker says so.
+    #[test]
+    fn argument_picker_hint_names_the_two_step_enter() {
+        let mut picker = ListPicker::new();
+        picker.set_items(vec!["yolo".to_string(), "auto".to_string()]);
+        picker.activate();
+        let mut out = Vec::new();
+        picker
+            .draw_with_hint(
+                &mut out,
+                80,
+                20,
+                "enter to fill, enter again to run, tab to fill and keep editing",
+            )
+            .unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.contains("enter to fill, enter again to run"), "{text}");
+        assert!(text.contains("yolo"));
+    }
+
     #[test]
     fn stale_file_query_replacement_preserves_the_multibyte_buffer_tail() {
         let mut buffer = CompactString::from("@a日本");

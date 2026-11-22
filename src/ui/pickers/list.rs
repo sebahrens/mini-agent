@@ -576,6 +576,49 @@ impl ListPicker {
             .map(|index| &*self.items[*index])
     }
 
+    /// [`Self::draw`] with a dim one-line `hint` on the row above the list
+    /// (argument pickers: what Enter and Tab do). No hint when the list is empty.
+    pub fn draw_with_hint(
+        &self,
+        mut out: &mut dyn std::io::Write,
+        cols: u16,
+        floor_row: u16,
+        hint: &str,
+    ) -> std::io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        if self.len() == 0 || floor_row < 2 {
+            return self.draw(out, cols, None, floor_row);
+        }
+        draw_picker_rows(
+            out,
+            cols,
+            self.len(),
+            |index| self.display_row(index),
+            self.selected,
+            self.monochrome,
+            self.accent,
+            None,
+            floor_row,
+            1,
+        )?;
+        let window = super::picker_window(floor_row, 1, self.len(), self.selected);
+        let Some(row) = window.top_row.checked_sub(1) else {
+            return Ok(());
+        };
+        let text = crate::ui::utils::display_prefix(hint, cols.saturating_sub(2) as usize);
+        crossterm::queue!(
+            &mut out,
+            crossterm::cursor::MoveTo(0, row),
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::CurrentLine),
+            crossterm::style::SetAttribute(crossterm::style::Attribute::Dim),
+            crossterm::style::Print(format!("  {text}")),
+            crossterm::style::SetAttribute(crossterm::style::Attribute::NormalIntensity),
+        )?;
+        out.flush()
+    }
+
     pub fn draw(
         &self,
         out: &mut dyn std::io::Write,
