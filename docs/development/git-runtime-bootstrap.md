@@ -86,6 +86,7 @@ bytes. Runtime approval comes from the compiled payload and policy contract.
 | `x86_64-unknown-linux-musl` | Explicit Docker launcher and pinned static MbedTLS/curl closure; see `git-runtime-musl.md` |
 | `aarch64-unknown-linux-musl` | Explicit Docker launcher and pinned static MbedTLS/curl closure; see `git-runtime-musl.md` |
 | `x86_64-pc-windows-msvc` | Explicit MSYS2 UCRT64 native executable/DLL bundle and Schannel curl; see below |
+| `aarch64-pc-windows-msvc` | Same helper in MSYS2 CLANGARM64 (clang) on a Windows ARM64 host; native ARM64 PE images only |
 
 The generic native bootstrap refuses cross-target requests; the musl and Windows
 paths use their explicit provisioning helpers. No host payload is labeled as
@@ -221,3 +222,14 @@ These exercise PE import/delay/forwarder parsing, recursive/cyclic DLL closure,
 absent DLLs despite ambient PATH, emulation-runtime refusal, wrong architecture,
 native compiler/Schannel requirements, whole-bundle publication and failure
 cleanup. They do not substitute for the pending native Windows execution row.
+
+## Windows ARM64 and package-sync resilience
+
+`build-git-runtime-windows.py --target aarch64-pc-windows-msvc` requires `MSYSTEM=CLANGARM64`, a clang
+that reports an aarch64 mingw triple, and ARM64 PE images throughout the dependency closure. In
+`.github/actions/prepare-git-runtime` the MSYS2 packages are synchronised by retrying steps (three
+attempts with backoff) that keep only the base and the toolchain repository in the pacman configuration,
+still from the official MSYS2 mirrors with signature verification. Outside release source collection, the
+verified payload is stored in the Actions cache keyed by target, runner architecture, month, and the hashes
+of the pinned source archive, policy patch, bootstrap scripts and the action; the Cargo build script still
+verifies every payload file hash.

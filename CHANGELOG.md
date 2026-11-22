@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Windows ARM64: the guarded Git runtime now builds natively for `aarch64-pc-windows-msvc` from the MSYS2 CLANGARM64 repository (clang), and the release workflow builds and smoke-tests the ARM64 zip archives; the MSYS2 package sync retries with backoff, syncs only the needed repositories, and a prepared Windows runtime is reused from the Actions cache for unchanged pinned inputs (mini-agent-ms27x, mini-agent-nvnkx.143).
 - `compact_size_fraction` (default 0.75; `0` disables) starts automatic compaction, between turns and at tool-batch boundaries, when the encoded session nears the 32 MiB save ceiling, so image-heavy sessions compact before saving stops (mini-agent-fmmhs).
 - TUI compaction on the session model over Anthropic or OpenAI forks the conversation's own request (same system prompt, tools and prefix, tools disabled) so the summary reads the prompt cache; other routes, a `compaction_model`, sessions with images or native replay history keep the text summarizer (mini-agent-o2nut).
 - `--stream-json-schema claude` partial streams now frame `message_start`/`content_block_start`/`content_block_stop`/`message_delta`/`message_stop` with per-block indexes; turn-budget exhaustion reports `error_max_turns`; results carry `uuid`, `duration_api_ms` and `permission_denials`, and records a `uuid` (mini-agent-5ux7e).

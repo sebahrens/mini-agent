@@ -299,7 +299,7 @@ jobs:
   build-windows:
     name: ${{ matrix.target }}
     needs: [verify-ci, package-metadata]
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
     defaults:
       run:
         shell: bash
@@ -308,6 +308,9 @@ jobs:
       matrix:
         include:
           - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+          - target: aarch64-pc-windows-msvc
+            runner: windows-11-arm
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -315,6 +318,7 @@ jobs:
       - name: Prepare guarded Git runtime
         uses: ./.github/actions/prepare-git-runtime
         with:
+          target: ${{ matrix.target }}
           collect-sources: "true"
 
       - name: Install Rust
@@ -418,7 +422,7 @@ jobs:
         run: |
           set -euo pipefail
           records=()
-          for target in x86_64-pc-windows-msvc x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+          for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
             record="native-git-sources/native-git-sources-$target/native-components.json"
             test -s "$record"
             records+=(--native-record "$record")
@@ -470,6 +474,10 @@ jobs:
             js_expectation: "yes"
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            executable: mini-agent.exe
+            js_expectation: "yes"
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
             executable: mini-agent.exe
             js_expectation: "yes"
     steps:
@@ -551,6 +559,7 @@ jobs:
             mini-agent-x86_64-unknown-linux-musl.tar.gz
             mini-agent-aarch64-unknown-linux-musl.tar.gz
             mini-agent-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-aarch64-pc-windows-msvc.tar.gz
             mini-agent-lite-x86_64-unknown-linux-gnu.tar.gz
             mini-agent-lite-aarch64-unknown-linux-gnu.tar.gz
             mini-agent-lite-x86_64-apple-darwin.tar.gz
@@ -558,6 +567,7 @@ jobs:
             mini-agent-lite-x86_64-unknown-linux-musl.tar.gz
             mini-agent-lite-aarch64-unknown-linux-musl.tar.gz
             mini-agent-lite-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-lite-aarch64-pc-windows-msvc.tar.gz
             mini-agent-${GITHUB_REF_NAME}-source.tar.gz
           )
           printf '%s\n' "${expected[@]}" > expected-archives.txt
@@ -883,6 +893,7 @@ jobs:
             mini-agent-x86_64-unknown-linux-musl.tar.gz
             mini-agent-aarch64-unknown-linux-musl.tar.gz
             mini-agent-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-aarch64-pc-windows-msvc.tar.gz
             mini-agent-lite-x86_64-unknown-linux-gnu.tar.gz
             mini-agent-lite-aarch64-unknown-linux-gnu.tar.gz
             mini-agent-lite-x86_64-apple-darwin.tar.gz
@@ -890,6 +901,7 @@ jobs:
             mini-agent-lite-x86_64-unknown-linux-musl.tar.gz
             mini-agent-lite-aarch64-unknown-linux-musl.tar.gz
             mini-agent-lite-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-lite-aarch64-pc-windows-msvc.tar.gz
             mini-agent-${GITHUB_REF_NAME}-source.tar.gz
             SHA256SUMS
             VSIX_SHA256SUMS
@@ -919,6 +931,7 @@ jobs:
             mini-agent-x86_64-unknown-linux-musl.tar.gz
             mini-agent-aarch64-unknown-linux-musl.tar.gz
             mini-agent-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-aarch64-pc-windows-msvc.tar.gz
             mini-agent-lite-x86_64-unknown-linux-gnu.tar.gz
             mini-agent-lite-aarch64-unknown-linux-gnu.tar.gz
             mini-agent-lite-x86_64-apple-darwin.tar.gz
@@ -926,6 +939,7 @@ jobs:
             mini-agent-lite-x86_64-unknown-linux-musl.tar.gz
             mini-agent-lite-aarch64-unknown-linux-musl.tar.gz
             mini-agent-lite-x86_64-pc-windows-msvc.tar.gz
+            mini-agent-lite-aarch64-pc-windows-msvc.tar.gz
             mini-agent-${GITHUB_REF_NAME}-source.tar.gz
           )
           printf '%s\n' "${expected_archives[@]}" > expected-archives.txt

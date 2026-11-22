@@ -347,7 +347,7 @@ class GitRuntimeCiTests(unittest.TestCase):
         source = job_body(self.release, "corresponding-source")
         self.assertIn('needs: [verify-ci, package-metadata, build-static, build-windows]', source)
         self.assertIn('pattern: native-git-sources-*', source)
-        self.assertIn('for target in x86_64-pc-windows-msvc x86_64-unknown-linux-musl aarch64-unknown-linux-musl;', source)
+        self.assertIn('for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc x86_64-unknown-linux-musl aarch64-unknown-linux-musl;', source)
         self.assertIn('test -s "$record"', source)
         self.assertIn('records+=(--native-record "$record")', source)
         self.assertIn('HEAD "${records[@]}"', source)
