@@ -111,6 +111,42 @@ command in `standard` mode runs without a prompt while an enforced `workspace` o
 `host-read` sandbox with network `deny` or `allowlist` contains it; deny and ask
 rules, destructive commands and `escalate=true` still prompt.
 
+On Windows the AppContainer shell is launched in the workspace and can list and
+read it. The shells resolve the working directory by name (PowerShell
+`Set-Location`, cmd.exe `dir`/`del`, `GetLongPathName` enumerate each ancestor to
+case-correct it), so every named ancestor of the workspace that does not already
+admit application packages receives, for the launch's unique profile SID only,
+`FILE_TRAVERSE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE` on the
+directory itself with no inheritance: the container can list the names inside
+each ancestor, nothing is readable below it beyond its own ACLs, and nothing is
+writable. The grants are revoked when the command ends. They are best effort: an
+ancestor whose DACL the user cannot change is left as it is (user-owned directories
+are changeable; `C:\\Users` and a drive root normally need an elevated start, and a
+grant is skipped when `ALL APPLICATION PACKAGES` already lists the directory).
+Without them PowerShell can start in `C:\\` and `cmd.exe dir` is refused, which is an
+operating-system limit of the container, not a policy choice. The cmd.exe UTF-8 prelude
+is skipped under AppContainer (it redirected `chcp` to `nul`), and every Windows
+PowerShell launch sets `$PSStyle.OutputRendering = 'PlainText'`, so PowerShell errors
+carry no ANSI colour sequences in any front end (ACP included).
+
+Interpreters and build tools installed outside `Program Files` (a runner tool
+cache, `C:\Python312`, a Chocolatey or Scoop directory) are on `PATH` but are not
+readable by the container. Unless `windows-appcontainer-toolchain-discovery` is
+`false`, the shell grants read and execute (never write) on the install
+directory of each well-known command the host `PATH` resolves, within the size
+and exclusion rules documented in `docs/agent/CONFIG.md` (the same idea as
+`sandbox-toolchain-roots` on Linux). The grant is best effort per root: a root
+whose DACL the user cannot change is skipped, never an error. A failed command
+that names a program the host resolves but the sandbox cannot run gets a
+`[sandbox: ...]` note naming `windows-appcontainer-read-roots`.
+
+The container cannot open the NUL device by default (the device DACL does not
+admit AppContainers), which breaks Git for Windows (it opens `/dev/null` first),
+cmd.exe `>nul`, Python `subprocess.DEVNULL` and Node ignored stdio. When
+mini-agent runs elevated it adds a temporary read/write ACE for the launch's
+unique SID on `\\.\NUL` and revokes it at cleanup; otherwise the limitation
+stands, the failure note says so, and Git operations should use the `git` tool.
+
 `pty = true` and `job_status action=input`/`keys` exist on Unix and, on
 Windows, under the AppContainer sandbox backend. On Windows the AppContainer
 helper hosts a ConPTY (`CreatePseudoConsole`) and creates the target with

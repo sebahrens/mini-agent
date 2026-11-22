@@ -146,6 +146,9 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- Windows AppContainer shell: the working directory is the workspace and it can be listed and read (named ancestors of the workspace now grant the container traverse and name listing), PowerShell no longer starts in `C:\` and cmd.exe no longer prints "Access is denied." before every command (mini-agent-p5g08).
+- Windows AppContainer shell: python, node and other toolchains the host `PATH` resolves are runnable through read/execute grants (`windows-appcontainer-toolchain-discovery`, default on, global-only); a failed command naming such a program says so and names `windows-appcontainer-read-roots`; an elevated launch lets Git reach the NUL device; `--doctor` probes `python` then `py` on Windows (mini-agent-bybjh).
+- Windows: sessions started at the same time no longer fail the production preflight with "no successful production preflight" because another session's live preflight root was scanned as preserved recovery state; the startup refusal now includes the preflight reason (mini-agent-pc1dr).
 - Read-only shell auto-allow no longer lets `git log -p`, `git show`, `git diff` or `git blame` (including `REV:path` arguments) read denied files from history: with any read deny rule they ask (mini-agent-qc4cf).
 - Azure WireServer `168.63.129.16` (and its IPv4-mapped form) is blocked by web fetch, JS fetch, MCP URL screening and the sandbox proxy (mini-agent-u903e).
 - MCP first-connect retries are bounded in total by `startup_timeout_sec`, a timed-out handshake is not retried, and 408/429 (with numeric `Retry-After`) are retried (mini-agent-0yrql).

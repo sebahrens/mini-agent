@@ -2245,7 +2245,7 @@ fn prepare_launch_request(
     let traverse_roots = workspace
         .ancestors()
         .skip(1)
-        .filter(|ancestor| ancestor.file_name().is_some())
+        .filter(|ancestor| ancestor.file_name().is_some() || is_plain_drive_root(ancestor))
         .map(Path::to_path_buf)
         .collect();
     validate_explicit_root_policy(
@@ -3328,7 +3328,7 @@ fn run_helper() -> Result<i32, String> {
     let requested_traverse_roots = request
         .traverse_roots
         .iter()
-        .map(|root| canonical_root(root, "workspace traversal root"))
+        .map(|root| canonical_traverse_root(root))
         .collect::<Result<Vec<_>, _>>()?;
     let all_packages = sid_from_string("S-1-15-2-1")?;
     let mut traverse_roots = Vec::new();
@@ -3655,6 +3655,36 @@ fn read_request() -> Result<LaunchRequest, String> {
         .map_err(|error| format!("decode Windows launch request: {error}"))
 }
 
+/// A drive root such as `\\?\C:\`: a disk prefix and a root directory, nothing else.
+fn is_plain_drive_root(path: &Path) -> bool {
+    let mut components = path.components();
+    matches!(
+        components.next(),
+        Some(std::path::Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+    ) && matches!(components.next(), Some(std::path::Component::RootDir))
+        && components.next().is_none()
+}
+
+/// Canonicalise one named ancestor of the workspace. `canonical_root` refuses a drive root
+/// because no access root may be one; as a name-listing ancestor it is accepted only when it is
+/// already exactly its own canonical form (no substitution or reparse point on the way).
+fn canonical_traverse_root(path: &Path) -> Result<PathBuf, String> {
+    if is_plain_drive_root(path) {
+        let canonical = std::fs::canonicalize(path).map_err(|error| {
+            format!(
+                "sandbox: canonicalize workspace drive root {}: {error}",
+                path.display()
+            )
+        })?;
+        if canonical != path || !canonical.is_dir() {
+            return Err("sandbox: workspace drive root is not its own canonical directory".into());
+        }
+        return Ok(canonical);
+    }
+    canonical_root(path, "workspace traversal root")
+}
+
 fn canonical_root(path: &Path, label: &str) -> Result<PathBuf, String> {
     reject_reparse_components(path)?;
     let canonical = std::fs::canonicalize(path)
@@ -3972,12 +4002,22 @@ fn sid_from_string(value: &str) -> Result<Local, String> {
 /// report access the container does not have. Returns the rights on the object itself and the
 /// rights inherited by both files and subdirectories; a missing DACL grants everything.
 fn exact_sid_rights(path: &Path, sid: PSID) -> Result<(u32, u32), String> {
-    let wide = wide_null(path.as_os_str())?;
+    // Handle-bound, like every other DACL read of an access root: the path is opened once without
+    // following links and the descriptor is read from that handle.
+    let directory = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("sandbox: inspect path for exact-SID rights: {error}"))?
+        .is_dir();
+    let file = open_stable_path(
+        path,
+        directory,
+        READ_CONTROL | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
     let mut dacl = null_mut();
     let mut descriptor = null_mut();
     let result = unsafe {
-        GetNamedSecurityInfoW(
-            wide.as_ptr(),
+        GetSecurityInfo(
+            file.as_raw_handle(),
             SE_FILE_OBJECT,
             DACL_SECURITY_INFORMATION,
             null_mut(),
@@ -5438,6 +5478,11 @@ fn sweep_stale_profile_journal(
     // the root so the operator can repair it.
     let mut roots = Vec::new();
     for root in super::roots_present_on_disk(&journal.roots, journal_root.path()) {
+        // A launch may have granted name listing on a drive root, which no access root can be.
+        if is_plain_drive_root(&root) {
+            roots.push(canonical_traverse_root(&root)?);
+            continue;
+        }
         roots.extend(
             canonicalize_access_roots([root.as_path()], journal_root.path())
                 .map_err(|error| format!("{error}: {}", root.display()))?,
@@ -5465,6 +5510,14 @@ fn sweep_stale_profile_journal(
         // a no-op WRITE_DAC transaction on those paths; enterprise endpoint controls can make a
         // directory-tree DACL rewrite exceed the complete recovery ceiling.
         if stale_effective == 0 {
+            continue;
+        }
+        // `effective_path_rights` folds `Everyone` into the stale SID's rights, so it cannot tell
+        // whether an ACE for that SID exists. Revoking where none exists would rewrite the
+        // directory DACL with child propagation (a whole drive for a drive-root ancestor), so
+        // only a root that carries an ACE naming the stale SID is revoked.
+        let (own, inherited) = exact_sid_rights(&root, sid.0)?;
+        if own == 0 && inherited == 0 {
             continue;
         }
         revoke_tree_until(&root, sid.0, deadline)
@@ -7546,6 +7599,28 @@ mod tests {
         assert!(diagnostic.starts_with("stage "));
         assert!(diagnostic.ends_with("..."));
         assert!(diagnostic.chars().count() <= MAX_PREFLIGHT_DIAGNOSTIC_CHARS + 3);
+    }
+
+    #[test]
+    fn a_concurrent_sessions_preflight_root_is_not_preserved_recovery_state() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let root =
+            std::env::temp_dir().join(format!("{PREFLIGHT_ROOT_PREFIX}{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        // Just created, no lease yet: its owner may still be about to create it.
+        assert!(preflight_root_is_possibly_live(&root));
+        // A held exclusive lease is a live session whatever the root's age.
+        let lease = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(0)
+            .open(root.join(PREFLIGHT_OWNER_FILE))
+            .unwrap();
+        assert!(preflight_root_is_possibly_live(&root));
+        drop(lease);
+        std::fs::remove_dir_all(&root).unwrap();
+        // The owner finished and removed the root while it was being inspected.
+        assert!(preflight_root_is_possibly_live(&root));
     }
 
     fn installed_sandbox_test_executable() -> PathBuf {
