@@ -2857,17 +2857,37 @@ pub(crate) fn windows_exchange_open_file_relative(
     })
 }
 
-/// Mark the object behind `file` (opened with DELETE access) for deletion.
+/// Delete the object behind `file` (opened with DELETE access). POSIX
+/// semantics unlink the name at once even while other handles (scanners,
+/// indexers, readers) keep the object alive; older systems fall back to the
+/// classic delete-on-close disposition.
 #[cfg(windows)]
 #[allow(unsafe_code)]
 fn windows_mark_open_file_deleted(file: &std::fs::File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO,
+        FILE_DISPOSITION_INFO_EX, FileDispositionInfo, FileDispositionInfoEx,
+        SetFileInformationByHandle,
     };
+    let extended = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    // SAFETY: `file` owns a live handle with DELETE access and `extended` has
+    // the layout required by FileDispositionInfoEx.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileDispositionInfoEx,
+            (&extended as *const FILE_DISPOSITION_INFO_EX).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if ok != 0 {
+        return Ok(());
+    }
     let information = FILE_DISPOSITION_INFO { DeleteFile: true };
-    // SAFETY: `file` owns a live handle with DELETE access and `information`
-    // has the layout required by FileDispositionInfo.
+    // SAFETY: as above, with the FileDispositionInfo layout.
     let ok = unsafe {
         SetFileInformationByHandle(
             file.as_raw_handle().cast(),
