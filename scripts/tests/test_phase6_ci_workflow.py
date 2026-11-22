@@ -641,7 +641,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     r"(?s)(?:for|foreach).+skills.+cargo test",
                 )
 
-    def test_superseded_branch_and_pr_runs_are_cancelled_but_never_tag_runs(self) -> None:
+    def test_only_superseded_pr_runs_are_cancelled_never_push_or_tag_runs(self) -> None:
         block = self.workflow.split("\nconcurrency:\n", 1)[1].split("\njobs:", 1)[0]
         group = re.search(r"(?m)^  group: (.+)$", block).group(1)
         cancel = re.search(r"(?m)^  cancel-in-progress: (.+)$", block).group(1)
@@ -651,7 +651,9 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         self.assertIn("github.event_name == 'schedule'", group)
         self.assertIn("github.event_name == 'workflow_dispatch'", group)
         self.assertIn("github.event_name == 'pull_request'", cancel)
-        self.assertIn("github.event_name == 'push' && !startsWith(github.ref, 'refs/tags/')", cancel)
+        # Push runs (main, tags) are never cancelled: each has its own group.
+        self.assertNotIn("push", cancel)
+        self.assertIn("github.event_name == 'push' && format('-{0}', github.sha)", group)
         self.assertNotIn("schedule", cancel)
         self.assertNotIn("workflow_dispatch", cancel)
 

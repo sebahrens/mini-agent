@@ -27,7 +27,7 @@ from typing import Callable, Iterable, NamedTuple
 
 # Only known, non-build data is exempt. Unknown JSON and other data still run
 # the matrix; extensions alone cannot distinguish evidence from fixtures.
-DOCS_ONLY = re.compile(r"^(docs/|\.beads/|[^/]*\.md$|editors/vscode/.*\.md$)")
+DOCS_ONLY = re.compile(r"^(docs/|\.beads/|reports/|research_notes/|[^/]*\.md$|editors/vscode/.*\.md$)")
 CONSUMED_DOCS = re.compile(
     r"^(docs/agent/|docs/specs/|docs/benchmarks/|docs/vscode-acp-setup\.md$|SOURCE\.md$|LICENSE)"
 )
