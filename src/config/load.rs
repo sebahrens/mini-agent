@@ -2712,6 +2712,10 @@ pub fn set_run_trust_project_config(enabled: bool) {
     RUN_TRUST_PROJECT_CONFIG.store(enabled, std::sync::atomic::Ordering::Relaxed);
 }
 
+pub(crate) fn run_trust_project_config_active() -> bool {
+    run_trust_project_config()
+}
+
 fn run_trust_project_config() -> bool {
     #[cfg(test)]
     {

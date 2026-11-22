@@ -435,6 +435,13 @@ pub(crate) struct ActiveContextSelection {
 }
 
 impl ContextFiles {
+    /// Text of the user's own global `AGENTS.md`, when one was loaded.
+    pub(crate) fn global_instruction_text(&self) -> Option<&str> {
+        self.instruction_roots
+            .iter()
+            .find_map(instructions::InstructionRoot::global_text)
+    }
+
     pub(crate) fn active_selection(&self) -> ActiveContextSelection {
         ActiveContextSelection {
             prompt_name: self.current_prompt_name.clone(),
