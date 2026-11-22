@@ -5787,7 +5787,7 @@ fn sweep_stale_profile_journal(
     // tool directory, unplugged drive) carries no ACE, so it is already clean.
     // A root that exists but cannot be inspected still fails closed, naming
     // the root so the operator can repair it.
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
     enum RootKind {
         /// Inheritable read or write root: a missing ACE at the root may still leave inherited
         /// ACEs below it after a killed propagating revoke, so it is always revoked.
