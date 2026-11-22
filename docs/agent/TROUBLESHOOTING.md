@@ -248,12 +248,12 @@ switch to a model the catalog prices, or cap the run with `--max-agent-turns` in
 ### a permission was refused in -p mode
 
 Without a terminal there is nobody to approve, so an operation that would ask is refused and listed in
-`permission_denials`. Choose a mode that allows it (`--permission-mode yolo`), add `--allow TOOL:PATTERN`
+`permission_denials`. Choose a mode that allows it (`--yolo`; `--accept-all` still asks for shell and web), add `--allow TOOL:PATTERN`
 rules for exactly what the job needs, or use `--read-only` for review jobs.
 
 ### Reading piped stdin (limit 1048576 bytes)
 
-`-p` reads redirected stdin through EOF (up to 1 MiB) and appends it as untrusted reference text. In CI,
+`-p` reads redirected stdin through EOF (up to 1 MiB) and appends it as untrusted reference text; the notice is printed only once stdin actually delivers data, so an empty or null stdin is silent. In CI,
 redirect from `/dev/null` when you pass the prompt as an argument and have nothing to pipe, or the run
 waits for the stream to close (`--stdin-idle-secs`).
 

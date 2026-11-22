@@ -353,7 +353,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `-i`, `--image FILE` | With `-p`, attach an image (png, jpeg, gif, webp); repeatable (at most 8, 2 MiB each and 4 MiB in total after the same downscaling `/add` applies). Sent with the first turn and saved in the session like a pasted image. A model the catalog lists as text-only refuses the run before any request; images cannot be combined with a `!` command. With the Anthropic provider the images travel with the prompt as one ordered user message that the persisted provider-native history keeps, so `--continue` replays them exactly once. |
 | `--stream-json-preview-bytes N` | With `-p`, cap stream-json text, tool-argument, tool-result and diff previews at `N` bytes (256–1,048,576; default 8,192). |
 | `--stream-json-schema native\|claude` | With `-p --output stream-json`: `claude` emits Claude Code SDK-shaped records instead of the native ones (default `native`; default output is unchanged). See "Claude-shaped stream-json output". |
-| `--include-partial-messages` | With `-p --output stream-json`, also emit `{"type":"text_delta"\|"reasoning_delta","message_id":"msg_<n>","text":...,"truncated":bool}` records as the model streams (coalesced per ready burst, each bounded by `--stream-json-preview-bytes`). `message_id` names the completion in progress. `assistant_text`, `usage` and `result` are unchanged, so each fragment also appears as `assistant_text`; without the flag the output is byte-identical to before. |
+| `--include-partial-messages` | With `-p --output stream-json`, also emit `{"type":"text_delta"\|"reasoning_delta","message_id":"msg_<n>","text":...,"truncated":bool}` records as the model streams (coalesced per ready burst, each bounded by `--stream-json-preview-bytes`). `message_id` names the model response in progress; thinking, text and tool-call records of one response share it. Fragments also reach the final `assistant_text` record, which is emitted once per text block; without the flag no delta records appear. |
 | `--stream-json-control` | With `-p --input-format stream-json --output stream-json`, opt in to the stdin control channel (see below). Default off: control lines are ordinary `input_error`s and headless asks stay denied. |
 | `--max-stdin-bytes N` | With `-p`, piped-stdin limit (per input line with `--input-format stream-json`; 1,024–67,108,864; default 1,048,576). |
 | `--stdin-idle-secs N` | With `-p` and an explicit prompt, seconds to wait for a silent piped stdin to produce data or EOF (0-86,400; default 2). On timeout the run proceeds without stdin (the piped input is NOT read), prints a `Warning: no stdin data within N s` line on stderr (`--quiet` silences it for text output only, never for `--output json`/`stream-json`) and marks machine output: the stream-json `system` `init` record and the final `json`/`stream-json` result carry `"stdin_abandoned":true` and `"stdin_idle_secs":N` (absent when stdin was read normally). `0` waits for EOF, for slow producers such as builds, test runs or `kubectl logs`. |
@@ -370,11 +370,11 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--guarded` | Allow reads and ask for other operations. |
 | `--allow TOOL:PATTERN` / `--deny TOOL:PATTERN` | Repeatable invocation-only permission seeds. Denies win; modes and external-directory safeguards still apply. Shell allows are exact scripts; other tools use permission globs. |
 | `--allow-prefix SHELL:ARGV` | Repeatable simple shell argv-prefix grants, with the same restricted syntax as `permission-allow-prefix`. |
-| `--accept-all` | Auto-allow operations inside the workspace while retaining the permission system. |
+| `--accept-all` | Standard mode: file reads and edits in the workspace are accepted; shell, web and other operations still ask, which `-p` refuses (the refusal names `--yolo`, `--allow` and `--allow-prefix` as the remedy). |
 | `--yolo` | Allow operations except destructive shell commands, which still ask. |
 | `--dangerously-skip-permissions` | Disable permission checks entirely. This is strictly broader than `--yolo`. |
 | `--sandbox` | Explicitly require the platform general-process sandbox; fail if unavailable |
-| `--no-sandbox` | Disable the default-on general-process sandbox |
+| `--no-sandbox` | Disable the default-on general-process sandbox. The structured `git` tool runs only inside the sandbox, so it is withheld too; the model is told to run git through the shell. |
 | `--sandbox-profile workspace\|host-read\|host-full` | Select ordinary command filesystem reach; does not change permission mode or network policy. Unix host-full is explicit and warns; Windows uses workspace plus AppContainer root keys. |
 | `--shell <path>` | Select Bash/sh; Windows also accepts Command Prompt (`cmd.exe`), PowerShell/pwsh, and native Git Bash. Without a value the default is `pwsh.exe`, then `powershell.exe`, then `cmd.exe` (first found on `PATH`). |
 | `--no-color` | Disable colored TUI output. |
@@ -413,7 +413,7 @@ when startup fails before a turn (missing credential, unknown session): `is_erro
 | `3` | The `--max-agent-turns` cap was exhausted (`stop_reason: "max_turns"`); continue the session or raise the cap. |
 | `4` | The spend budget was exhausted (`stop_reason: "budget"`). |
 | `2` | Usage error: bad or conflicting flags, empty prompt, unknown quick model or tool name, malformed `--config`, unknown session. Retrying cannot succeed. |
-| `20`-`24` | Goal outcome: impossible, blocked, awaiting an answer (`22`), paused, budget limited (see [COMMANDS.md](COMMANDS.md#goal-feature-gated)). |
+| `20`-`24` | Goal outcome: impossible, blocked, awaiting an answer (`22`), paused, budget limited (see [COMMANDS.md](COMMANDS.md#goal-feature-gated)). A `--loop` that spends `--loop-max` without the goal met (for example `--loop-run` still failing) exits `24`. |
 | `22` | Also: `-p` is waiting for an answer to a question; send a new user message. |
 | `130` | Interrupted; cleanup was bounded. |
 
@@ -441,7 +441,7 @@ wait immediately; completed work and accounting are retained before final output
 
 `--output stream-json` writes one JSON object per line: `system` (logical session ID/name,
 provider/model, and `ephemeral`), `assistant_text`, `tool_call`, `tool_result`, `usage`, optional
-`goal` updates, optional `file_mutation` records, and a final `result`. Calls and results share `id`; `provider_call_id` records
+`goal` updates, optional `file_mutation` records, and a final `result`. Assistant text is buffered until its block ends, so there is one `assistant_text` record per text block (split only at the preview cap), not one per stream flush. A run stopped by `--max-agent-turns` or `--max-budget-usd` carries the limit in `stop_detail` and, when the model wrote no closing text, in `result`. Calls and results share `id`; `provider_call_id` records
 the provider identifier separately (its preview is capped at 512 bytes). Tool result events include `is_error`; text/arguments and
 tool previews are limited to 8 KiB (`--stream-json-preview-bytes`) and mark truncation. JSON escapes terminal control and deceptive
 Unicode characters while preserving decoded argument data. These events reflect observed SDK

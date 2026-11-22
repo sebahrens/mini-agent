@@ -1154,6 +1154,25 @@ impl PermissionChecker {
         self.permission_modes.contains(&self.mode) || self.mode == SecurityMode::Yolo
     }
 
+    /// Whether the current mode refuses every call of an edit-class tool: in
+    /// read-only mode `write`, `edit` and `notebook_edit` are denied unless a
+    /// configured rule or a session grant names them. Offering such a tool to
+    /// a run that cannot prompt only produces refusals (mini-agent-j0ea2); the
+    /// per-call check is unchanged and remains the authority.
+    pub(crate) fn tool_always_denied(&self, tool: &str) -> bool {
+        matches!(tool, "write" | "edit" | "notebook_edit")
+            && self.mode == SecurityMode::ReadOnly
+            && !self.rules.contains_key(tool)
+            && !self
+                .session_allowlist
+                .iter()
+                .any(|(allowed, _)| allowed == tool)
+            && !self
+                .project_entries
+                .iter()
+                .any(|(allowed, _)| allowed == tool)
+    }
+
     fn is_read_tool(&self, tool: &str) -> bool {
         matches!(
             tool,

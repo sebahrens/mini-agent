@@ -1292,7 +1292,38 @@ async fn settle_check(
     {
         crate::print::record_permission_denial(tool, input, message);
     }
-    settled
+    match settled {
+        Err(ToolError::Msg(message)) if crate::print::headless_surface() => {
+            Err(ToolError::Msg(headless_denial_remedy(&message, tool)))
+        }
+        other => other,
+    }
+}
+
+/// Names the command-line flags that would allow a refused call in a
+/// headless run, where the TUI's slash commands do not exist
+/// (mini-agent-5495j, mini-agent-j0ea2). The denial itself is unchanged; only
+/// the advice differs by surface.
+fn headless_denial_remedy(message: &str, tool: &str) -> String {
+    const SLASH_HINT: &str = " (change the mode with /mode, or see /permissions)";
+    if let Some(head) = message.strip_suffix(SLASH_HINT) {
+        return format!(
+            "{head} (rerun with a permissive mode flag: --guarded, --accept-all or --yolo; \
+             --accept-all still asks for shell and web; or add --allow {tool}:PATTERN)"
+        );
+    }
+    if message.starts_with("Permission denied (non-interactive mode)") {
+        let rule = if tool == "shell" || tool == "bash" {
+            "--allow-prefix 'shell:<argv prefix>' or --allow 'shell:<exact command>'"
+        } else {
+            "--allow 'TOOL:PATTERN'"
+        };
+        return format!(
+            "{message}. Nobody can approve this in -p mode; rerun with --yolo (all but destructive \
+             shell), {rule}, or --stream-json-control so a driver can answer"
+        );
+    }
+    message.to_string()
 }
 
 async fn settle_check_inner(
@@ -2005,5 +2036,31 @@ mod read_tracker_index_tests {
             tracker.track_read("w.rs", 0, 10).is_some(),
             "offset-0 window that can authorize an overwrite is kept"
         );
+    }
+}
+
+#[cfg(test)]
+mod headless_remedy_tests {
+    use super::headless_denial_remedy;
+
+    #[test]
+    fn denials_name_flags_not_slash_commands() {
+        let readonly = headless_denial_remedy(
+            "Permission denied: Blocked by permission rules: readonly mode does not allow shell (change the mode with /mode, or see /permissions)",
+            "shell",
+        );
+        assert!(
+            readonly.contains("--yolo") && !readonly.contains("/mode"),
+            "{readonly}"
+        );
+        let ask = headless_denial_remedy(
+            "Permission denied (non-interactive mode); effective mode: standard; selected mode: standard; cause: mode policy",
+            "shell",
+        );
+        assert!(
+            ask.contains("--yolo") && ask.contains("--allow-prefix"),
+            "{ask}"
+        );
+        assert_eq!(headless_denial_remedy("other", "edit"), "other");
     }
 }

@@ -590,6 +590,19 @@ pub fn decision_line(goal: &Goal, decision: &GateDecision) -> String {
     }
 }
 
+/// The decision line as a non-interactive run should print it: the budget
+/// remedy names command-line flags instead of TUI slash commands
+/// (mini-agent-u0t2v), because a script cannot type `/goal bounds`.
+pub fn headless_line(line: &str) -> String {
+    match line.split_once("; raise it with /goal bounds") {
+        Some((head, _)) => format!(
+            "{head}; raise it with --goal-max-rounds <n> (or --loop-max <n> for --loop), \
+             then rerun with --continue --goal-resume"
+        ),
+        None => line.to_string(),
+    }
+}
+
 /// What a completion rests on, when it does not rest on a command.
 ///
 /// Every surface prints this line, so this is where a completion nothing
@@ -1176,6 +1189,15 @@ mod tests {
             evidence: Vec::new(),
         };
         assert_eq!(next_round(&g, &decision), None);
+    }
+
+    #[test]
+    fn headless_budget_line_names_flags_not_slash_commands() {
+        let line = "goal: budget limited — 3 rounds used; raise it with /goal bounds max_rounds=<n> (or max_tokens, max_active_secs), then /goal resume";
+        let headless = headless_line(line);
+        assert!(headless.contains("--loop-max") && headless.contains("--goal-resume"));
+        assert!(!headless.contains("/goal"));
+        assert_eq!(headless_line("goal: met"), "goal: met");
     }
 
     #[test]

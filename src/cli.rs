@@ -1172,7 +1172,7 @@ pub struct Cli {
     #[arg(
         long = "no-sandbox",
         conflicts_with = "sandbox",
-        help = "Run subprocesses unsandboxed, overriding the default-on sandbox"
+        help = "Run subprocesses unsandboxed, overriding the default-on sandbox; the structured git tool is withheld (git runs through the shell)"
     )]
     pub no_sandbox: bool,
 

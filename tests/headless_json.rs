@@ -1147,8 +1147,12 @@ fn startup_commands_run_with_the_windows_default_stack_budget() {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        // A one-iteration loop with no validator and no tools cannot meet its
+        // goal, so it ends budget limited with exit 24 (mini-agent-u0t2v); the
+        // point here is the startup stack, which it got past.
+        let expected_loop_exit = args.contains(&"--loop") && output.status.code() == Some(24);
         assert!(
-            output.status.success(),
+            output.status.success() || expected_loop_exit,
             "{args:?}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
@@ -1877,7 +1881,10 @@ fn loop_validation_cli_preserves_command_results_and_output_limits() {
         let output = bounded_output(cli);
         server.join().unwrap().unwrap();
         let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(output.status.success(), "{stderr}");
+        // The loop spent its one iteration without the goal met, so it exits
+        // 24 like a budget-limited goal (mini-agent-u0t2v).
+        assert_eq!(output.status.code(), Some(24), "{stderr}");
+        assert!(stderr.contains("--loop-max"), "{stderr}");
         // `--loop` is a goal preset, so an iteration's record is a goal round
         // record and the validator's output is the round's check result.
         let directories: Vec<_> = std::fs::read_dir(root.0.join("goals"))

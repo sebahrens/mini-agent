@@ -688,6 +688,10 @@ fn append_repository_reference(
     preamble.push_str("[end repository reference]");
 }
 
+/// Said instead of the git tool's guidance when `--no-sandbox` removed it.
+#[cfg(feature = "git-worktree")]
+const GIT_UNAVAILABLE_PROMPT: &str = "\n- There is no structured `git` tool in this run because the sandbox is disabled; run git through the shell tool instead.";
+
 #[cfg(all(test, feature = "js"))]
 fn build_registered_preamble(
     context: &ContextFiles,
@@ -861,6 +865,14 @@ fn compose_registered_preamble(
     {
         bullets.push_str(&capability.model_guidance());
     }
+    #[cfg(feature = "git-worktree")]
+    if !has("git")
+        && has("shell")
+        && sandbox.policy() == crate::sandbox::SandboxPolicy::Disabled
+        && (cli.tools.is_empty() || cli.tools.iter().any(|name| name == "git"))
+    {
+        bullets.push_str(GIT_UNAVAILABLE_PROMPT);
+    }
     #[cfg(feature = "lsp")]
     if has("lsp_navigate") {
         sections.push_str(crate::agent::prompt::LSP_NAVIGATE_PROMPT);
@@ -932,8 +944,12 @@ fn estimated_registered_tools(cli: &Cli, cfg: &Config, sandbox: &Sandbox) -> Vec
         "todo_read",
         "ask_user_question",
     ];
+    // The structured Git tool runs Git only inside the sandbox, so
+    // `--no-sandbox` leaves it out; the preamble says so (mini-agent-hrlqc).
     #[cfg(feature = "git-worktree")]
-    names.push("git");
+    if sandbox.policy() != crate::sandbox::SandboxPolicy::Disabled {
+        names.push("git");
+    }
     if native_web_search_registered(cfg, tools::web_search::exa_api_key_present()) {
         names.push("web_search");
     }
@@ -1971,6 +1987,23 @@ pub(crate) async fn build_agent_inner_with_snapshot<M: CompletionModel + 'static
             );
         }
 
+        // A headless run in read-only mode cannot answer a prompt, so a write
+        // tool the mode always denies is not offered: the model would only
+        // spend calls on refusals (mini-agent-j0ea2). The permission check
+        // itself is untouched and still decides every call.
+        let all_tools = if cli.is_headless()
+            && let Some(permission) = &permission
+        {
+            let checker = permission
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            all_tools
+                .into_iter()
+                .filter(|tool| !checker.tool_always_denied(tool.name().as_ref()))
+                .collect()
+        } else {
+            all_tools
+        };
         let all_tools = filter_tools_by_allowlist(all_tools, &cli.tools);
         let all_tools = tools::memoize::definitions(all_tools);
 
