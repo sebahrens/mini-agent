@@ -4280,7 +4280,11 @@ fn windows_capable_production_process_terminals_use_creation_boundary() {
         {
             continue;
         }
-        let contents = std::fs::read_to_string(&source).expect("Rust source must be UTF-8");
+        // A Windows checkout may carry CRLF line endings, which would change the macro digests of
+        // multi-line string literals; the digests are pinned against LF text.
+        let contents = std::fs::read_to_string(&source)
+            .expect("Rust source must be UTF-8")
+            .replace("\r\n", "\n");
         for call in terminal_calls(&contents).expect("Rust terminals must be discoverable") {
             if !call.guarded
                 && let Some(context) = call.macro_context
