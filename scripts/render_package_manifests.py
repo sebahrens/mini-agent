@@ -30,6 +30,7 @@ TOKEN = re.compile(r"@[A-Z0-9_]+@")
 
 MSI_ASSET = "mini-agent-windows-x64.msi"
 SCOOP_ASSET = "mini-agent-x86_64-pc-windows-msvc.tar.gz"
+SCOOP_ARM64_ASSET = "mini-agent-aarch64-pc-windows-msvc.tar.gz"
 # npm platform name -> (node os, node cpu, release target, binary name)
 NPM_PLATFORMS = {
     "darwin-arm64": ("darwin", "arm64", "aarch64-apple-darwin", "mini-agent"),
@@ -91,7 +92,11 @@ def render_winget(version: str, msi_sums: str, out: Path) -> list[Path]:
 
 
 def render_scoop(version: str, sums: str, out: Path) -> list[Path]:
-    values = {"VERSION": version, "ARCHIVE_SHA256": digest_for(sums, SCOOP_ASSET)}
+    values = {
+        "VERSION": version,
+        "ARCHIVE_SHA256": digest_for(sums, SCOOP_ASSET),
+        "ARCHIVE_ARM64_SHA256": digest_for(sums, SCOOP_ARM64_ASSET),
+    }
     out.mkdir(parents=True, exist_ok=True)
     target = out / "mini-agent.json"
     rendered = fill(read_template("scoop/mini-agent.json.in"), values)

@@ -204,12 +204,21 @@ pub(crate) fn classify_install(exe: &str, home: Option<&str>, version: &str) -> 
 
 /// Release asset target for this host (`install.sh` names), or `None`.
 fn release_archive_name() -> Option<String> {
-    let os = match std::env::consts::OS {
+    release_archive_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// Pure asset selection so the table is testable on any host. The Windows
+/// names are the archives the release workflow publishes; a running Windows
+/// `.exe` still cannot be replaced in place, so `classify_install` keeps
+/// Windows installs on the MSI/zip path before this name is ever downloaded.
+fn release_archive_for(os: &str, arch: &str) -> Option<String> {
+    let os = match os {
         "macos" => "apple-darwin",
         "linux" => "unknown-linux-musl",
+        "windows" => "pc-windows-msvc",
         _ => return None,
     };
-    let arch = match std::env::consts::ARCH {
+    let arch = match arch {
         "x86_64" => "x86_64",
         "aarch64" => "aarch64",
         _ => return None,
@@ -1083,6 +1092,37 @@ async fn install_verified(exe: &Path, binary: &[u8], version: &str) -> Result<()
 #[cfg(test)]
 mod tests {
     // mini-agent-et59d
+    #[test]
+    fn release_archive_selection_follows_the_host_os_and_architecture() {
+        for (os, arch, expected) in [
+            (
+                "linux",
+                "x86_64",
+                "mini-agent-x86_64-unknown-linux-musl.tar.gz",
+            ),
+            (
+                "linux",
+                "aarch64",
+                "mini-agent-aarch64-unknown-linux-musl.tar.gz",
+            ),
+            ("macos", "aarch64", "mini-agent-aarch64-apple-darwin.tar.gz"),
+            (
+                "windows",
+                "x86_64",
+                "mini-agent-x86_64-pc-windows-msvc.tar.gz",
+            ),
+            (
+                "windows",
+                "aarch64",
+                "mini-agent-aarch64-pc-windows-msvc.tar.gz",
+            ),
+        ] {
+            assert_eq!(release_archive_for(os, arch).as_deref(), Some(expected));
+        }
+        assert_eq!(release_archive_for("windows", "x86"), None);
+        assert_eq!(release_archive_for("freebsd", "x86_64"), None);
+    }
+
     #[test]
     fn version_probe_requires_a_whole_version_token() {
         use super::version_probe_matches as m;

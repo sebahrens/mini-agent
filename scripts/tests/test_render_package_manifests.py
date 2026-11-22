@@ -11,7 +11,7 @@ from scripts import render_package_manifests as render
 REPOSITORY = Path(__file__).resolve().parents[2]
 SUMS = "\n".join(
     f"{hashlib.sha256(name.encode()).hexdigest()}  {name}"
-    for name in [render.SCOOP_ASSET, render.MSI_ASSET]
+    for name in [render.SCOOP_ASSET, render.SCOOP_ARM64_ASSET, render.MSI_ASSET]
 )
 
 
@@ -52,6 +52,9 @@ class RenderManifestTests(unittest.TestCase):
             manifest = json.loads(path.read_text())
             self.assertEqual("1.12.0", manifest["version"])
             self.assertEqual(digest(render.SCOOP_ASSET), manifest["architecture"]["64bit"]["hash"])
+            self.assertEqual(digest(render.SCOOP_ARM64_ASSET), manifest["architecture"]["arm64"]["hash"])
+            self.assertIn("aarch64-pc-windows-msvc", manifest["architecture"]["arm64"]["url"])
+            self.assertIn("aarch64-pc-windows-msvc", manifest["autoupdate"]["architecture"]["arm64"]["url"])
 
     def test_missing_digest_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -94,7 +97,7 @@ class RenderManifestTests(unittest.TestCase):
                 render.render_npm("1.12.0", "\n".join(lines), archives, root / "out2")
 
     def test_templates_hold_only_known_placeholders(self) -> None:
-        known = {"VERSION", "MSI_SHA256", "ARCHIVE_SHA256", "PLATFORM", "OS", "CPU", "BINARY", "ARCHIVE"}
+        known = {"VERSION", "MSI_SHA256", "ARCHIVE_SHA256", "ARCHIVE_ARM64_SHA256", "PLATFORM", "OS", "CPU", "BINARY", "ARCHIVE"}
         for template in (REPOSITORY / "packaging").rglob("*.in"):
             tokens = {t.strip("@") for t in render.TOKEN.findall(template.read_text())}
             self.assertLessEqual(tokens, known, template)

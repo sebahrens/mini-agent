@@ -49,6 +49,12 @@ foreach ($sidValue in @($identity.User.Value, 'S-1-5-18', 'S-1-5-32-544')) {
 """
 
 
+# Windows PowerShell starts slowly on a loaded hosted ARM64 runner; ten seconds
+# was not enough there (mini-agent-nvnkx.143). A longer bound weakens nothing:
+# the script only sets one directory ACL and still fails closed on any error.
+WINDOWS_ACL_TIMEOUT_SECONDS = 120
+
+
 class ReleaseArtifactError(ValueError):
     """A release candidate failed a closed validation gate."""
 
@@ -271,17 +277,24 @@ def _harden_windows_install_directory(
             ],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=WINDOWS_ACL_TIMEOUT_SECONDS,
             check=False,
             env=acl_environment,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
+    except subprocess.TimeoutExpired as error:
         raise ReleaseArtifactError(
-            "cannot create a private Windows smoke-install directory"
+            "cannot create a private Windows smoke-install directory "
+            f"(timed out after {WINDOWS_ACL_TIMEOUT_SECONDS} s)"
+        ) from error
+    except OSError as error:
+        raise ReleaseArtifactError(
+            "cannot create a private Windows smoke-install directory "
+            f"({type(error).__name__})"
         ) from error
     if hardened.returncode != 0:
         raise ReleaseArtifactError(
-            "cannot create a private Windows smoke-install directory"
+            "cannot create a private Windows smoke-install directory "
+            f"(exit code {hardened.returncode})"
         )
 
 
