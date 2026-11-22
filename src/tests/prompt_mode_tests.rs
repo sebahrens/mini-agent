@@ -463,3 +463,28 @@ fn bundled_prompts_name_only_real_tools() {
     let ask = include_str!("../../data/prompts/ask.md");
     assert!(!ask.contains("use the shell tool directly"));
 }
+
+/// mini-agent-0a0xz: every mode prompt carries the one shared delegation rule
+/// and none of the retired enumeration advice.
+#[cfg(feature = "subagents")]
+#[test]
+fn every_mode_prompt_embeds_the_shared_delegation_rule() {
+    for (name, text) in [
+        ("code", include_str!("../../data/prompts/code.md")),
+        ("debug", include_str!("../../data/prompts/debug.md")),
+        ("default", include_str!("../../data/prompts/default.md")),
+        ("refactor", include_str!("../../data/prompts/refactor.md")),
+        ("review", include_str!("../../data/prompts/review.md")),
+        (
+            "review-security",
+            include_str!("../../data/prompts/review-security.md"),
+        ),
+    ] {
+        assert!(
+            text.contains(crate::agent::prompt::TASK_DELEGATION_RULE),
+            "{name} must embed the shared delegation rule"
+        );
+        assert!(!text.contains("Anti-pattern"), "{name}");
+        assert!(!text.contains("listing test files"), "{name}");
+    }
+}

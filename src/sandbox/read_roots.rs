@@ -41,8 +41,40 @@ const RESERVED_SANDBOX_PATHS: [&str; 5] =
 /// home those proxies (and Debian's `/usr/bin/cargo`) need. None of these
 /// hold credentials; `~/.cargo` itself is deliberately not listed because it
 /// contains `credentials.toml`.
-pub(crate) const DEFAULT_SANDBOX_READ_ROOTS: [&str; 4] = [
+#[cfg(not(target_os = "macos"))]
+pub(crate) const DEFAULT_SANDBOX_READ_ROOTS: &[&str] = &[
     "/home/linuxbrew",
+    "~/.cargo/bin",
+    "~/.local/bin",
+    "~/.rustup",
+];
+
+/// macOS default: the immutable parts of the two Homebrew prefixes (Apple
+/// Silicon and Intel) that hold the tools on a launcher's `PATH`, plus the same
+/// user-level Cargo and rustup locations as Linux. Listed per directory rather
+/// than as whole prefixes so `etc` and `var` (service configuration, database
+/// directories, logs) stay unreadable; nothing here is writable and the
+/// credential-bearing `~/.cargo/credentials*` is not under `~/.cargo/bin`.
+/// Per-user version managers (`~/.nvm`, `~/.pyenv`, `/opt/anaconda3`) are not
+/// defaults: add them through `sandbox-toolchain-roots`.
+#[cfg(target_os = "macos")]
+pub(crate) const DEFAULT_SANDBOX_READ_ROOTS: &[&str] = &[
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "/opt/homebrew/Cellar",
+    "/opt/homebrew/opt",
+    "/opt/homebrew/lib",
+    "/opt/homebrew/include",
+    "/opt/homebrew/share",
+    "/opt/homebrew/Frameworks",
+    "/usr/local/bin",
+    "/usr/local/sbin",
+    "/usr/local/Cellar",
+    "/usr/local/opt",
+    "/usr/local/lib",
+    "/usr/local/include",
+    "/usr/local/share",
+    "/usr/local/Frameworks",
     "~/.cargo/bin",
     "~/.local/bin",
     "~/.rustup",
@@ -82,6 +114,16 @@ impl BwrapReadRoots {
     #[cfg(test)]
     pub(crate) fn roots(&self) -> &[BwrapReadRoot] {
         &self.roots
+    }
+
+    /// Canonical sources of the roots that exist, for the Seatbelt backend
+    /// (which matches resolved paths and has no bind mounts).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn roots_for_seatbelt(&self) -> impl Iterator<Item = &Path> {
+        self.roots
+            .iter()
+            .filter(|root| root.present)
+            .map(|root| root.source.as_path())
     }
 
     /// Append the read-only bind arguments. A present source was
@@ -365,6 +407,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn default_roots_cover_linuxbrew_cargo_local_bin_and_rustup_without_cargo_credentials() {
         assert_eq!(
@@ -384,6 +427,49 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_default_roots_cover_homebrew_and_cargo_without_secrets_or_mutable_state() {
+        let roots = default_sandbox_read_roots();
+        for expected in [
+            "/opt/homebrew/bin",
+            "/opt/homebrew/Cellar",
+            "/usr/local/bin",
+            "~/.cargo/bin",
+            "~/.rustup",
+        ] {
+            assert!(roots.contains(&PathBuf::from(expected)), "{expected}");
+        }
+        for root in DEFAULT_SANDBOX_READ_ROOTS {
+            let forbidden = [
+                "/opt/homebrew",
+                "/usr/local",
+                "~",
+                "~/.cargo",
+                "~/.ssh",
+                "~/.aws",
+                "~/.npmrc",
+                "~/.config",
+            ];
+            assert!(
+                !forbidden.contains(root),
+                "whole prefix or secret dir: {root}"
+            );
+            for sensitive in [
+                ".ssh",
+                ".aws",
+                ".config",
+                "credentials",
+                ".npmrc",
+                "/etc",
+                "/var",
+            ] {
+                assert!(!root.contains(sensitive), "{root}");
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn default_roots_expand_home_and_absent_entries_use_try_semantics() {
         let base = temp_tree("defaults");
@@ -602,7 +688,8 @@ mod tests {
         )
         .unwrap();
         let args = args(&roots);
-        assert!(args.iter().any(|arg| arg == "/home/linuxbrew"), "{args:?}");
+        let first = default_sandbox_read_roots()[0].display().to_string();
+        assert!(args.contains(&first), "{args:?}");
         assert!(!args.iter().any(|arg| arg.contains(".cargo")), "{args:?}");
     }
 

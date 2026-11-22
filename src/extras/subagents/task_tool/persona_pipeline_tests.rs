@@ -459,6 +459,7 @@ fn persona_memory_and_hooks_are_closed_unless_the_subagent_opt_ins_are_set() {
         background: true,
         memory: Some(crate::context::agents::AgentMemoryScope::Project),
         hooks: Some(r#"{"PreToolUse":[]}"#.into()),
+        ..Default::default()
     };
     let resolve = |config: &crate::config::Config| {
         let factory = RecordingFactory::new();

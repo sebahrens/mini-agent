@@ -2018,14 +2018,21 @@ impl RunProgress {
                 .into(),
             );
         }
-        messages.push(Message::user(crate::agent::input::host_instruction(
-            "turn interrupted",
-            "The user cancelled the previous turn before it finished. Tool calls above \
-             that show an unknown outcome may or may not have taken effect; check the \
-             current state before repeating work.",
-        )));
+        messages.push(interrupted_turn_marker());
         messages
     }
+}
+
+/// Host marker closing a cancelled turn in history, so the next turn does not
+/// carry out the unanswered request (mini-agent-l8lb2).
+pub(crate) fn interrupted_turn_marker() -> Message {
+    Message::user(crate::agent::input::host_instruction(
+        "turn interrupted",
+        "The user cancelled the previous turn before it finished. Do not continue or \
+         carry out that request unless the user asks for it again. Tool calls above \
+         that show an unknown outcome may or may not have taken effect; check the \
+         current state before repeating work.",
+    ))
 }
 
 /// Tell the client what a cancelled turn had already done. Never blocks the

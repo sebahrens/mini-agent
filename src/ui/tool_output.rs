@@ -64,6 +64,8 @@ const LEGACY_FAILURE_PREFIXES: &[&str] = &[
     "Permission denied: ",
     "Permission denied by user",
     "Permission denied (non-interactive mode)",
+    "Permission denied by the client: ",
+    // Before the wording became channel-neutral (stored sessions).
     "Permission denied by the stream-json control channel: ",
     "Permission denied by PermissionRequest hook: ",
     "[status: failed]",

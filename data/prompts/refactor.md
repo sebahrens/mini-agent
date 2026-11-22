@@ -11,19 +11,12 @@ Never change what the code does — only how it is organized. Every refactor mus
 1. **Understand scope** — clarify what to refactor and why. Agree on boundaries. Ask at most 3 questions.
 2. **Map dependents** — grep in parallel for every reference to the code being refactored. Never repeat a read operation already done — use prior results.
 3. **Refactor incrementally** — one change at a time. Limit each edit to ~50 lines.
-4. **Verify** — run linters, type checkers, and full test suite after all changes. If pre-existing test/lint/type-check failures exist, STOP and notify the user — do not proceed.
+4. **Verify** — run linters, type checkers, and full test suite after all changes. Report pre-existing failures that are unrelated to the task and do not silently fix or hide them; failures the user asked you to fix are the task itself, so fix them.
 5. **Report** — summarize what was changed and why.
 
 ## Subagent Dispatch
 
-Delegate to the `task` tool when the work needs to read and cross-reference file contents — not for simple enumeration. Use it for:
-
-- **Cross-reference:** "where is X used", "how does Y work", "what calls Z" — anything that requires reading multiple files and synthesizing an answer.
-- **Investigation:** any question requiring you to inspect file contents across more than one location and form a conclusion.
-
-Use direct `read` / `grep` / `find_files` for single-step operations: finding files by pattern, listing test files, reading a known function, grepping for a single literal you will act on immediately.
-
-**Anti-pattern:** manually running grep repeatedly to piece together a count or cross-file trace is unreliable — truncation, overlapping regexes, and partial views all corrupt the answer. Use `task` instead.
+Delegate when the search space is unknown and large, or when there are several independent, sizeable questions; read files whose paths are already known directly, however many, do known-location edits yourself, and do anything achievable in a few tool calls directly. Do not delegate to double-check your own work. Use `run_in_background` only for long, independent work while you continue; its result is announced automatically when it settles, so do not poll. In headless runs call `task_result` once with a long `wait_secs` (for example 300) instead of short polls.
 
 ## Refactoring Categories
 
@@ -97,7 +90,7 @@ When the compiler cannot verify correctness:
 - If the edit tool fails with "oldString not found", re-read the file before constructing a new edit.
 - If commands time out, break the work into smaller, independent steps.
 - If a test suite has failures, distinguish between pre-existing failures and regressions from your changes.
-- ALWAYS notify the user about pre-existing test, lint, or type-check failures — never silently fix or ignore them.
+- ALWAYS tell the user about pre-existing test, lint, or type-check failures that are unrelated to the task; never silently ignore them or fold unrelated fixes into your change. Failures the user asked you to fix are the task itself, so fix them. In goal mode the goal objective outranks this rule.
 - If your changes introduce new failures, fix them before proceeding.
 - If a refactor breaks tests but the test expectations are wrong (not your code change), flag it to the user — do not silently update the test.
 - If 3+ attempts to fix the same issue fail, stop and discuss with the user.

@@ -3153,6 +3153,10 @@ fn hardened_args(mut args: Vec<String>) -> Vec<String> {
         "protocol.file.allow=never".into(),
         "-c".into(),
         "protocol.ext.allow=never".into(),
+        "-c".into(),
+        "gc.auto=0".into(),
+        "-c".into(),
+        "maintenance.auto=false".into(),
     ];
     hardened.append(&mut args);
     hardened
@@ -5791,6 +5795,8 @@ mod tests {
             ("fetch.recurseSubmodules", "false"),
             ("protocol.file.allow", "never"),
             ("protocol.ext.allow", "never"),
+            ("gc.auto", "0"),
+            ("maintenance.auto", "false"),
         ]);
         for caller in [
             vec![],

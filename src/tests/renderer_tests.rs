@@ -1186,6 +1186,29 @@ mod permission_prompt_layout_tests {
     }
 
     #[test]
+    fn permission_options_never_break_inside_a_word() {
+        let options = "  (y) allow once  (n) deny once  (t) deny and tell the model why  (s) deny and stop with instruction  (ESC) deny and stop  [cause: mode policy denies this write]";
+        for width in [30usize, 80, 100, 130] {
+            let rows = prompt_block_rows("[permission] bash: ls", options, width, 12);
+            assert!(
+                rows.iter().all(|row| display_width(row) <= width),
+                "{rows:?}"
+            );
+            let joined = rows[1..].join(" ");
+            for word in options.split_whitespace() {
+                assert!(
+                    joined.split_whitespace().any(|got| got == word),
+                    "width {width}: {word:?} was cut in {rows:?}"
+                );
+            }
+            // Each `(key) label` option starts a row or follows two spaces.
+            for row in &rows[1..] {
+                assert!(!row.trim_start().starts_with("p with"), "{rows:?}");
+            }
+        }
+    }
+
+    #[test]
     fn a_long_path_wraps_instead_of_being_clipped() {
         let header = "[permission] edit: /home/user/projects/app/src/components/forms/Input.tsx";
         let rows = prompt_block_rows(header, OPTIONS, 30, 6);
@@ -1727,6 +1750,8 @@ mod tool_output_folding {
             "Permission denied: Blocked by deny rule: shell = \"**\"",
             "Permission denied (non-interactive mode); effective mode: guarded",
             "Permission denied by PermissionRequest hook: no",
+            "Permission denied by the client: not now",
+            "Permission denied by the stream-json control channel: old session",
             "[status: failed]\nboom",
             "[status: not_started; the command was not run] no sandbox",
             "[status: timed_out; timeout_ms: 5]",

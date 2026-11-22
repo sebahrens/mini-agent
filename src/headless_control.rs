@@ -105,6 +105,9 @@ pub(crate) enum Reply {
 /// Prefix of the tool error that asks the tool-call wrapper to run the call
 /// again with the driver's `updatedInput`.
 const REWRITE_SENTINEL: &str = "\u{1}mini-agent:updated-input\u{1}";
+/// Why a malformed `updatedInput` denies the call it was attached to.
+const UPDATED_INPUT_NOT_AN_OBJECT: &str =
+    "updatedInput must be a JSON object holding the tool call's arguments; the call was not run";
 /// Most edits one call accepts; each rerun is checked and asked again.
 pub(crate) const MAX_INPUT_REWRITES: usize = 3;
 
@@ -401,6 +404,17 @@ impl ControlState {
             Reply::AllowForRun => Reply::Allow,
             Reply::AllowWith(updated) => {
                 let value = serde_json::from_str(&updated).unwrap_or(serde_json::Value::Null);
+                // An `updatedInput` that is neither an object nor an echo of
+                // the offered arguments cannot be honoured; running the
+                // original call instead would hide that (mini-agent-6wtc2).
+                if !value.is_object() && value.as_str() != Some(input) {
+                    let message = UPDATED_INPUT_NOT_AN_OBJECT;
+                    let _ = self
+                        .output
+                        .emit_event(serde_json::json!({"type":"input_error","message":message}))
+                        .await;
+                    return Reply::Deny(message.to_owned());
+                }
                 match edited_arguments(&value, input) {
                     Some(args) => Reply::AllowWith(args),
                     None => Reply::Allow,
@@ -1117,7 +1131,9 @@ mod tests {
             ),
             (r#"{"command":"ls"}"#, Reply::Allow),
             (r#""the offered text""#, Reply::Allow),
-            (r#"[1]"#, Reply::Allow),
+            // mini-agent-6wtc2: a non-object updatedInput denies the call.
+            (r#"[1]"#, Reply::Deny(UPDATED_INPUT_NOT_AN_OBJECT.into())),
+            (r#"7"#, Reply::Deny(UPDATED_INPUT_NOT_AN_OBJECT.into())),
         ] {
             let waiting = std::sync::Arc::clone(&state);
             let args = call.clone();

@@ -79,6 +79,51 @@ pub(crate) fn wrap_to_width(s: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// Wrap a key-hint line into rows of at most `width` columns without cutting
+/// a word. Options are separated by two spaces and a `(key) label` option is
+/// kept whole on one row when it fits; a longer option (or bracketed cause)
+/// wraps on single spaces, and only a word wider than `width` is hard-wrapped.
+pub(crate) fn wrap_at_spaces(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows: Vec<String> = Vec::new();
+    let mut row = String::new();
+    for segment in s.split("  ").map(str::trim).filter(|seg| !seg.is_empty()) {
+        let segment_width = display_width(segment);
+        if !row.is_empty() && display_width(&row) + 2 + segment_width <= width {
+            row.push_str("  ");
+            row.push_str(segment);
+            continue;
+        }
+        if !row.is_empty() {
+            rows.push(std::mem::take(&mut row));
+        }
+        if segment_width <= width {
+            row.push_str(segment);
+            continue;
+        }
+        for word in segment.split(' ').filter(|word| !word.is_empty()) {
+            if !row.is_empty() && display_width(&row) + 1 + display_width(word) <= width {
+                row.push(' ');
+                row.push_str(word);
+                continue;
+            }
+            if !row.is_empty() {
+                rows.push(std::mem::take(&mut row));
+            }
+            let mut pieces = wrap_to_width(word, width);
+            row = pieces.pop().unwrap_or_default();
+            rows.extend(pieces);
+        }
+    }
+    rows.push(row);
+    // Keep the line's own indent when the first row has room for it.
+    let indent = s.len() - s.trim_start_matches(' ').len();
+    if indent > 0 && display_width(&rows[0]) + indent <= width {
+        rows[0].insert_str(0, &" ".repeat(indent));
+    }
+    rows
+}
+
 /// Shorten `s` to at most `max_width` columns by replacing its middle with
 /// `…`, keeping the head and a longer tail: for a path, the file name at the
 /// end is what identifies the target.

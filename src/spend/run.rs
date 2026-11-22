@@ -883,7 +883,19 @@ pub(crate) struct StreamGuard {
     /// the request body (nvnkx.159). When present, an unfinished stream is
     /// settled as an estimated receipt instead of latching tracking failure.
     estimate: std::sync::Mutex<Option<UsageDelta>>,
+    /// Response bytes received so far; an interrupted stream is charged for
+    /// what actually arrived, never more than the request's upper bound
+    /// (mini-agent-4zov7).
+    streamed_bytes: std::sync::atomic::AtomicU64,
 }
+
+/// Conservative output tokens for `bytes` of streamed response: SSE framing
+/// makes the byte count several times the generated text, so two bytes per
+/// token overstates the real output while staying far below `max_tokens`.
+fn streamed_output_tokens(bytes: u64) -> u64 {
+    bytes.div_ceil(2)
+}
+
 impl StreamGuard {
     pub(crate) fn new(run: Option<Run>) -> Arc<Self> {
         Arc::new(Self {
@@ -891,7 +903,13 @@ impl StreamGuard {
             opened: Default::default(),
             finished: Default::default(),
             estimate: Default::default(),
+            streamed_bytes: Default::default(),
         })
+    }
+    /// Counts response bytes received from the provider.
+    pub(crate) fn add_streamed(&self, bytes: usize) {
+        self.streamed_bytes
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
     }
     /// Records the conservative usage bound charged if this stream ends
     /// before its final usage report.
@@ -922,7 +940,14 @@ impl Drop for StreamGuard {
                 // Settle the unfinished request at an upper bound: the cap
                 // stays conservative (it never assumed the request was free)
                 // and the session continues (mini-agent-nvnkx.159).
-                Some(bound) => run.observe(bound),
+                Some(mut bound) => {
+                    let streamed = self
+                        .streamed_bytes
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    bound.output_tokens = bound.output_tokens.min(streamed_output_tokens(streamed));
+                    bound.total_tokens = bound.input_tokens.saturating_add(bound.output_tokens);
+                    run.observe(bound)
+                }
                 None => run.account.tracking_failed(),
             }
         }
@@ -1024,11 +1049,14 @@ mod first_item_tests {
             total_tokens: 3_000,
             ..Default::default()
         });
+        // mini-agent-4zov7: only what streamed in is charged as output, far
+        // below the 2,000-token bound: 1,000 bytes are at most 500 tokens.
+        request.guard.add_streamed(1_000);
         drop(request);
         let snapshot = run.account.snapshot();
         assert!(!snapshot.tracking_error);
         assert!(
-            (snapshot.observed_cost - 0.005).abs() < 1e-9,
+            (snapshot.observed_cost - 0.002).abs() < 1e-9,
             "{snapshot:?}"
         );
         run.flush().await;

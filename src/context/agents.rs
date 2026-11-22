@@ -254,6 +254,11 @@ pub(crate) struct AgentExtras {
     pub(crate) memory: Option<AgentMemoryScope>,
     /// `hooks:` as validated hook-configuration JSON text.
     pub(crate) hooks: Option<String>,
+    /// `instructions: false`: the child gets neither the root instruction
+    /// overlay nor the discovered nested instruction files (scout personas).
+    pub(crate) omit_instructions: bool,
+    /// `architecture: false`: the child gets no architecture text.
+    pub(crate) omit_architecture: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -594,6 +599,8 @@ fn normalize_agent_definition(
         "background",
         "memory",
         "hooks",
+        "instructions",
+        "architecture",
     ];
     #[cfg(not(feature = "mcp"))]
     let known_keys = [
@@ -618,6 +625,8 @@ fn normalize_agent_definition(
         "background",
         "memory",
         "hooks",
+        "instructions",
+        "architecture",
     ];
     let mut unknown_keys = mapping
         .keys()
@@ -714,6 +723,18 @@ fn parse_agent_extras(mapping: &serde_yaml_ng::Mapping, notices: &mut Vec<String
         Some(serde_yaml_ng::Value::Bool(flag)) => extras.background = *flag,
         Some(_) => notices
             .push("[specialist metadata: background not applied: it must be true or false]".into()),
+    }
+    for (key, flag) in [
+        ("instructions", &mut extras.omit_instructions),
+        ("architecture", &mut extras.omit_architecture),
+    ] {
+        match get(key) {
+            None => {}
+            Some(serde_yaml_ng::Value::Bool(include)) => *flag = !*include,
+            Some(_) => notices.push(format!(
+                "[specialist metadata: {key} not applied: it must be true or false]"
+            )),
+        }
     }
     match get("memory").map(|value| value.as_str()) {
         None => {}
@@ -3223,6 +3244,35 @@ pub(crate) mod tests {
                 .any(|notice| notice.contains("background") || notice.contains("memory")),
             "{:?}",
             parsed.compat_notices
+        );
+    }
+
+    #[test]
+    fn persona_frontmatter_can_omit_instructions_and_architecture() {
+        let parse = |frontmatter: &str| {
+            normalize_agent_definition("scout".into(), format!("---\n{frontmatter}\n---\nbody"))
+                .unwrap()
+                .2
+        };
+        let default = parse("name: scout");
+        assert!(!default.extras.omit_instructions && !default.extras.omit_architecture);
+        let omitted = parse("instructions: false\narchitecture: false");
+        assert!(omitted.extras.omit_instructions && omitted.extras.omit_architecture);
+        assert!(
+            omitted.unknown_keys.is_empty(),
+            "{:?}",
+            omitted.unknown_keys
+        );
+        let kept = parse("instructions: true");
+        assert!(!kept.extras.omit_instructions);
+        let bad = parse("instructions: never");
+        assert!(!bad.extras.omit_instructions);
+        assert!(
+            bad.compat_notices
+                .iter()
+                .any(|notice| notice.contains("instructions not applied")),
+            "{:?}",
+            bad.compat_notices
         );
     }
 

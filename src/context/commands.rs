@@ -976,7 +976,7 @@ fn merge_layer_at(
 ) {
     #[cfg(test)]
     LAYER_READS.with(|reads| reads.set(reads.get() + 1));
-    let entries = match binding.read_relative_definition_layer(
+    let (entries, overflow) = match binding.read_relative_definition_layer_degrading(
         directory,
         "md",
         MAX_TEMPLATE_BYTES,
@@ -986,11 +986,20 @@ fn merge_layer_at(
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
-            tracing::warn!(%error, "could not load custom command directory");
+            tracing::warn!(directory = %directory.display(), %error, "could not load custom command directory");
             skipped.push(format!("{}: {error}", directory.display()));
             return;
         }
     };
+    if !overflow.is_empty() {
+        tracing::warn!(directory = %directory.display(), skipped = overflow.len(), "custom command directory exceeds the file limit");
+        skipped.push(format!(
+            "{}: more than {MAX_FILES} command files; loaded the first {MAX_FILES} in name order, skipped {} (first skipped: {})",
+            directory.display(),
+            overflow.len(),
+            overflow[0]
+        ));
+    }
     for (stem, text) in entries {
         let file = directory.join(format!("{stem}.md"));
         let normalized = normalize_name(&stem);
@@ -1274,6 +1283,30 @@ mod tests {
         std::fs::write(commands.join("Deploy_Tools/ship.md"), "Ship it twice").unwrap();
         std::fs::write(commands.join("Deploy_Tools/new.md"), "New").unwrap();
         assert_ne!(before, commands_stamp(&paths, &workspace));
+    }
+
+    #[test]
+    fn jd6h1_overfull_command_directory_loads_first_files_and_reports_the_rest() {
+        let root = crate::tests::OwnedTestDirectory::new("command-overfull");
+        let paths = paths(root.path());
+        let commands = paths.config_dir.join("commands");
+        std::fs::create_dir_all(&commands).unwrap();
+        crate::fs::ensure_private_directory(&paths.config_dir).unwrap();
+        for index in 0..(MAX_FILES + 2) {
+            std::fs::write(commands.join(format!("c{index:03}.md")), "body").unwrap();
+        }
+        let workspace_dir = root.path().join("workspace");
+        std::fs::create_dir(&workspace_dir).unwrap();
+        let workspace = crate::paths::WorkspaceBinding::capture(&workspace_dir).unwrap();
+        let (loaded, skipped) = load_layers_reporting(&paths, &workspace, false);
+        assert_eq!(loaded.len(), MAX_FILES, "{}", loaded.len());
+        assert!(loaded.contains_key("c000") && !loaded.contains_key("c129"));
+        let report = skipped.join("\n");
+        assert!(
+            report.contains("commands") && report.contains("skipped 2"),
+            "{report}"
+        );
+        assert_eq!(skipped.len(), 1, "{report}");
     }
 
     #[test]

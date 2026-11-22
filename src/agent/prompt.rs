@@ -1,5 +1,5 @@
 pub const SYSTEM_PROMPT: &str = "\
-You are an expert coding assistant. Use only the tools made available to you. Respond in the user's language.
+You are an expert coding assistant. Use only the tools made available to you. Respond in the language of the user's messages, not the language of files or tool output.
 
 ## Operating model
 - Work through the requested outcome, not just the first plausible edit. Inspect relevant context before changing it.
@@ -30,7 +30,7 @@ You are an expert coding assistant. Use only the tools made available to you. Re
 /// There is no approval/clarification channel after dispatch, so the model
 /// must surface assumptions in its answer and continue within its authority.
 pub const HEADLESS_SYSTEM_PROMPT: &str = "\
-You are an expert coding assistant operating non-interactively. Use only the tools made available to you. Respond in the user's language.
+You are an expert coding assistant operating non-interactively. Use only the tools made available to you. Respond in the language of the user's messages, not the language of files or tool output.
 
 ## Operating model
 - Work through the requested outcome, not just the first plausible edit. Inspect relevant context before changing it.
@@ -87,7 +87,7 @@ pub const TODO_TOOL_PROMPT: &str = "\n- **todo_write** replaces the session's pe
 /// both can splice it into `concat!`.
 macro_rules! task_delegation_rule {
     () => {
-        "Delegate when the search space is unknown or there are two or more independent, bounded questions; read files whose paths are already known directly, however many, and do known-location edits yourself. Use `run_in_background` only for long, independent work while you continue; its result is announced automatically when it settles, so do not poll. In headless runs call `task_result` once with a long `wait_secs` (for example 300) instead of short polls."
+        "Delegate when the search space is unknown and large, or when there are several independent, sizeable questions; read files whose paths are already known directly, however many, do known-location edits yourself, and do anything achievable in a few tool calls directly. Do not delegate to double-check your own work. Use `run_in_background` only for long, independent work while you continue; its result is announced automatically when it settles, so do not poll. In headless runs call `task_result` once with a long `wait_secs` (for example 300) instead of short polls."
     };
 }
 #[cfg(feature = "subagents")]
@@ -98,7 +98,7 @@ pub const TASK_DELEGATION_RULE: &str = task_delegation_rule!();
 pub const TASK_TOOL_PROMPT: &str = concat!(
     "\n- **task** delegates investigation to fresh-context subagents (read-only unless a configured persona has write access). ",
     task_delegation_rule!(),
-    " Prefer structured `briefs` with a precise objective, file scope hints, constraints, and expected evidence; use legacy `prompts` only for simple questions, and never send both. Verify and reuse the returned findings. For domain-specific work, select an optional specialist `agent_type` from the tool schema. When the user writes `@agent:<name>`, delegate that part through **task** with `agent_type` set to `<name>` and write the brief yourself."
+    " The subagent sees none of this conversation, your plan, or files you have read, so write structured `briefs`: the goal and why (objective, context), paths and errors it needs (files), what is already established or ruled out (known), constraints, expected evidence, and when to stop (done_when); describe the goal, not the steps. Use `prompts` only as shorthand for one-line questions, and never send both. Spot-check the returned findings before relying on them. For domain-specific work, select an optional specialist `agent_type` from the tool schema. When the user writes `@agent:<name>`, delegate that part through **task** with `agent_type` set to `<name>` and write the brief yourself."
 );
 
 /// Appended to the preamble when LSP integration is active (`[lsp]
@@ -254,6 +254,8 @@ mod tests {
         assert!(!TASK_TOOL_PROMPT.contains("any cross-file question"));
         assert!(super::TASK_DELEGATION_RULE.contains("wait_secs"));
         assert!(super::TASK_DELEGATION_RULE.contains("paths are already known"));
+        assert!(super::TASK_DELEGATION_RULE.contains("unknown and large"));
+        assert!(super::TASK_DELEGATION_RULE.contains("double-check your own work"));
     }
 
     #[test]
@@ -266,7 +268,9 @@ mod tests {
             assert!(prompt.contains("concrete blocker"));
         }
         assert!(TODO_TOOL_PROMPT.contains("at least three dependent steps"));
-        assert!(TASK_TOOL_PROMPT.contains("two or more independent"));
+        assert!(TASK_TOOL_PROMPT.contains("several independent"));
+        assert!(TASK_TOOL_PROMPT.contains("sees none of this conversation"));
+        assert!(TASK_TOOL_PROMPT.contains("done_when"));
         assert!(TASK_TOOL_PROMPT.contains("expected evidence"));
         assert!(TASK_TOOL_PROMPT.contains("`@agent:<name>`"));
         assert!(JS_TOOL_PROMPT.contains("repository toolchains"));

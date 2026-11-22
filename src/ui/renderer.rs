@@ -787,7 +787,9 @@ fn prompt_header_shortened(header: &str, options: &str, width: usize, rows: &[St
     let width = width.max(1);
     let header = crate::ui::events::sanitize_for_review(header);
     let options = crate::ui::events::sanitize_output(options).replace('\n', " ");
-    let option_rows = wrap_to_width(&options, width).len().min(rows.len());
+    let option_rows = crate::ui::utils::wrap_at_spaces(&options, width)
+        .len()
+        .min(rows.len());
     let full: Vec<String> = header
         .split('\n')
         .flat_map(|line| wrap_to_width(line, width))
@@ -801,15 +803,15 @@ fn prompt_header_shortened(header: &str, options: &str, width: usize, rows: &[St
 /// fit, the last two lines (the draft and the key legend) are kept and the
 /// earlier ones shrink to one row each, so the tail is never what is cut.
 fn option_block_rows(options: &str, width: usize, room: usize) -> Vec<String> {
-    use crate::ui::utils::{display_prefix, wrap_to_width};
+    use crate::ui::utils::{display_prefix, wrap_at_spaces};
     let options = crate::ui::events::sanitize_output(options);
     let lines: Vec<&str> = options.split('\n').collect();
     if lines.len() == 1 {
-        let mut rows = wrap_to_width(lines[0], width);
+        let mut rows = wrap_at_spaces(lines[0], width);
         rows.truncate(room);
         return rows;
     }
-    let all: Vec<Vec<String>> = lines.iter().map(|l| wrap_to_width(l, width)).collect();
+    let all: Vec<Vec<String>> = lines.iter().map(|l| wrap_at_spaces(l, width)).collect();
     if all.iter().map(Vec::len).sum::<usize>() <= room {
         return all.into_iter().flatten().collect();
     }

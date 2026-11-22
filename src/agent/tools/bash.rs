@@ -1651,9 +1651,52 @@ impl JobStatusTool {
                 .join("\n"));
         }
         let mut wait_note: Option<String> = None;
-        let id = args.id.as_deref().ok_or_else(|| ToolError::Msg(
-            "job_status requires an id for poll, wait or stop. Example: {\"id\":\"job-...\",\"action\":\"wait\"}".into(),
-        ))?;
+        // mini-agent-36576: poll and wait never change a job, so a missing id
+        // defaults to the only job that is still running (or the only job).
+        // Stop and input never guess; the error names the ids instead.
+        let in_scope_jobs = || {
+            self.sandbox
+                .background_job_summaries()
+                .into_iter()
+                .filter(|job| {
+                    self.job_scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.contains(&job.id))
+                })
+                .collect::<Vec<_>>()
+        };
+        let defaulted: Option<String> =
+            if args.id.is_none() && matches!(args.action, JobAction::Poll | JobAction::Wait) {
+                let jobs = in_scope_jobs();
+                let mut active = jobs.iter().filter(|job| !job.status.is_terminal());
+                match (active.next(), active.next(), jobs.as_slice()) {
+                    (Some(only), None, _) => Some(only.id.clone()),
+                    (None, _, [only]) => Some(only.id.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        let id = match args.id.as_deref().or(defaulted.as_deref()) {
+            Some(id) => id,
+            None => {
+                let jobs = in_scope_jobs();
+                let known = if jobs.is_empty() {
+                    "There are no background jobs in this session.".to_owned()
+                } else {
+                    format!(
+                        "Current job ids: {}.",
+                        jobs.iter()
+                            .map(|job| format!("{} ({})", job.id, job.status.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                };
+                return Err(ToolError::Msg(format!(
+                    "job_status requires an id for poll, wait or stop. Example: {{\"id\":\"job-...\",\"action\":\"wait\"}}. {known}"
+                )));
+            }
+        };
         if self
             .job_scope
             .as_ref()
@@ -3317,6 +3360,46 @@ mod tests {
             .to_string()
             .contains("600000")
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn job_status_without_an_id_defaults_to_the_only_running_job_or_lists_ids() {
+        // mini-agent-36576
+        let shell = test_tool();
+        let status = JobStatusTool::new(shell.sandbox.clone(), None);
+        let start = |command: &str| BashArgs {
+            command: command.to_string(),
+            timeout: Some(20_000),
+            background: true,
+            ..Default::default()
+        };
+        let no_id = |action| JobStatusArgs {
+            id: None,
+            action,
+            timeout_ms: None,
+            since: None,
+            ..Default::default()
+        };
+        let first = background_id(&shell.call(start("sleep 5")).await.unwrap());
+        let polled = status.call(no_id(JobAction::Poll)).await.unwrap();
+        assert!(polled.contains(&first), "{polled}");
+        let second = background_id(&shell.call(start("sleep 5")).await.unwrap());
+        for action in [JobAction::Poll, JobAction::Wait, JobAction::Stop] {
+            let error = status.call(no_id(action)).await.unwrap_err().to_string();
+            assert!(error.contains("requires an id"), "{error}");
+            assert!(error.contains(&first) && error.contains(&second), "{error}");
+        }
+        for id in [first, second] {
+            status
+                .call(JobStatusArgs {
+                    id: Some(id),
+                    action: JobAction::Stop,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
     }
 
     #[tokio::test]

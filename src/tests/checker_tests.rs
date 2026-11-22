@@ -2296,7 +2296,7 @@ fn mcp_exa_web_tools_are_not_exempt_in_readonly_or_planwrite() {
     for mode in [SecurityMode::ReadOnly, SecurityMode::PlanWrite] {
         let mut checker = make_checker(mode);
         for tool_name in ["websearch", "webfetch"] {
-            let input = format!("mcp_tool:Exa Web Search:{tool_name}");
+            let input = format!("mcp_tool:exa:{tool_name}");
             assert!(
                 !matches!(
                     checker.check_mcp(&input, registration.trusted_identity(), tool_name),
@@ -2396,10 +2396,31 @@ fn readonly_denies_unrelated_prefix() {
 }
 
 #[test]
+fn legacy_exa_web_search_rule_still_matches_the_renamed_built_in() {
+    let config = PermissionConfig {
+        mcp_tool: Some(ToolPerm::Granular(
+            [("mcp_tool:Exa Web Search:*".to_owned(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        None,
+        default_modes(),
+    )
+    .expect("valid permission test configuration");
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:exa:websearch"),
+        CheckResult::Denied(_),
+    ));
+}
+
+#[test]
 fn standard_mode_still_allows_exa_mcp_via_default() {
     let mut checker = make_checker(SecurityMode::Standard);
     assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Exa Web Search:websearch"),
+        checker.check("mcp_tool", "mcp_tool:exa:websearch"),
         CheckResult::Allowed,
     ));
 }
@@ -3569,4 +3590,18 @@ fn configured_alias_mapping_keeps_raw_mcp_inputs_and_stored_alias_grants_unmodif
         CheckResult::Ask,
         "canonicalizing config keys must not revive an ignored persisted runtime alias grant"
     );
+}
+
+/// mini-agent-j0ea2: read-only mode's always-denied edit tools are not offered.
+#[test]
+fn read_only_mode_marks_edit_tools_as_always_denied() {
+    let readonly = make_checker(SecurityMode::ReadOnly);
+    for tool in ["write", "edit", "notebook_edit"] {
+        assert!(readonly.tool_always_denied(tool), "{tool}");
+    }
+    for tool in ["read", "grep", "shell", "git"] {
+        assert!(!readonly.tool_always_denied(tool), "{tool}");
+    }
+    let standard = make_checker(SecurityMode::Standard);
+    assert!(!standard.tool_always_denied("write"));
 }

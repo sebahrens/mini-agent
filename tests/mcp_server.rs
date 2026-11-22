@@ -189,3 +189,111 @@ fn mcp_server_mode_initializes_lists_run_and_executes_a_headless_prompt() {
     );
     assert!(request.to_string().contains("say pong"));
 }
+
+#[test]
+fn mcp_server_run_with_a_progress_token_reports_the_model_turn() {
+    let root = temp::TempDir::new_canonical("mcp-server-progress");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    std::fs::write(
+        root.join("config.toml"),
+        format!(
+            "session_title_model=\"off\"\n[custom_providers.local-test]\nprovider_type=\"openai\"\nbase_url=\"http://{address}/v1\"\napi_key_env=\"MCP_SERVER_TEST_KEY\"\napi_style=\"completions\"\n"
+        ),
+    )
+    .unwrap();
+    let server = provider(listener, "pong from mini-agent");
+
+    let mut command = Command::new(tested_binary());
+    command
+        .current_dir(root.path())
+        .env("HOME", root.path())
+        .env("MCP_SERVER_TEST_KEY", "local-test-key")
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost");
+    for name in [
+        "MINI_AGENT_CONFIG_DIR",
+        "MINI_AGENT_DATA_DIR",
+        "MINI_AGENT_LOCAL_DATA_DIR",
+        "MINI_AGENT_STATE_DIR",
+        "MINI_AGENT_CACHE_DIR",
+        "MINI_AGENT_CREDENTIALS_DIR",
+    ] {
+        command.env(name, root.path());
+    }
+    let mut child = command
+        .args([
+            "--mcp-server",
+            "--no-sandbox",
+            "--no-context-files",
+            "--no-tools",
+            "--provider",
+            "local-test",
+            "--model",
+            "test",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut call = |request: serde_json::Value| -> serde_json::Value {
+        writeln!(stdin, "{request}").unwrap();
+        stdin.flush().unwrap();
+        if request.get("id").is_none() {
+            return serde_json::Value::Null;
+        }
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap_or_else(|_| panic!("not JSON-RPC: {line:?}"))
+    };
+    let init = call(
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}),
+    );
+    assert_eq!(init["result"]["serverInfo"]["name"], "mini-agent");
+    assert!(init["result"]["capabilities"]["tools"].is_object());
+    call(serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    writeln!(
+        stdin,
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+            "_meta":{"progressToken":"tok"},
+            "name":"run","arguments":{"prompt":"say pong"}}})
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+    let mut messages = Vec::new();
+    let run = loop {
+        let mut line = String::new();
+        assert_ne!(stdout.read_line(&mut line).unwrap(), 0, "server closed");
+        let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+        if value["method"] == "notifications/progress" {
+            assert_eq!(value["params"]["progressToken"], "tok");
+            messages.push(value["params"]["message"].as_str().unwrap().to_owned());
+        } else if value["id"] == 3 {
+            break value;
+        }
+    };
+    server.join().unwrap();
+    drop(stdin);
+    let _ = child.wait();
+    assert_eq!(run["result"]["isError"], false, "{run}");
+    assert!(
+        run["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pong from mini-agent"),
+        "{run}"
+    );
+    assert!(
+        messages.iter().any(|m| m == "model turn finished"),
+        "{messages:?}"
+    );
+}

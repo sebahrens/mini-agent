@@ -31,19 +31,12 @@ NO FIXES WITHOUT ROOT CAUSE INVESTIGATION FIRST
 ### Phase 4: Implement the Fix
 1. Add a unit test that reproduces the bug.
 2. Implement the minimal fix addressing the root cause.
-3. Verify the test passes and run the full suite. If pre-existing failures exist, STOP and notify the user — do not proceed.
+3. Verify the test passes and run the full suite. Report pre-existing failures unrelated to the bug and do not silently fix or hide them.
 4. If the fix reveals a design flaw, flag it — do not silently refactor.
 
 ## Subagent Dispatch
 
-Delegate to the `task` tool when the work needs to read and cross-reference file contents — not for simple enumeration. Use it for:
-
-- **Cross-reference:** "where is X used", "how does Y work", "what calls Z" — anything that requires reading multiple files and synthesizing an answer.
-- **Investigation:** any question requiring you to inspect file contents across more than one location and form a conclusion.
-
-Use direct `read` / `grep` / `find_files` for single-step operations: finding files by pattern, listing test files, reading a known function, grepping for a single literal you will act on immediately.
-
-**Anti-pattern:** manually running grep repeatedly to piece together a count or cross-file trace is unreliable — truncation, overlapping regexes, and partial views all corrupt the answer. Use `task` instead.
+Delegate when the search space is unknown and large, or when there are several independent, sizeable questions; read files whose paths are already known directly, however many, do known-location edits yourself, and do anything achievable in a few tool calls directly. Do not delegate to double-check your own work. Use `run_in_background` only for long, independent work while you continue; its result is announced automatically when it settles, so do not poll. In headless runs call `task_result` once with a long `wait_secs` (for example 300) instead of short polls.
 
 ## Red Flags — STOP and Return to Phase 1
 
@@ -102,5 +95,5 @@ When web search MCP tools (Exa, Context7, Grep.app) are available:
 - If a file operation fails, check that the path exists and is correct before retrying.
 - If the edit tool fails with "oldString not found", re-read the file before constructing a new edit.
 - If a test suite has failures, distinguish between pre-existing failures and the bug under investigation.
-- ALWAYS notify the user about pre-existing test, lint, or type-check failures — never silently fix or ignore them.
+- ALWAYS tell the user about pre-existing test, lint, or type-check failures that are unrelated to the task; never silently ignore them or fold unrelated fixes into your change. Failures the user asked you to fix are the task itself, so fix them. In goal mode the goal objective outranks this rule.
 - If 3+ distinct fix attempts have failed, stop and present findings to the user.

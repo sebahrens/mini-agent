@@ -232,9 +232,104 @@ pub(crate) fn annotate_stdin_abandoned(value: &mut serde_json::Value) {
 }
 
 static PARTIAL_MESSAGES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Completions finished so far this process; a delta's `message_id` names the
-/// completion in progress (`msg_<n>`, 1-based), so a driver can group deltas.
-static COMPLETIONS_FINISHED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Per-response output bookkeeping shared by the text, stream-json and stderr
+/// writers (mini-agent-55yev, s940q, kttw7, 7b0m8).
+///
+/// * `seq` numbers model responses; a response owns the `msg_<seq>` id of its
+///   thinking, text and tool-call records. A response starts at the first
+///   content record after a tool result (or after the previous result record).
+/// * `pending` holds assistant text for stream-json until the response's text
+///   ends, so one `assistant_text` record is emitted per text block instead of
+///   one per stream flush.
+struct ResponseFlow {
+    seq: u64,
+    open: bool,
+    pending: String,
+    text_wrote: bool,
+    text_ends_newline: bool,
+    reasoning_wrote: bool,
+    reasoning_ends_newline: bool,
+}
+
+static RESPONSE_FLOW: std::sync::Mutex<ResponseFlow> = std::sync::Mutex::new(ResponseFlow {
+    seq: 0,
+    open: false,
+    pending: String::new(),
+    text_wrote: false,
+    text_ends_newline: true,
+    reasoning_wrote: false,
+    reasoning_ends_newline: true,
+});
+
+fn response_flow() -> std::sync::MutexGuard<'static, ResponseFlow> {
+    RESPONSE_FLOW
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Mark that a content record of the current model response is being written;
+/// true when this record starts a new response.
+fn begin_response_content() -> bool {
+    let mut flow = response_flow();
+    if flow.open {
+        return false;
+    }
+    flow.seq += 1;
+    flow.open = true;
+    true
+}
+
+/// The current response ended (its tool batch finished, or the run's result
+/// was emitted): the next content record belongs to a new response.
+fn end_response() {
+    response_flow().open = false;
+}
+
+/// Split buffered assistant text into records no larger than `limit` bytes.
+fn take_full_text_chunks(flow: &mut ResponseFlow, limit: usize) -> Vec<String> {
+    let limit = limit.max(4);
+    let mut chunks = Vec::new();
+    while flow.pending.len() >= limit {
+        let mut end = limit;
+        while !flow.pending.is_char_boundary(end) {
+            end -= 1;
+        }
+        let rest = flow.pending.split_off(end);
+        chunks.push(std::mem::replace(&mut flow.pending, rest));
+    }
+    chunks
+}
+
+/// Emit the buffered assistant text as one `assistant_text` record, if any.
+pub(crate) async fn flush_pending_assistant_text() -> anyhow::Result<()> {
+    let text = std::mem::take(&mut response_flow().pending);
+    emit_assistant_text_record(&text).await
+}
+
+async fn emit_assistant_text_record(text: &str) -> anyhow::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let (text, truncated) = bounded_progress(text, progress_bytes());
+    emit_stream_record(
+        serde_json::json!({"type":"assistant_text", "text":text, "truncated":truncated}),
+    )
+    .await
+}
+
+async fn emit_stream_record(event: serde_json::Value) -> anyhow::Result<()> {
+    if HEADLESS_STDOUT_CLOSED.load(std::sync::atomic::Ordering::Relaxed) {
+        return Ok(());
+    }
+    if claude_schema() {
+        for record in claude_stream_records(event) {
+            headless_stdout_async(format!("{}\n", terminal_safe_json(&record))).await?;
+        }
+    } else {
+        headless_stdout_async(format!("{}\n", terminal_safe_json(&event))).await?;
+    }
+    Ok(())
+}
 
 /// Start of the span the next final result's `duration_ms` covers: process
 /// start for a single-turn run; for a multi-turn stream-json run, the moment
@@ -363,6 +458,12 @@ fn truncate_utf8(text: &str, max: usize) -> String {
     format!("{}...", &text[..end])
 }
 
+/// Whether this process is a configured headless run (`-p`, `--loop`): the
+/// surface where slash commands do not exist and flags are the remedy.
+pub(crate) fn headless_surface() -> bool {
+    RECORD_PERMISSION_DENIALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Record a refused tool call (bounded: a count plus the first entries).
 pub(crate) fn record_permission_denial(tool: &str, input: &str, reason: &str) {
     if !RECORD_PERMISSION_DENIALS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -476,12 +577,23 @@ pub(crate) fn claude_stream_records(event: serde_json::Value) -> Vec<serde_json:
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let session_id = session_id.map_or(serde_json::Value::Null, serde_json::Value::from);
+    let model = CLAUDE_STREAM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .model
+        .clone();
     let assistant = |block: serde_json::Value, truncated: bool| {
+        let stop_reason = if block["type"] == "tool_use" {
+            json!("tool_use")
+        } else {
+            serde_json::Value::Null
+        };
         let mut record = json!({
             "type":"assistant",
             "message":{
                 "id":current_message_id(), "type":"message", "role":"assistant",
-                "content":[block],
+                "content":[block], "model":model, "stop_reason":stop_reason,
+                "stop_sequence":null,
             },
             "parent_tool_use_id":null, "session_id":session_id,
             "uuid":uuid::Uuid::new_v4().to_string(),
@@ -623,6 +735,22 @@ pub(crate) fn claude_stream_records(event: serde_json::Value) -> Vec<serde_json:
             records.push(delta);
             records
         }
+        // Extension records never land inside a content block's frame: the
+        // open block (not the message) ends first (mini-agent-s940q).
+        Some("usage") => {
+            let mut state = CLAUDE_STREAM
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut records = Vec::new();
+            if let Some((index, _)) = state.block.take() {
+                records.push(claude_stream_event(
+                    json!({"type":"content_block_stop", "index":index}),
+                    &session_id,
+                ));
+            }
+            records.push(event);
+            records
+        }
         _ => vec![event],
     }
 }
@@ -665,11 +793,11 @@ fn partial_messages() -> bool {
     PARTIAL_MESSAGES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `msg_<n>` of the model response whose content is being written; every
+/// thinking, text and tool-call record of one response shares it.
 fn current_message_id() -> String {
-    format!(
-        "msg_{}",
-        COMPLETIONS_FINISHED.load(std::sync::atomic::Ordering::Relaxed) + 1
-    )
+    let flow = response_flow();
+    format!("msg_{}", if flow.open { flow.seq } else { flow.seq + 1 })
 }
 
 /// Apply `--stream-json-preview-bytes` / `--max-stdin-bytes` (clap already
@@ -769,16 +897,15 @@ impl HeadlessOutputPolicy {
     }
 
     pub(crate) async fn emit_event(self, event: serde_json::Value) -> anyhow::Result<()> {
-        if self.format == cli::OutputFormat::StreamJson
-            && !HEADLESS_STDOUT_CLOSED.load(std::sync::atomic::Ordering::Relaxed)
-        {
-            if claude_schema() {
-                for record in claude_stream_records(event) {
-                    headless_stdout_async(format!("{}\n", terminal_safe_json(&record))).await?;
-                }
-            } else {
-                headless_stdout_async(format!("{}\n", terminal_safe_json(&event))).await?;
+        if self.format == cli::OutputFormat::StreamJson {
+            // Buffered assistant text precedes whatever record ends its block.
+            if !matches!(
+                event.get("type").and_then(serde_json::Value::as_str),
+                Some("assistant_text" | "text_delta")
+            ) {
+                flush_pending_assistant_text().await?;
             }
+            emit_stream_record(event).await?;
         }
         Ok(())
     }
@@ -802,19 +929,36 @@ impl HeadlessOutputPolicy {
     }
 
     pub(crate) async fn assistant_text(self, text: &str) -> anyhow::Result<()> {
+        let started = begin_response_content();
         if self.streams_text() {
+            let separator = {
+                let mut flow = response_flow();
+                let separate = started && flow.text_wrote && !flow.text_ends_newline;
+                if !text.is_empty() {
+                    flow.text_wrote = true;
+                    flow.text_ends_newline = text.ends_with('\n');
+                }
+                separate
+            };
+            if separator {
+                headless_stdout_async("\n".to_string()).await?;
+            }
             headless_stdout_async(text.to_string()).await?;
         }
         if self.format == cli::OutputFormat::StreamJson {
-            let (text, truncated) = bounded_progress(text, progress_bytes());
             if partial_messages() {
-                self.emit_event(partial_event("text_delta", &text, truncated))
+                let (bounded, truncated) = bounded_progress(text, progress_bytes());
+                self.emit_event(partial_event("text_delta", &bounded, truncated))
                     .await?;
             }
-            self.emit_event(
-                serde_json::json!({"type":"assistant_text", "text":text, "truncated":truncated}),
-            )
-            .await?;
+            let chunks = {
+                let mut flow = response_flow();
+                flow.pending.push_str(text);
+                take_full_text_chunks(&mut flow, progress_bytes())
+            };
+            for chunk in chunks {
+                emit_assistant_text_record(&chunk).await?;
+            }
         }
         Ok(())
     }
@@ -822,18 +966,35 @@ impl HeadlessOutputPolicy {
     /// A streamed reasoning fragment: the usual stderr display, plus a
     /// `reasoning_delta` event under `--include-partial-messages`.
     pub(crate) async fn reasoning_delta(self, text: &str) -> anyhow::Result<()> {
+        let started = begin_response_content();
         if self.format == cli::OutputFormat::StreamJson && partial_messages() {
             let (bounded, truncated) = bounded_progress(text, progress_bytes());
             self.emit_event(partial_event("reasoning_delta", &bounded, truncated))
                 .await?;
         }
-        self.reasoning(text).await
+        self.write_reasoning(text, started).await
     }
 
     pub(crate) async fn reasoning(self, text: &str) -> anyhow::Result<()> {
+        let started = begin_response_content();
+        self.write_reasoning(text, started).await
+    }
+
+    /// Reasoning blocks of different responses start on their own line
+    /// (mini-agent-kttw7).
+    async fn write_reasoning(self, text: &str, started: bool) -> anyhow::Result<()> {
         if !self.quiet {
             let (text, _) = bounded_progress(text, progress_bytes());
-            headless_stderr_async(text).await?;
+            let separator = {
+                let mut flow = response_flow();
+                let separate = started && flow.reasoning_wrote && !flow.reasoning_ends_newline;
+                if !text.is_empty() {
+                    flow.reasoning_wrote = true;
+                    flow.reasoning_ends_newline = text.ends_with('\n');
+                }
+                separate
+            };
+            headless_stderr_async(if separator { format!("\n{text}") } else { text }).await?;
         }
         Ok(())
     }
@@ -849,6 +1010,7 @@ impl HeadlessOutputPolicy {
         if let Some(collector) = crate::extras::otel::global() {
             collector.tool_call(id, name);
         }
+        begin_response_content();
         let (args, args_truncated) = bounded_json_value(args, progress_bytes());
         let (provider_id, id_truncated) = bounded_progress(provider_id, 512);
         let (event_name, name_truncated) = bounded_progress(name, 256);
@@ -883,6 +1045,7 @@ impl HeadlessOutputPolicy {
         let (event_name, name_truncated) = bounded_progress(name, 256);
         let truncated = output_truncated || name_truncated;
         self.emit_event(serde_json::json!({"type":"tool_result", "id":id, "name":event_name, "output":bounded, "truncated":truncated, "is_error":is_error})).await?;
+        end_response();
         if self.format == cli::OutputFormat::Text {
             let (name, _) = bounded_progress(name, 256);
             if self.pure_stdout && !output.is_empty() {
@@ -916,7 +1079,9 @@ impl HeadlessOutputPolicy {
         delta: crate::event::UsageDelta,
         cumulative: Usage,
     ) -> anyhow::Result<()> {
-        COMPLETIONS_FINISHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.format == cli::OutputFormat::StreamJson {
+            flush_pending_assistant_text().await?;
+        }
         end_api_span();
         #[cfg(feature = "otel")]
         if let Some(collector) = crate::extras::otel::global() {
@@ -1102,14 +1267,33 @@ fn bounded_json_value(value: &impl Serialize, limit: usize) -> (serde_json::Valu
     )
 }
 
-fn read_stdin_bounded(mut reader: impl io::Read) -> anyhow::Result<String> {
+#[cfg(test)]
+fn read_stdin_bounded(reader: impl io::Read) -> anyhow::Result<String> {
+    read_stdin_bounded_with(reader, || {})
+}
+
+/// Reads `reader` to the byte bound; `on_first_data` runs once, after the
+/// first byte arrives and before the rest is awaited, so a notice is printed
+/// only when stdin carries data (an empty or `/dev/null` stdin stays silent).
+fn read_stdin_bounded_with(
+    mut reader: impl io::Read,
+    on_first_data: impl FnOnce(),
+) -> anyhow::Result<String> {
     use std::io::Read as _;
     let limit = stdin_bytes();
     let mut bytes = Vec::new();
-    reader
-        .by_ref()
-        .take(limit as u64 + 1)
-        .read_to_end(&mut bytes)?;
+    let mut first = [0u8; 1];
+    loop {
+        match reader.read(&mut first) {
+            Ok(0) => return Ok(String::new()),
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    on_first_data();
+    bytes.push(first[0]);
+    reader.by_ref().take(limit as u64).read_to_end(&mut bytes)?;
     if bytes.len() > limit {
         anyhow::bail!("piped stdin exceeds {limit} bytes (raise with --max-stdin-bytes)");
     }
@@ -1177,16 +1361,18 @@ fn read_stdin_gated(
         }
         return Ok(String::new());
     }
-    // This notice shares the reader's owned blocking job. Emitting it
-    // here gates readiness without an async gap before the read; even
-    // a stalled stderr write cannot hold the event-loop thread.
-    if !quiet {
-        headless_stderr(format_args!(
-            "Reading piped stdin (limit {} bytes)\n",
-            stdin_bytes()
-        ));
-    }
-    read_stdin_bounded(reader)
+    // The notice shares the reader's owned blocking job and is printed once
+    // the first byte arrives (mini-agent-7b0m8): an empty or null stdin, the
+    // normal case in CI, stays silent, while a blocked reader with data is
+    // still announced before it waits for EOF.
+    read_stdin_bounded_with(reader, || {
+        if !quiet {
+            headless_stderr(format_args!(
+                "Reading piped stdin (limit {} bytes)\n",
+                stdin_bytes()
+            ));
+        }
+    })
 }
 
 /// Read piped stdin for a headless run. With an explicit prompt, a pipe that
@@ -1407,6 +1593,10 @@ pub(crate) async fn emit_headless_result(
     session: Option<(&str, &str)>,
     persisted: bool,
 ) -> anyhow::Result<()> {
+    if format == cli::OutputFormat::StreamJson {
+        flush_pending_assistant_text().await?;
+    }
+    end_response();
     let mut value: serde_json::Value = serde_json::from_str(rendered)?;
     annotate_stdin_abandoned(&mut value);
     value["session_id"] = session.map_or(serde_json::Value::Null, |(id, _)| id.into());
@@ -2151,6 +2341,16 @@ where
     result
 }
 
+/// Close an interrupted turn in the saved history with the host marker, unless
+/// it already ends with one, so a later turn is not read as a request to
+/// finish the cancelled one (mini-agent-l8lb2).
+fn mark_interrupted_history(interactions: &mut Vec<rig::completion::Message>) {
+    let marker = crate::agent::runner::interrupted_turn_marker();
+    if interactions.last() != Some(&marker) {
+        interactions.push(marker);
+    }
+}
+
 /// [`run_headless_turn`] without the process-wide forced-stop record, so tests
 /// can drive it with injected signals.
 async fn run_headless_turn_with<F>(
@@ -2201,6 +2401,12 @@ where
                     };
                     if let Err(error) = signal {
                         result.failure = Some(anyhow::anyhow!(error).context("headless signal handler failed"));
+                    } else if result
+                        .failure
+                        .as_ref()
+                        .is_some_and(crate::agent::runner::is_headless_interrupt)
+                    {
+                        mark_interrupted_history(&mut result.interactions);
                     }
                     (result, Some(deadline), None)
                 }
@@ -4109,6 +4315,17 @@ mod tests {
 
     // mini-agent-nvnkx.158
     #[test]
+    fn an_interrupted_turn_is_closed_in_history_with_one_marker() {
+        let mut interactions = Vec::new();
+        super::mark_interrupted_history(&mut interactions);
+        super::mark_interrupted_history(&mut interactions);
+        assert_eq!(interactions.len(), 1);
+        let text = format!("{:?}", interactions[0]);
+        assert!(text.contains("turn interrupted"), "{text}");
+        assert!(text.contains("unless the user asks for it again"), "{text}");
+    }
+
+    #[test]
     fn an_interrupted_result_keeps_the_partial_text_and_marks_the_cut() {
         use super::{HeadlessStopReason, interrupted_result};
         assert_eq!(
@@ -5883,6 +6100,45 @@ mod headless_output_policy_tests {
         tokio::time::timeout(std::time::Duration::from_millis(100), scope.wait_idle())
             .await
             .unwrap();
+    }
+
+    /// mini-agent-55yev: buffered assistant text is split only at the preview
+    /// cap, on a char boundary, and loses nothing.
+    #[test]
+    fn buffered_assistant_text_chunks_at_the_cap_without_loss() {
+        let mut flow = ResponseFlow {
+            seq: 0,
+            open: false,
+            pending: "é".repeat(10),
+            text_wrote: false,
+            text_ends_newline: true,
+            reasoning_wrote: false,
+            reasoning_ends_newline: true,
+        };
+        let chunks = take_full_text_chunks(&mut flow, 7);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= 7));
+        let rejoined = format!("{}{}", chunks.concat(), flow.pending);
+        assert_eq!(rejoined, "é".repeat(10));
+        assert!(flow.pending.len() < 7);
+        let mut short = ResponseFlow {
+            pending: "short".into(),
+            ..flow
+        };
+        assert!(take_full_text_chunks(&mut short, 64).is_empty());
+        assert_eq!(short.pending, "short");
+    }
+
+    /// mini-agent-7b0m8: the piped-stdin notice fires only when data arrives.
+    #[test]
+    fn piped_stdin_notice_runs_only_when_stdin_has_data() {
+        let mut fired = false;
+        let empty = read_stdin_bounded_with(std::io::Cursor::new(Vec::new()), || fired = true);
+        assert_eq!(empty.unwrap(), "");
+        assert!(!fired, "empty or null stdin must not print the notice");
+        let mut fired = false;
+        let text = read_stdin_bounded_with(std::io::Cursor::new(b"abc".to_vec()), || fired = true);
+        assert_eq!(text.unwrap(), "abc");
+        assert!(fired);
     }
 
     #[test]

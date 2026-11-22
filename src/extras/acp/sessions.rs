@@ -300,10 +300,21 @@ pub(super) async fn handle_load(
     // An id this process still holds with nothing running is replaced by the
     // saved copy, and at the session cap the least recently used idle session
     // makes room; only busy sessions refuse the load.
+    // The permission mode is runtime state, never adopted from saved data. A
+    // reload that replaces a session this connection still holds keeps the
+    // mode the client set with session/set_mode (mini-agent-w7thh).
+    let live_mode = match state.sessions.lock().await.get(&req.session_id) {
+        Some(live) => live
+            .history
+            .try_lock()
+            .ok()
+            .and_then(|history| history.policy.mode()),
+        None => None,
+    };
     let lease = super::reserve_lease(state, &req.session_id).await?;
     let saved_selection = session.acp_selection.clone();
     let native = crate::session::native_publication::is_native_bearing(&session);
-    let modes = super::install_session(
+    let mut modes = super::install_session(
         state,
         req.session_id.clone(),
         workspace,
@@ -315,6 +326,13 @@ pub(super) async fn handle_load(
         client_mcp_servers,
     )
     .await?;
+    if let Some(mode) = live_mode
+        && let Some(installed) = state.sessions.lock().await.get(&req.session_id)
+        && let Ok(history) = installed.history.try_lock()
+        && history.policy.set_mode(&mode.to_string()).is_ok()
+    {
+        modes = history.policy.modes();
+    }
     super::set_additional_dirs(state, &req.session_id, additional_dirs).await;
     // Replay literal saved data only. Opaque native signatures/redacted blocks
     // are never sent to the editor's display channel.
@@ -414,7 +432,7 @@ fn replay_updates(
                     content.push(stored);
                 }
                 content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
-                    message.content.to_string(),
+                    crate::ui::events::sanitize_output(&message.content).to_string(),
                 ))));
                 let mut fields = ToolCallUpdateFields::new()
                     .status(ToolCallStatus::Completed)
@@ -540,6 +558,26 @@ mod canonical_tests {
         };
         assert_eq!(closed.tool_call_id.0.as_ref(), "lost");
         assert_eq!(closed.fields.status, Some(ToolCallStatus::Failed));
+    }
+
+    #[test]
+    fn replay_strips_terminal_controls_from_stored_tool_output() {
+        let mut session = crate::session::Session::new("logical", "model", 128_000, "");
+        session.add_tool_call_with_id("c", "shell", &serde_json::json!({"command": "x"}));
+        session.add_tool_result_with_id("c", "shell", "a\x1b]0;t\x07b\x1b[2Jc");
+        let id = SessionId::new(session.id.to_string());
+        let updates = replay_updates(&id, &session, std::path::Path::new("/work")).unwrap();
+        let SessionUpdate::ToolCallUpdate(done) = &updates[1].update else {
+            panic!("expected a result update");
+        };
+        let ToolCallContent::Content(block) = &done.fields.content.as_ref().unwrap()[0] else {
+            panic!("text content");
+        };
+        let ContentBlock::Text(text) = &block.content else {
+            panic!("text block");
+        };
+        assert!(text.text.ends_with("abc"), "{}", text.text);
+        assert!(!text.text.contains('\u{1b}'), "{}", text.text);
     }
 
     #[test]

@@ -44,6 +44,8 @@ pub(crate) use output_capture::{
 pub(crate) use pty_windows as pty;
 mod git_metadata;
 mod read_roots;
+#[cfg(unix)]
+mod synthetic_etc;
 pub(crate) use read_roots::default_sandbox_read_roots;
 
 /// Earlier sessions' Windows AppContainer grants this launcher could not withdraw (doctor).
@@ -3870,8 +3872,8 @@ impl Sandbox {
     /// Effective `sandbox-read-roots` for `--print-config`, resolved against
     /// the current workspace exactly as a launch would resolve them.
     pub(crate) fn bwrap_read_roots_summary(&self) -> String {
-        if self.backend != "bwrap" {
-            return "not applicable (bwrap backend only)".to_string();
+        if !matches!(self.backend.as_str(), "bwrap" | "seatbelt") {
+            return "not applicable (bwrap and seatbelt backends only)".to_string();
         }
         if self.profile != SandboxProfile::Workspace {
             return "not applicable (host filesystem profile already exposes the host tree)"
@@ -4714,6 +4716,29 @@ impl Sandbox {
     /// [`Self::get_seatbelt_profile`] for a launch that already validated the
     /// explicit roots and protected runtimes of this same workspace; those are
     /// reused instead of validated a second time. `None` validates everything.
+    /// Seatbelt `(subpath ...)` read grants and metadata-ancestor literals for
+    /// the validated `sandbox-toolchain-roots`. Empty outside the workspace
+    /// profile. Reads only: no write grant is ever derived from these roots.
+    fn seatbelt_toolchain_reads(
+        &self,
+        workspace: &Path,
+        cache: &Path,
+    ) -> Result<(String, String), String> {
+        if self.backend != "seatbelt" {
+            return Ok((String::new(), String::new()));
+        }
+        let roots = self.resolve_bwrap_read_roots(workspace, cache)?;
+        let sources: Vec<PathBuf> = roots.roots_for_seatbelt().map(Path::to_path_buf).collect();
+        let reads = seatbelt_private_read_denies(
+            &sources
+                .iter()
+                .map(|source| (source.as_path(), "toolchain root"))
+                .collect::<Vec<_>>(),
+        )?;
+        let ancestors = seatbelt_namespace_denies(&sources)?;
+        Ok((reads, ancestors))
+    }
+
     fn get_seatbelt_profile_for_launch(
         &self,
         workspace: &Path,
@@ -4759,6 +4784,13 @@ impl Sandbox {
             extra_writes,
             metadata_ancestors,
         } = root_inputs.as_ref();
+        // `sandbox-toolchain-roots` (macOS: Homebrew prefixes and user-level
+        // Cargo/rustup by default) become read-only grants. They precede the
+        // private-path denies in the profile, so those still win.
+        let (toolchain_reads, toolchain_ancestors) =
+            self.seatbelt_toolchain_reads(workspace, cache)?;
+        let extra_reads = &format!("{extra_reads}{toolchain_reads}");
+        let metadata_ancestors = &format!("{metadata_ancestors}{toolchain_ancestors}");
         let namespace_denies = &protected_denies.namespace;
         let profile_name = self.profile.to_string();
         let cache_key = seatbelt_profile_key(
@@ -5232,9 +5264,7 @@ impl Sandbox {
                 cmd.args(["--ro-bind-try", path, path]);
             }
             cmd.args(["--dir", "/etc"]);
-            for path in ["/etc/localtime", "/etc/ld.so.cache", "/etc/alternatives"] {
-                cmd.args(["--ro-bind-try", path, path]);
-            }
+            append_bwrap_etc_entries(&mut cmd);
         }
         cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
         // After the synthetic mounts (so a root under /tmp stays visible) and
@@ -5485,9 +5515,7 @@ impl Sandbox {
                 cmd.args(["--ro-bind-try", path, path]);
             }
             cmd.args(["--dir", "/etc"]);
-            for path in ["/etc/localtime", "/etc/ld.so.cache", "/etc/alternatives"] {
-                cmd.args(["--ro-bind-try", path, path]);
-            }
+            append_bwrap_etc_entries(&mut cmd);
         }
         cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]);
         cmd.arg("--bind").arg(cwd).arg(cwd);
@@ -5770,6 +5798,14 @@ impl Sandbox {
         // every `git` call would fail. Point the global config at an empty
         // file; `shell-env` below can still override it.
         cmd.arg("GIT_CONFIG_GLOBAL=/dev/null");
+        // Git also probes `$XDG_CONFIG_HOME/git/ignore` (default
+        // `~/.config/git/ignore`); the denied read prints a warning on every
+        // command. A command-scope `core.excludesFile` pointing at an empty
+        // file suppresses the probe without granting the user's git config
+        // directory. `shell-env` below can still override these.
+        cmd.arg("GIT_CONFIG_COUNT=1");
+        cmd.arg("GIT_CONFIG_KEY_0=core.excludesFile");
+        cmd.arg("GIT_CONFIG_VALUE_0=/dev/null");
         for (key, value) in self.shell_env_extra() {
             cmd.arg(format!("{key}={value}"));
         }
@@ -5982,9 +6018,7 @@ impl Sandbox {
                 cmd.arg("--ro-bind-try").arg(source).arg(destination);
             }
             cmd.args(["--dir", "/etc"]);
-            for path in ["/etc/localtime", "/etc/ld.so.cache", "/etc/alternatives"] {
-                cmd.args(["--ro-bind-try", path, path]);
-            }
+            append_bwrap_etc_entries(&mut cmd);
             cmd.args(["--proc", "/proc", "--dev", "/dev", "--tmpfs"])
                 .arg(&layout.temporary_root);
             // Empty-root layout only: never create aliases or directories after
@@ -8835,6 +8869,30 @@ const NONINTERACTIVE_ENV: &[(&str, &str)] = &[
     ("GIT_SEQUENCE_EDITOR", ":"),
 ];
 
+/// Host files bound read-only into the synthetic `/etc` of the workspace
+/// profile. `/etc/os-release` lets distribution detection work; neither the
+/// host account database nor `/etc/group` is exposed.
+const BWRAP_ETC_FILES: &[&str] = &[
+    "/etc/localtime",
+    "/etc/ld.so.cache",
+    "/etc/alternatives",
+    "/etc/os-release",
+];
+
+/// Bind the fixed `/etc` entries plus a synthetic passwd/group naming only the
+/// current user (mini-agent-7iqhg). If the files cannot be staged the sandbox
+/// simply lacks them, as before.
+fn append_bwrap_etc_entries(cmd: &mut Command) {
+    for path in BWRAP_ETC_FILES {
+        cmd.args(["--ro-bind-try", path, path]);
+    }
+    #[cfg(unix)]
+    if let Some(files) = synthetic_etc::stage_current_user(&std::env::temp_dir()) {
+        cmd.arg("--ro-bind").arg(&files.passwd).arg("/etc/passwd");
+        cmd.arg("--ro-bind").arg(&files.group).arg("/etc/group");
+    }
+}
+
 /// Resolver, host and CA files bound read-only into the workspace profile
 /// when `sandbox-network = "allow"`.
 const BWRAP_NETWORK_ETC_FILES: &[&str] = &[
@@ -9069,7 +9127,7 @@ fn seatbelt_profile_ladder(
             format!("(allow file-read-metadata{metadata_ancestors})\n")
         };
         format!(
-            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/\") (literal \"/var\") (literal \"/Library\") (literal \"/Library/Developer\") (literal \"/etc\") (literal \"/private/etc\") (literal \"/Applications\") (regex #\"^/Applications/Xcode[^/]*[.]app(/Contents)?$\"))\n(allow file-read* (literal \"/private/etc/gitconfig\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\") (literal \"/var/select/sh\") (literal \"/private/var/select/sh\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (subpath \"/Library/Developer/PrivateFrameworks\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Frameworks(/|$)\")\n (subpath \"/dev\"){extra_reads})"
+            "(allow file-read-data (literal \"/\"))\n{ancestor_metadata}(allow file-read-metadata (literal \"/\") (literal \"/var\") (literal \"/Library\") (literal \"/Library/Developer\") (literal \"/etc\") (literal \"/private/etc\") (literal \"/Applications\") (regex #\"^/Applications/Xcode[^/]*[.]app(/Contents)?$\"))\n(allow file-read* (literal \"/private/etc/gitconfig\") (subpath \"/private/etc/ssl\"))\n(allow file-read* (literal \"/var/select/developer_dir\") (literal \"/private/var/select/developer_dir\") (literal \"/var/select/sh\") (literal \"/private/var/select/sh\"))\n(allow file-read* (subpath \"{workspace}\") (subpath \"{cache}\")\n (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\")\n (subpath \"/System\") (subpath \"/Library/Apple\") (subpath \"/private/var/db\")\n (subpath \"/opt/homebrew/Cellar\") (subpath \"/opt/homebrew/opt\")\n (subpath \"/Library/Developer/CommandLineTools\")\n (subpath \"/Library/Developer/PrivateFrameworks\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Developer(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/SharedFrameworks(/|$)\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Info[.]plist$\")\n (regex #\"^/Applications/Xcode[^/]*[.]app/Contents/Frameworks(/|$)\")\n (subpath \"/dev\"){extra_reads})"
         )
     } else {
         "(allow file-read*)".to_owned()
@@ -11132,7 +11190,7 @@ mod sandbox_tests {
             .position(|w| flags.contains(&w[0].as_str()) && w[2] == mount_point)
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn bwrap_command_binds_default_read_roots_read_only_before_the_workspace() {
         // Hold the process-environment lock for the whole test: it derives
@@ -11995,6 +12053,56 @@ mod sandbox_tests {
         assert!(binds_alternatives, "{argv:?}");
     }
 
+    #[cfg(all(unix, feature = "hooks"))]
+    #[test]
+    fn bwrap_workspace_etc_has_synthetic_passwd_group_and_os_release_only() {
+        // mini-agent-7iqhg: the host account database is never bound; a staged
+        // single-user file is, read-only, and /etc/os-release is shared.
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        let (_scratch, root) = canonical_scratch();
+        let workspace = git_metadata::fixtures::plain_repository(&root, "repo");
+        let command = Sandbox::new(true, "bwrap")
+            .build_hook_bwrap_command(
+                Path::new("/usr/bin/bwrap"),
+                Path::new("/bin/sh"),
+                "/usr/bin/hook",
+                &[],
+                &workspace,
+                Path::new("/cache/mini-agent"),
+                &std::collections::BTreeMap::new(),
+                git_metadata::BwrapGitMetadataBinds::open(&workspace).unwrap(),
+                &read_roots::BwrapReadRoots::none(),
+            )
+            .unwrap();
+        let argv = command_argv(&command);
+        let bound = |destination: &str| -> Option<String> {
+            argv.windows(3)
+                .find(|w| w[0] == "--ro-bind" && w[2] == destination)
+                .map(|w| w[1].clone())
+        };
+        let passwd = bound("/etc/passwd").expect("synthetic passwd bound");
+        assert_ne!(
+            passwd, "/etc/passwd",
+            "the host account database must not be bound"
+        );
+        let text = std::fs::read_to_string(&passwd).unwrap();
+        assert_eq!(text.lines().count(), 1, "{text}");
+        let group = bound("/etc/group").expect("synthetic group bound");
+        assert_ne!(group, "/etc/group");
+        assert_eq!(std::fs::read_to_string(&group).unwrap().lines().count(), 1);
+        assert!(
+            argv.windows(3).any(|w| w[0] == "--ro-bind-try"
+                && w[1] == "/etc/os-release"
+                && w[2] == "/etc/os-release"),
+            "{argv:?}"
+        );
+        let etc = argv.iter().position(|a| a == "/etc").unwrap();
+        assert!(
+            argv.iter().position(|a| a == "/etc/passwd").unwrap() > etc,
+            "the passwd bind must come after the synthetic /etc directory"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn bwrap_workspace_service_binds_git_metadata_read_only_after_workspace() {
@@ -12388,6 +12496,70 @@ echo COMMITTED"#;
         assert!(stdout.contains("COMMITTED"), "{stdout}\n{stderr}");
         assert!(workspace.join("gitdir").is_dir());
         assert!(!workspace.join("moved").exists());
+    }
+
+    /// mini-agent-eb562, h8uk3, r0c68: the default macOS workspace profile
+    /// reads Homebrew tools and the LibreSSL config, stays silent about the
+    /// global git excludes probe, and still writes only inside the workspace.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_workspace_runs_homebrew_tools_and_reads_ssl_config_but_not_credentials() {
+        let _process_env = crate::tests::ScopedProcessEnv::set(&[]);
+        if !seatbelt_exists() {
+            eprintln!("skipping: Seatbelt is unusable on this host");
+            return;
+        }
+        let scratch = TempDir::new("sandbox");
+        let workspace = host_git_repository(scratch.path());
+        let sandbox = Sandbox::new(true, "seatbelt").with_working_dir(&workspace);
+        let run = |script: &'static str| {
+            let sandbox = &sandbox;
+            async move {
+                let output = sandbox
+                    .output_command_with_limits(script, DEFAULT_COMMAND_LIMITS)
+                    .await
+                    .unwrap();
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                )
+            }
+        };
+        let ssl = run("head -c 1 /private/etc/ssl/openssl.cnf >/dev/null && echo SSL_OK").await;
+        assert!(ssl.contains("SSL_OK"), "{ssl}");
+        let git = run("git status --short 2>&1; echo END").await;
+        assert!(!git.contains("unable to access"), "{git}");
+        if Path::new("/opt/homebrew/bin").is_dir() {
+            let listed = run("ls /opt/homebrew/bin >/dev/null && echo BREW_OK").await;
+            assert!(listed.contains("BREW_OK"), "{listed}");
+            for tool in ["python3", "node", "rg"] {
+                if Path::new("/opt/homebrew/bin").join(tool).exists() {
+                    let version = run(match tool {
+                        "python3" => "/opt/homebrew/bin/python3 --version 2>&1",
+                        "node" => "/opt/homebrew/bin/node --version 2>&1",
+                        _ => "/opt/homebrew/bin/rg --version 2>&1",
+                    })
+                    .await;
+                    assert!(!version.contains("not permitted"), "{tool}: {version}");
+                    assert!(!version.is_empty(), "{tool}");
+                }
+            }
+            let write = run("touch /opt/homebrew/bin/mini-agent-probe 2>&1; echo END").await;
+            assert!(!Path::new("/opt/homebrew/bin/mini-agent-probe").exists());
+            assert!(
+                write.contains("not permitted") || write.contains("denied"),
+                "{write}"
+            );
+        }
+        let secret =
+            run("cat \"$HOME/.ssh/id_rsa\" \"$HOME/.aws/credentials\" \"$HOME/.cargo/credentials.toml\" 2>&1; echo END")
+                .await;
+        assert!(!secret.contains("BEGIN"), "{secret}");
+        assert!(
+            secret.matches("not permitted").count() + secret.matches("No such file").count() >= 3,
+            "{secret}"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -13999,8 +14171,12 @@ echo PRIVATE_TEMP_PASS"#,
                 .collect::<Vec<_>>(),
         )
         .unwrap();
-        let metadata_ancestors =
-            seatbelt_namespace_denies(&[workspace.clone(), cache_dir.clone()]).unwrap();
+        let (toolchain_reads, toolchain_ancestors) = sandbox
+            .seatbelt_toolchain_reads(&workspace, &cache_dir)
+            .unwrap();
+        let metadata_ancestors = seatbelt_namespace_denies(&[workspace.clone(), cache_dir.clone()])
+            .unwrap()
+            + &toolchain_ancestors;
         let uncached_profile = seatbelt_profile_ladder(
             SandboxProfile::Workspace,
             &workspace_str,
@@ -14008,7 +14184,7 @@ echo PRIVATE_TEMP_PASS"#,
             &private_read_denies,
             "",
             &storage,
-            "",
+            &toolchain_reads,
             "",
             &namespace,
             &metadata_ancestors,

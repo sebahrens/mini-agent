@@ -177,6 +177,27 @@ permission grants. `constraints` bound the investigation, while
 sections rather than replacing them. Each list is limited to 64 non-empty
 items, each item to 8 KiB, and the complete rendered brief to 64 KiB.
 
+A child sees none of the parent conversation, so a brief states the goal and
+why, and may carry three more optional fields: `context` (why the task exists
+and the decisions that bear on it), `known` (facts already established and
+approaches already ruled out; worded as facts, not conclusions to confirm) and
+`done_when` (the stopping condition). They render as their own `### Context`,
+`### Known` and `### Done when` sections with the same JSON escaping and size
+limits, and are omitted when empty. Each `files` entry that names a file inside
+the workspace which the parent may read without asking is annotated by the
+host with `exists, N lines` or `not found`; globs, directories, paths outside
+the workspace and anything the permission rules would not allow outright get no
+note, and file contents are never attached.
+
+When one call starts several children, each child's first message ends with a
+host note listing the other children's objectives (one line each, at most
+eight, then a count) so parallel children do not repeat one another. A
+worktree-isolated child is also told its branch, the base commit and whether
+the parent checkout had uncommitted changes the worktree lacks; the same
+statement appears in the isolated-worktree section of its result. Every child's
+system prompt ends with an environment block (working directory, UTC date and
+platform).
+
 Optional `max_turns` and `timeout_secs` arguments set the child model-turn
 budget and the whole-call deadline for one call (for example
 `{"prompts": ["…"], "max_turns": 60, "timeout_secs": 1800}`). They override a
@@ -680,6 +701,12 @@ mode: review
 - `inline_images` is an integer from 0 to 3 that narrows
   `[subagents] task_inline_images` for this persona (it can never widen it);
   see [Inline image lane](#inline-image-lane).
+- `instructions: false` and `architecture: false` (both default `true`) keep the
+  root instruction overlay with its nested instruction files, respectively the
+  architecture text, out of this persona's children; use them for scout
+  personas that should start light. The injected byte counts are logged at
+  debug level. Worktree-isolated write children already start without the
+  parent's instruction overlay.
 - `isolation` is `worktree` or `none` (default). With `mode: write`,
   `worktree` runs each child in its own git worktree and branch; see
   [Worktree-isolated write children](#worktree-isolated-write-children).

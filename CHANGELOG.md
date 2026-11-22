@@ -6,8 +6,21 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `--mcp-server` runs with a progress token send `notifications/progress` at each tool call start and finish and each model turn, not only a heartbeat (mini-agent-1ptzh).
+- A permission denial from a stream-json, MCP elicitation or ACP client now reads "denied by the client"; an unanswered MCP elicitation is refused early enough for the run to save its session before `--mcp-server-timeout`; a second ACP TCP peer reads a "busy" line instead of waiting silently (mini-agent-mt2f2).
+- A failed hashedit lets the re-read it asks for through the repeated-read guard, and restarted goal/loop rounds clear the guard because their earlier tool results are gone (mini-agent-5zdmu, mini-agent-hs2tc).
+- A compaction summary cut off at the output cap (reasoning tokens count toward it) is retried once with a four times larger cap before it is accepted, and an empty reasoning-only response now reports why (mini-agent-h3ay0).
+- Compaction on the OpenRouter route forks the conversation's own request so the provider prompt cache can serve the prefix, as Anthropic and OpenAI already did (mini-agent-csng7).
+- A custom command directory with more than 128 files loads the first 128 in name order and one notice names the directory and the skipped count, instead of dropping the whole layer (mini-agent-jd6h1).
+
 ### Added
 
+- Esc interrupts a running turn when no picker, prompt, selection or Vim editor owns it, and the status line shows `esc to interrupt` (`ctrl+c to interrupt` in Vim mode) (mini-agent-z8nnm).
+- Task briefs take optional `context`, `known` and `done_when`; file hints are annotated with `exists, N lines` or `not found`; parallel children are told what their siblings are doing; worktree children are told their base commit and whether the parent checkout was dirty; every child gets an environment block (mini-agent-2u1w0, 2jysx, qp3od, kzzul, irrra).
+- Persona frontmatter `instructions: false` / `architecture: false` omits the instruction overlay or architecture text from that persona's children (mini-agent-l4lqw).
+- The task tool text and system-prompt bullet now tell the parent what the child cannot see and what a brief must contain (mini-agent-37gvy).
 - `compact_size_fraction` (default 0.75; `0` disables) starts automatic compaction, between turns and at tool-batch boundaries, when the encoded session nears the 32 MiB save ceiling, so image-heavy sessions compact before saving stops (mini-agent-fmmhs).
 - TUI compaction on the session model over Anthropic or OpenAI forks the conversation's own request (same system prompt, tools and prefix, tools disabled) so the summary reads the prompt cache; other routes, a `compaction_model`, sessions with images or native replay history keep the text summarizer (mini-agent-o2nut).
 - `--stream-json-schema claude` partial streams now frame `message_start`/`content_block_start`/`content_block_stop`/`message_delta`/`message_stop` with per-block indexes; turn-budget exhaustion reports `error_max_turns`; results carry `uuid`, `duration_api_ms` and `permission_denials`, and records a `uuid` (mini-agent-5ux7e).
@@ -142,10 +155,38 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Changed
 
+- One delegation rule is embedded in every mode prompt (delegate for unknown and large search spaces or several independent questions; never to double-check your own work) (mini-agent-0a0xz).
+- Behaviour change: a headless `--loop` that spends its iteration cap with the goal unmet (for example `--loop-run` still failing) now exits 24 instead of 0, and its stderr remedy names `--loop-max` and `--goal-resume` instead of TUI slash commands (mini-agent-u0t2v).
 - Built-in wildcard `rm` and `dd` hard denies loosened: only `rm` targeting `/*`, `~/*` or `$HOME/*` and `dd` writing to `/dev/**` stay denied; other wildcard `rm` and `dd` now ask in every mode including yolo, and the old `^rm\s+.*\*` regex no longer over-matches other commands in the script (mini-agent-nvnkx.65)
 
 ### Fixed
 
+- The TUI repaints the idle prompt, spinner and terminal title as soon as a turn ends instead of waiting for a key press (mini-agent-xm2tu).
+- `/undo` + Enter runs the plain conversation undo; `/undo stash` needs an explicit argument (Tab) (mini-agent-zgfwi).
+- The permission prompt's option line wraps at option boundaries, not mid-word (mini-agent-wu1q9).
+- Headless `-p` prompts no longer enter the TUI input history (mini-agent-ukk9a).
+- Built-in prompts no longer tell the model to stop on pre-existing failures: unrelated failures are reported, failures the user asked to fix are the task (mini-agent-t2uqq).
+- Project instruction files (AGENTS.md) are framed as the repository's standing instructions, below system and user messages, instead of untrusted reference data (mini-agent-wwsmh).
+- The "Web Search Rules" prompt section is sent only when a search tool is registered (mini-agent-dlhut).
+- The preamble date is the local date with its UTC offset (mini-agent-0rwwz); the language rule follows the user's messages, not file or tool text (mini-agent-xkv23).
+- An interrupted headless turn is closed in history with a host marker so the next turn does not carry out the cancelled request (mini-agent-l8lb2).
+- The built-in Exa web-search server is registered as `exa` instead of `Exa Web Search`, which the server-name check rejected (web search was missing on a default install); old `mcp_tool:Exa Web Search:` rules and a user server under the old name still apply (mini-agent-n02qh).
+- ACP tool-result text (live and replayed on `session/load`) has terminal control sequences removed, like the TUI (mini-agent-i51kw).
+- ACP `session/load` of a session the connection still holds keeps the permission mode set with `session/set_mode` (mini-agent-w7thh).
+- `job_status` poll/wait without an id uses the only running job; otherwise the error lists the job ids (mini-agent-36576).
+- A child without a persona is no longer told that a specialization above its prompt supplies heuristics (mini-agent-8pvri).
+- macOS default sandbox runs Homebrew tools: `sandbox-toolchain-roots` now also drives read-only Seatbelt grants, defaulting to the immutable Homebrew directories (`/opt/homebrew`, `/usr/local`), `~/.cargo/bin`, `~/.local/bin` and `~/.rustup`; credentials stay unreadable and nothing becomes writable (mini-agent-eb562).
+- macOS sandbox reads `/private/etc/ssl` (curl and LibreSSL no longer abort) and git stops warning about `~/.config/git/ignore` (mini-agent-h8uk3, mini-agent-r0c68).
+- Linux bwrap workspace profile binds a synthetic single-user `/etc/passwd` and `/etc/group` and the host `/etc/os-release`, so `id -un` and distribution detection work (mini-agent-7iqhg).
+- The git tool disables auto-maintenance so commits no longer print `unknown option detach` on older host git, and the missing-identity message no longer claims global config is ignored (mini-agent-l4seb).
+- `build.rs` keeps the Git runtime bootstrap cache under `CARGO_TARGET_DIR`, so a build from a read-only source tree works (mini-agent-q21x4).
+- Headless stream-json emits one `assistant_text` record per text block instead of one per stream flush, shares one `msg_<n>` id across a model response's thinking, text and tool-call records, and `--stream-json-schema claude` fills `message.model`, marks tool-use messages with `stop_reason`, and keeps `usage` records outside content-block frames; text mode separates consecutive assistant messages and stderr reasoning blocks with a newline (mini-agent-55yev, s940q, kttw7).
+- The `Reading piped stdin` notice is printed only when stdin delivers data (mini-agent-7b0m8).
+- Headless permission refusals name the flags that allow the call (`--yolo`, `--allow`, `--allow-prefix`, `--stream-json-control`) instead of slash commands, `--accept-all` is documented as standard mode, and `--read-only` runs no longer offer `write`, `edit` or `notebook_edit` (mini-agent-5495j, j0ea2).
+- `--no-sandbox` tells the model the structured git tool is unavailable and to use git through the shell, and `--help` says so (mini-agent-hrlqc).
+- An interrupted provider stream is charged for the bytes it streamed (at most the request's `max_tokens` bound) instead of the whole bound (mini-agent-4zov7).
+- A run stopped by `--max-agent-turns` or `--max-budget-usd` reports the limit in a `stop_detail` field and in `result` when the model had written no text (mini-agent-qpci0).
+- A stream-json control `updatedInput` that is not a JSON object denies the call and emits an `input_error` instead of running the original call (mini-agent-6wtc2).
 - Windows AppContainer shell: three opt-in, default-off, global-only keys fix the default-start symptoms for people who accept what they expose: `windows-appcontainer-ancestor-listing` (PowerShell starts in the workspace and `cmd dir`/Git resolve it: the container may list the names, sizes and timestamps in each parent of the workspace and the drive root; system-owned parents need an elevated launcher), `windows-appcontainer-null-device` (an elevated launcher lets Git, `>nul` and `DEVNULL` open NUL) and `windows-appcontainer-toolchain-discovery` (read/execute on the install directories of the python, node, ... a command names). Managed policy can force each off; a failure matching the symptom names the key; `--doctor` and `--print-config` show their state (mini-agent-p5g08, mini-agent-bybjh).
 - Windows AppContainer shell: cmd.exe no longer prints "Access is denied." before every command (its UTF-8 prelude redirected to `nul`), PowerShell output is plain text (no ANSI colour sequences in ACP), `--doctor` probes `python` then `py` through the configured shell and reports the failing line, and a failed command naming a program the host resolves says it is outside the read roots without showing host directories (mini-agent-p5g08, mini-agent-bybjh).
 - Windows: sessions started at the same time no longer fail the production preflight with "no successful production preflight" (preflights are serialised across processes and a live session's preflight root is skipped, not recovered), and the startup refusal includes the preflight reason (mini-agent-pc1dr).

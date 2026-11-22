@@ -86,4 +86,6 @@ python3 scripts/native-terminal-hangup118.py --binary /path/to/mini-agent --labe
 The normal control checks multiline bracketed paste and `/quit`; the hangup
 control requires the process to exit and be reaped without forced cleanup.
 
-`/help keys` (also `?` on an empty prompt) lists the effective bindings generated from this table, so rebinding under `[keys]` is reflected; only non-rebindable gestures (mouse, pickers, Esc Esc) are static rows.
+`/help keys` (also `?` on an empty prompt) lists the effective bindings generated from this table, so rebinding under `[keys]` is reflected; only non-rebindable gestures (mouse, pickers, Esc, Esc Esc) are static rows.
+
+While a turn runs, a plain Esc interrupts it unless a picker, prompt, selection, transcript search or the Vim editor owns Esc (Ctrl+C always interrupts); the status line shows the key. Idle, Esc Esc on an empty prompt opens the rewind picker.

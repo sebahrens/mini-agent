@@ -2367,3 +2367,85 @@ async fn nvnkx256_pasted_image_path_attaches_the_image_and_other_pastes_stay_tex
     assert_eq!(app.ui.session.pending_media.len(), 1);
     assert_eq!(app.input.buffer, far.as_str());
 }
+
+/// mini-agent-xm2tu: the end of a turn must repaint the idle prompt on its
+/// own; no key press or title request may be needed to replace the spinner.
+#[tokio::test]
+async fn turn_end_event_repaints_without_further_input() {
+    let root = crate::tests::OwnedTestDirectory::new("turn-end-repaint");
+    let _environment = environment(&root);
+    let cli = crate::cli::Cli {
+        no_session: true,
+        no_tools: true,
+        no_sandbox: true,
+        ..Default::default()
+    };
+    let cfg = fixture_config();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+    let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+    let mut app = fixture_app(fixture_ui(
+        &cli,
+        &cfg,
+        &mut session,
+        &mut context,
+        workspace,
+    ));
+    let pending = PendingMainTurn::capture(app.ui.session, "second prompt");
+    crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+    app.run.is_running = true;
+    app.refresh().unwrap();
+    let before = app.loop_state.frames;
+    app.handle_agent_stream_event(AgentEvent::Done {
+        response: "answer".into(),
+        interactions: Vec::new(),
+    })
+    .await
+    .unwrap();
+    assert!(!app.run.is_running);
+    assert!(
+        app.loop_state.frames > before,
+        "Done must schedule a frame so the spinner and title settle"
+    );
+}
+
+/// mini-agent-z8nnm: Esc stops a running turn, but only when nothing else
+/// owns Esc.
+#[tokio::test]
+async fn esc_interrupts_a_running_turn_unless_something_owns_it() {
+    let root = crate::tests::OwnedTestDirectory::new("esc-interrupt");
+    let _environment = environment(&root);
+    let cli = crate::cli::Cli {
+        no_session: true,
+        no_tools: true,
+        no_sandbox: true,
+        ..Default::default()
+    };
+    let cfg = fixture_config();
+    let workspace = Arc::new(crate::paths::WorkspaceBinding::capture(root.path()).unwrap());
+    let mut context = crate::context::load(true).for_workspace_binding(true, &workspace);
+    let mut session = Session::new("permission-fixture", "test-model", 128_000, "");
+    let mut app = fixture_app(fixture_ui(
+        &cli,
+        &cfg,
+        &mut session,
+        &mut context,
+        workspace,
+    ));
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(!app.esc_interrupts_run(esc), "idle Esc keeps rewind");
+    let pending = PendingMainTurn::capture(app.ui.session, "long prompt");
+    crate::ui::mark_main_turn_started(app.ui.session, &mut app.run, pending);
+    app.run.is_running = true;
+    assert!(app.esc_interrupts_run(esc));
+    assert!(!app.esc_interrupts_run(KeyEvent::new(KeyCode::Esc, KeyModifiers::ALT)));
+    app.renderer.selection_active = true;
+    assert!(!app.esc_interrupts_run(esc), "selection owns Esc");
+    app.renderer.selection_active = false;
+    app.input.set_vim_enabled(true);
+    assert!(!app.esc_interrupts_run(esc), "Vim owns Esc");
+    app.input.set_vim_enabled(false);
+    let flow = app.handle_user_event(UserEvent::Key(esc)).await.unwrap();
+    assert!(flow.is_continue());
+    assert!(!app.run.is_running, "Esc must stop the running turn");
+}

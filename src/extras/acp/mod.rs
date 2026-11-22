@@ -1870,7 +1870,16 @@ async fn serve_tcp_peers(
             accept_timeout: if first { settings.accept_timeout } else { None },
             connected: connected.clone(),
         };
-        let result = connect_agent(state.clone(), transport).await;
+        let busy = refuse_extra_peers(
+            listener
+                .try_clone()
+                .map_err(|e| anyhow::anyhow!("ACP TCP server error: TCP clone: {e}"))?,
+            connected.clone(),
+        );
+        let result = tokio::select! {
+            result = connect_agent(state.clone(), transport) => result,
+            () = busy => unreachable!("the busy responder never finishes"),
+        };
         if state.idle.is_retiring() || !connected.load(Ordering::Acquire) {
             return result.map_err(|e| anyhow::anyhow!("ACP TCP server error: {}", e));
         }
@@ -1884,6 +1893,44 @@ async fn serve_tcp_peers(
         // The old connection's sessions are dormant: they must not keep the
         // idle timer from running out while nobody is connected.
         state.idle.sessions_changed(0);
+    }
+}
+
+/// The line a second TCP peer reads while another peer is attached
+/// (mini-agent-mt2f2). One peer is served at a time; without this the second
+/// connection would wait silently until the first disconnected.
+const BUSY_LINE: &[u8] =
+    b"mini-agent ACP: busy, another client is connected; retry after it disconnects\n";
+
+/// Once a peer has authenticated, answers every further connection with
+/// [`BUSY_LINE`] and closes it, so a second client learns why it is not served.
+/// Runs until dropped. Writes are bounded in time and in number in flight.
+async fn refuse_extra_peers(listener: TcpListener, connected: Arc<std::sync::atomic::AtomicBool>) {
+    use tokio::io::AsyncWriteExt as _;
+    while !connected.load(Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let Ok(mut listener) = accept::tokio_listener(listener) else {
+        return std::future::pending().await;
+    };
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(8));
+    loop {
+        match accept::AcceptSource::accept(&mut listener).await {
+            Ok((mut stream, _)) => {
+                let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        stream.write_all(BUSY_LINE).await?;
+                        stream.shutdown().await
+                    })
+                    .await;
+                });
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+        }
     }
 }
 
@@ -8548,6 +8595,40 @@ pub(super) fn announce_tool_call(
 }
 
 /// A live output preview as content on the call's own id.
+/// The `tool_call_update` fields for a finished call. Tool output is
+/// untrusted, so terminal controls are stripped before it reaches an
+/// editor's terminal-like views (mini-agent-i51kw).
+fn tool_result_fields(
+    output: &str,
+    is_error: bool,
+    diff: Option<ToolCallContent>,
+    shell_workdir: Option<Option<String>>,
+) -> ToolCallUpdateFields {
+    let output = crate::ui::events::sanitize_output(output);
+    let mut content = Vec::new();
+    content.extend(diff);
+    content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
+        output.to_string(),
+    ))));
+    let mut fields = ToolCallUpdateFields::new()
+        .status(ToolCallStatus::Completed)
+        .content(content);
+    if is_error {
+        fields.status = Some(ToolCallStatus::Failed);
+    }
+    // Shell calls run in mini-agent's own sandbox, never in a client
+    // terminal; the result carries what a console view needs.
+    if let Some(workdir) = shell_workdir {
+        fields.raw_output = Some(serde_json::json!({
+            "kind": "shell",
+            "status": if is_error { "failed" } else { "completed" },
+            "workdir": workdir,
+            "output": output.as_str(),
+        }));
+    }
+    fields
+}
+
 fn tool_progress_update(id: &str, text: &str) -> ToolCallUpdate {
     ToolCallUpdate::new(
         ToolCallId::new(id.to_owned()),
@@ -8650,27 +8731,7 @@ impl OpenCalls {
         toolcall::forget_args(&id);
         let diff = self.diffs.remove(&id);
         toolcall::record_result(session_id.0.as_ref(), output, is_error, diff.as_ref());
-        let mut content = Vec::new();
-        content.extend(diff);
-        content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
-            output.to_owned(),
-        ))));
-        let mut fields = ToolCallUpdateFields::new()
-            .status(ToolCallStatus::Completed)
-            .content(content);
-        if is_error {
-            fields.status = Some(ToolCallStatus::Failed);
-        }
-        // Shell calls run in mini-agent's own sandbox, never in a client
-        // terminal; the result carries what a console view needs.
-        if let Some(workdir) = shell {
-            fields.raw_output = Some(serde_json::json!({
-                "kind": "shell",
-                "status": if is_error { "failed" } else { "completed" },
-                "workdir": workdir,
-                "output": output,
-            }));
-        }
+        let fields = tool_result_fields(output, is_error, diff, shell);
         let notif = SessionNotification::new(
             session_id.clone(),
             SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(ToolCallId::new(id), fields)),
@@ -18125,6 +18186,41 @@ brainstorm = "no-such-quick-model"
     }
 
     #[tokio::test]
+    async fn a_second_tcp_peer_reads_a_busy_line_while_the_first_is_attached() {
+        // mini-agent-mt2f2
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let state = persona_state(
+            PERSONA_CONFIG,
+            counting_fixture(Arc::new(AtomicUsize::new(0))),
+        );
+        let listener = TcpListener::bind((DEFAULT_TCP_HOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy = tokio::spawn(refuse_extra_peers(listener, connected.clone()));
+        // Nothing is refused before a peer is attached.
+        connected.store(true, Ordering::Release);
+        let mut second = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::BufReader::new(&mut second).read_line(&mut line),
+        )
+        .await
+        .expect("the second peer is answered")
+        .unwrap();
+        assert!(line.contains("busy"), "{line}");
+        let _ = second.shutdown().await;
+        drop(state);
+        busy.abort();
+    }
+
+    #[tokio::test]
     async fn i7zf8_model_effort_and_cost_slash_commands() {
         let turns = Arc::new(AtomicUsize::new(0));
         let state = persona_state(PERSONA_CONFIG, counting_fixture(turns.clone()));
@@ -20158,5 +20254,29 @@ mod routed_spend_tests {
         assert_eq!(pricing.output_token_cost, 60.0);
         // The startup profile is untouched.
         assert_eq!(startup.prices.input, Some(1.0));
+    }
+}
+
+#[cfg(test)]
+mod tool_result_sanitising_tests {
+    use super::*;
+
+    #[test]
+    fn tool_result_text_and_shell_raw_output_have_terminal_controls_removed() {
+        // mini-agent-i51kw
+        let hostile = "ok\x1b]0;pwned\x07\x1b[31mred\x1b[0m\u{202e}done\r\n";
+        let fields = tool_result_fields(hostile, false, None, Some(Some("/w".to_owned())));
+        let Some(content) = fields.content else {
+            panic!("content");
+        };
+        let ToolCallContent::Content(block) = &content[0] else {
+            panic!("text content");
+        };
+        let ContentBlock::Text(text) = &block.content else {
+            panic!("text block");
+        };
+        assert_eq!(text.text, "okreddone\n");
+        let raw = fields.raw_output.unwrap();
+        assert_eq!(raw["output"], "okreddone\n");
     }
 }
