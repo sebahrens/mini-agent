@@ -8,6 +8,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- On Windows, `/rewind` Restore workspace now works: whole-workspace snapshots use the handle-bound checked primitives, never follow junctions or symbolic links, and refuse the whole restore (nothing changed) when a file is held open by another program or a case-only rename makes the plan ambiguous (mini-agent-rb4w2).
 - `--mcp-server` runs with a progress token send `notifications/progress` at each tool call start and finish and each model turn, not only a heartbeat (mini-agent-1ptzh).
 - A permission denial from a stream-json, MCP elicitation or ACP client now reads "denied by the client"; an unanswered MCP elicitation is refused early enough for the run to save its session before `--mcp-server-timeout`; a second ACP TCP peer reads a "busy" line instead of waiting silently (mini-agent-mt2f2).
 - An interrupted stream's ledger row is flagged `estimated`, and the exit summary names the estimated tokens so its totals match the charged cost; a capped run refuses a request whose prompt alone exceeds the remaining budget before sending it, with exit code 4 (mini-agent-4zov7, mini-agent-qpci0).
