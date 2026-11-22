@@ -791,6 +791,39 @@ pub(crate) fn powershell_workspace_drive_prelude(root: &str) -> String {
     )
 }
 
+/// Statements that wrap `Remove-Item`, `Move-Item`, `Copy-Item` and `Rename-Item` so a relative
+/// `-Path`, `-LiteralPath` or `-Destination` reaches the real cmdlet as a full provider path.
+///
+/// Inside the AppContainer the workspace drive resolves relative paths for most cmdlets, but
+/// these four fall back to the process-wide current directory for a relative path and fail with
+/// "Access to the path 'C:\' is denied" (mini-agent-95p8e). A full path works, so each wrapper
+/// (a proxy command generated from the cmdlet's own metadata, so every parameter, wildcard and
+/// switch keeps its meaning) first joins a relative value onto `(Get-Location).ProviderPath`.
+/// Wildcards are left in the value; `Join-Path` does not expand them. A failure to build a
+/// wrapper is ignored: the cmdlet then behaves as it did before.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn powershell_path_proxy_prelude() -> String {
+    // Rewrites the bound `-Path`, `-LiteralPath` and `-Destination` values in place, keeping each
+    // parameter's own type (`Move-Item -Destination` is a string, `Remove-Item -Path` an array). A
+    // `ws:` value maps onto the drive's root; a rooted or otherwise drive-qualified value is kept.
+    let rewrite = r#"foreach ($__k in 'Path','LiteralPath','Destination') { if ($PSBoundParameters.ContainsKey($__k)) { $__v = $PSBoundParameters[$__k]; $__r = @($__v | ForEach-Object { if ($_ -match '^__WS__:[\\/]*(.*)$') { Join-Path (Get-PSDrive __WS__).Root $Matches[1] } elseif ([System.IO.Path]::IsPathRooted($_) -or $_ -match '^[A-Za-z0-9_]+:') { $_ } else { Join-Path (Get-Location).ProviderPath $_ } }); $PSBoundParameters[$__k] = if ($__v -is [array]) { [string[]]$__r } else { [string]$__r[0] } } }; "#
+        .replace("__WS__", POWERSHELL_WORKSPACE_DRIVE)
+        .replace('\'', "''");
+    let mut prelude = String::from(
+        "try { foreach ($__n in 'Remove-Item','Move-Item','Copy-Item','Rename-Item') { \
+         $__c = Get-Command $__n -CommandType Cmdlet -ErrorAction Stop; \
+         $__m = [System.Management.Automation.CommandMetadata]::new($__c); \
+         $__p = [System.Management.Automation.ProxyCommand]; \
+         $__fix = '",
+    );
+    prelude.push_str(&rewrite);
+    prelude.push_str(
+        "'; $__b = $__p::GetCmdletBindingAttribute($__m) + ' param(' + $__p::GetParamBlock($__m) + ') begin { ' + $__fix + $__p::GetBegin($__m) + ' } process { ' + $__p::GetProcess($__m) + ' } end { ' + $__p::GetEnd($__m) + ' }'; \
+         Set-Item -Path ('function:global:' + $__n) -Value ([scriptblock]::Create($__b)) } } catch {}; ",
+    );
+    prelude
+}
+
 /// Statements binding `git` and `git.exe` to the bundled Git executable at `exe`.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn powershell_git_alias_prelude(exe: &str) -> String {
@@ -2272,6 +2305,36 @@ fn with_runtime_read_roots(configured: &[PathBuf], runtime_files: Vec<PathBuf>) 
         }
     }
     roots
+}
+
+/// A `git.cmd` shim directory under the application `cache` that runs the bundled Git at
+/// `git_exe`. cmd.exe finds programs by listing each `PATH` directory, which the container may
+/// not do for the runtime directory (its files are granted one by one); the cache is a listable
+/// read root, so a directory holding only this shim, placed first on `PATH`, makes `git` resolve
+/// to the bundled Git instead of the host one. The container cannot write the cache.
+#[cfg(any(test, feature = "git-worktree"))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn ensure_cmd_git_shim(cache: &Path, git_exe: &Path) -> Result<PathBuf, String> {
+    let directory = cache.join("shell-shims");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("sandbox: create the cmd Git shim directory: {error}"))?;
+    let exe = git_exe.to_string_lossy();
+    if exe.contains(['"', '%', '\r', '\n', '\0']) {
+        return Err("sandbox: the bundled Git path cannot be written into a cmd shim".into());
+    }
+    let content = format!("@\"{exe}\" %*\r\n");
+    let shim = directory.join("git.cmd");
+    if std::fs::read_to_string(&shim).is_ok_and(|existing| existing == content) {
+        return Ok(directory);
+    }
+    let staging = directory.join(format!("git.cmd.{}.tmp", std::process::id()));
+    std::fs::write(&staging, &content)
+        .and_then(|()| std::fs::rename(&staging, &shim))
+        .map_err(|error| {
+            let _ = std::fs::remove_file(&staging);
+            format!("sandbox: write the cmd Git shim: {error}")
+        })?;
+    Ok(directory)
 }
 
 /// The workspace Git metadata binds for a bubblewrap launch rooted at the
@@ -5171,14 +5234,24 @@ impl Sandbox {
                 read_roots = with_runtime_read_roots(&read_roots, runtime_file_roots(&runtime));
                 shell_env.retain(|(name, _)| !name.eq_ignore_ascii_case("PATH"));
                 let host_path = std::env::var_os("PATH").unwrap_or_default();
+                let git_exe = windows::child_process_path(&runtime.join("git.exe"));
+                // cmd.exe cannot list the runtime directory, so it would fall through to the
+                // host Git; a shim directory in the listable cache comes first for it.
+                let shim_directory = (self.shell_capability().map(ShellCapability::dialect)
+                    == Some(ShellDialect::Cmd))
+                .then(|| ensure_cmd_git_shim(&cache_dir, &git_exe))
+                .transpose()?
+                .map(|directory| windows::child_process_path(&directory));
                 let joined = std::env::join_paths(
-                    std::iter::once(windows::child_process_path(&runtime))
+                    shim_directory
+                        .into_iter()
+                        .chain(std::iter::once(windows::child_process_path(&runtime)))
                         .chain(std::env::split_paths(&host_path)),
                 );
                 if let Ok(joined) = joined {
                     shell_env.push(("PATH".to_string(), joined.to_string_lossy().into_owned()));
                 }
-                git_alias = Some(windows::child_process_path(&runtime.join("git.exe")));
+                git_alias = Some(git_exe);
             }
             let drive_script;
             let script = if self.uses_powershell_workspace_drive() {
@@ -5191,6 +5264,7 @@ impl Sandbox {
                 if let Some(exe) = &git_alias {
                     prelude.push_str(&powershell_git_alias_prelude(&exe.to_string_lossy()));
                 }
+                prelude.push_str(&powershell_path_proxy_prelude());
                 drive_script = format!("{prelude}{command}");
                 drive_script.as_str()
             } else {
@@ -5834,7 +5908,7 @@ impl Sandbox {
             let read_roots = self.git_service_read_roots(program);
             // The container's environment is otherwise fixed: carry the runner's
             // policy variables, the commit identity and the stdin file name.
-            let extra_env = _env
+            let mut extra_env = _env
                 .iter()
                 .map(|(name, value)| {
                     (
@@ -5843,6 +5917,20 @@ impl Sandbox {
                     )
                 })
                 .collect::<Vec<_>>();
+            // Git starts its own sub-commands (`git stash`, `git cherry-pick`, a local-path
+            // `git fetch`) by name through `PATH`. As in the shell, the runtime directory comes
+            // first so they resolve to the bundled, granted `git.exe` and never to a host Git
+            // the container cannot read.
+            if let Some(runtime) = program.parent() {
+                let host_path = std::env::var_os("PATH").unwrap_or_default();
+                if let Ok(joined) = std::env::join_paths(
+                    std::iter::once(windows::child_process_path(runtime))
+                        .chain(std::env::split_paths(&host_path)),
+                ) {
+                    extra_env.retain(|(name, _)| !name.eq_ignore_ascii_case("PATH"));
+                    extra_env.push(("PATH".to_string(), joined.to_string_lossy().into_owned()));
+                }
+            }
             return windows::build_git_direct_helper(
                 program,
                 args,
@@ -12196,6 +12284,32 @@ mod sandbox_tests {
     }
 
     #[test]
+    fn the_cmd_git_shim_runs_the_bundled_git_and_is_rewritten_only_on_change() {
+        let scratch = TempDir::new("cmd-git-shim");
+        let cache = scratch.path().to_path_buf();
+        let exe = Path::new(r"C:\runtime\git.exe");
+        let directory = ensure_cmd_git_shim(&cache, exe).unwrap();
+        assert_eq!(directory, cache.join("shell-shims"));
+        let shim = directory.join("git.cmd");
+        assert_eq!(
+            std::fs::read_to_string(&shim).unwrap(),
+            "@\"C:\\runtime\\git.exe\" %*\r\n"
+        );
+        // Unchanged content is left alone; changed content replaces it; no staging file stays.
+        assert_eq!(ensure_cmd_git_shim(&cache, exe).unwrap(), directory);
+        ensure_cmd_git_shim(&cache, Path::new(r"C:\other\git.exe")).unwrap();
+        assert!(
+            std::fs::read_to_string(&shim)
+                .unwrap()
+                .contains(r"C:\other\git.exe")
+        );
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        // A path that could break out of the quoted command is refused.
+        assert!(ensure_cmd_git_shim(&cache, Path::new("C:\\x\"&calc\\git.exe")).is_err());
+        assert!(ensure_cmd_git_shim(&cache, Path::new("C:\\%PATH%\\git.exe")).is_err());
+    }
+
+    #[test]
     fn git_service_read_roots_grant_each_runtime_file_once() {
         let scratch = TempDir::new("runtime-roots");
         let root = scratch.path().to_path_buf();
@@ -13014,6 +13128,37 @@ echo COMMITTED"#;
         );
         assert!(alias.contains("-Name git.exe -Value"), "{alias}");
         assert!(alias.ends_with("catch {}; "), "{alias}");
+    }
+
+    #[test]
+    fn powershell_path_proxies_wrap_the_four_cmdlets_and_never_fail_the_command() {
+        let prelude = powershell_path_proxy_prelude();
+        for cmdlet in ["Remove-Item", "Move-Item", "Copy-Item", "Rename-Item"] {
+            assert!(prelude.contains(&format!("'{cmdlet}'")), "{prelude}");
+        }
+        for parameter in ["'Path'", "'LiteralPath'", "'Destination'"] {
+            assert!(prelude.contains(parameter), "{prelude}");
+        }
+        assert!(
+            prelude.contains("Join-Path (Get-Location).ProviderPath"),
+            "{prelude}"
+        );
+        assert!(prelude.ends_with("catch {}; "), "{prelude}");
+        // Braces and parentheses balance outside the single-quoted PowerShell strings.
+        let mut depth = (0i32, 0i32);
+        let mut quoted = false;
+        for c in prelude.chars() {
+            match c {
+                '\'' => quoted = !quoted,
+                '{' if !quoted => depth.0 += 1,
+                '}' if !quoted => depth.0 -= 1,
+                '(' if !quoted => depth.1 += 1,
+                ')' if !quoted => depth.1 -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(depth, (0, 0), "{prelude}");
+        assert!(!quoted, "{prelude}");
     }
 
     #[test]

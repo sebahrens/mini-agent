@@ -207,6 +207,36 @@ pub(crate) fn appcontainer_extras_line(sandbox: &crate::sandbox::Sandbox) -> Str
     line
 }
 
+/// The one-step recipe that makes the host interpreter runnable in the container: the exact
+/// directory the opt-in `windows-appcontainer-toolchain-discovery` grant would add for the first
+/// of `python`, `python3` that `path` resolves, as a `windows-appcontainer-read-roots` entry.
+/// `None` when no interpreter resolves or the directory cannot be written as a TOML literal.
+pub(crate) fn interpreter_grant_recipe(
+    path: &std::ffi::OsStr,
+    extensions: &[String],
+) -> Option<String> {
+    let found = ["python", "python3"].iter().find_map(|name| {
+        crate::sandbox::windows_toolchains::resolve_on_path(name, path, extensions)
+    })?;
+    let directory = crate::sandbox::windows_toolchains::proposed_directory(&found)?;
+    let directory = crate::sandbox::strip_verbatim_prefix(&directory.to_string_lossy());
+    if directory.contains(['\'', '"', '\n']) {
+        return None;
+    }
+    Some(format!(
+        "set `windows-appcontainer-read-roots = ['{directory}']` (global config, restart required) or `windows-appcontainer-toolchain-discovery = true`"
+    ))
+}
+
+fn host_path_extensions() -> Vec<String> {
+    std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|extension| extension.starts_with('.'))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Command names the sandboxed Python probe tries, in order. Windows has no
 /// `python3`: the interpreter is `python`, or the `py` launcher.
 pub(crate) fn python_probe_names() -> &'static [&'static str] {
@@ -374,10 +404,24 @@ pub(crate) async fn run_all(
             "sandboxed git",
             tool_in_sandbox(&sandbox, "git").await,
         ));
-        checks.push(Check::of(
-            python_check_name(),
-            first_tool_in_sandbox(&sandbox, python_probe_names()).await,
-        ));
+        let python = first_tool_in_sandbox(&sandbox, python_probe_names()).await;
+        let python_failed = matches!(python, Outcome::Warn(_));
+        checks.push(Check::of(python_check_name(), python));
+        if python_failed
+            && backend == "appcontainer"
+            && !sandbox.windows_toolchain_discovery()
+            && let Some(recipe) = interpreter_grant_recipe(
+                &std::env::var_os("PATH").unwrap_or_default(),
+                &host_path_extensions(),
+            )
+        {
+            checks.push(Check::of(
+                "python grant",
+                Outcome::Warn(format!(
+                    "python is not runnable by default (decision: no automatic grant); {recipe}"
+                )),
+            ));
+        }
     }
     #[cfg(feature = "js")]
     if cli.tool_is_eligible(cfg, "js") {
@@ -432,6 +476,32 @@ impl Check {
 mod tests {
     use super::*;
     use crate::auth::LoginRecordState as S;
+
+    #[test]
+    fn the_interpreter_recipe_names_the_directory_the_opt_in_grant_would_add() {
+        let scratch = crate::tests::OwnedTestDirectory::new("interpreter-recipe");
+        let install = scratch.path().join("Python312");
+        std::fs::create_dir(&install).unwrap();
+        std::fs::write(install.join("python.exe"), b"x").unwrap();
+        let path = std::env::join_paths([&install]).unwrap();
+        let recipe = interpreter_grant_recipe(&path, &[".exe".to_string()]).unwrap();
+        assert!(
+            recipe.contains(&format!(
+                "windows-appcontainer-read-roots = ['{}']",
+                crate::sandbox::strip_verbatim_prefix(&install.to_string_lossy())
+            )),
+            "{recipe}"
+        );
+        assert!(
+            recipe.contains("windows-appcontainer-toolchain-discovery = true"),
+            "{recipe}"
+        );
+        let empty = std::env::join_paths([scratch.path()]).unwrap();
+        assert_eq!(
+            interpreter_grant_recipe(&empty, &[".exe".to_string()]),
+            None
+        );
+    }
 
     #[test]
     fn the_sandboxed_python_probe_uses_the_names_of_the_host_platform() {

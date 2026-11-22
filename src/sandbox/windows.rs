@@ -9951,6 +9951,59 @@ mod tests {
         std::fs::remove_dir_all(parent).expect("remove junction preflight fixture");
     }
 
+    /// mini-agent-yamfe: a read grant is propagated by the system over the tree below the root
+    /// (`SetSecurityInfo`). A junction inside the root points outside it; the grant (and its
+    /// revoke) must stop at the link and leave the target's DACL untouched.
+    #[test]
+    fn a_propagated_read_grant_does_not_follow_a_junction_out_of_the_root() {
+        let parent = std::env::temp_dir().join(format!("mini-agent-jct-{}", uuid::Uuid::new_v4()));
+        let root = parent.join("root");
+        let outside = parent.join("outside");
+        std::fs::create_dir_all(root.join("inner")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(root.join("inner").join("own.txt"), b"in").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"out").unwrap();
+        let junction = root.join("inner").join("link");
+        let status = Command::new("cmd")
+            .args([
+                "/C",
+                "mklink",
+                "/J",
+                junction.to_str().expect("junction path is UTF-8"),
+                outside.to_str().expect("junction target is UTF-8"),
+            ])
+            .status_guarded()
+            .expect("create junction");
+        assert!(status.success(), "fixture must create a real junction");
+        let sid = sid_from_string("S-1-5-21-111-222-333-7777").unwrap();
+        let file = open_stable_path(
+            &root,
+            true,
+            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        .unwrap();
+        update_access_ace(&file, true, sid.0, GRANT_ACCESS, FILE_GENERIC_READ).unwrap();
+        // The grant reached the tree...
+        let (own, _) = exact_sid_rights(&root.join("inner").join("own.txt"), sid.0).unwrap();
+        assert_eq!(own & FILE_GENERIC_READ, FILE_GENERIC_READ);
+        // ...and did not cross the junction into the target.
+        assert_eq!(
+            exact_sid_rights(&outside.join("secret.txt"), sid.0).unwrap(),
+            (0, 0),
+            "propagation followed a junction out of the read root"
+        );
+        assert_eq!(exact_sid_rights(&outside, sid.0).unwrap(), (0, 0));
+        update_access_ace(&file, true, sid.0, REVOKE_ACCESS, 0).unwrap();
+        assert_eq!(
+            exact_sid_rights(&root.join("inner").join("own.txt"), sid.0).unwrap(),
+            (0, 0)
+        );
+        drop(file);
+        std::fs::remove_dir(&junction).expect("remove junction only");
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
     #[test]
     fn active_preflight_owner_is_rejected_without_mutation() {
         let (parent, mut root) = new_preflight_recovery_fixture();

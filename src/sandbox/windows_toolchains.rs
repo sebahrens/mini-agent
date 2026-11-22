@@ -207,7 +207,7 @@ fn looks_like_install(prefix: &Path) -> bool {
 /// [looks like an install](looks_like_install); otherwise only the `bin`/`Scripts` directory is
 /// proposed. A `bin` under a dot-directory (`.cargo\bin`, `.local\bin`) stays as it is:
 /// dot-directories also hold configuration and credentials.
-fn proposed_directory(executable: &Path) -> Option<PathBuf> {
+pub(crate) fn proposed_directory(executable: &Path) -> Option<PathBuf> {
     let directory = executable.parent()?;
     let prefix = directory.parent().map(Path::to_path_buf);
     let promote = match lowered_name(directory).as_deref() {

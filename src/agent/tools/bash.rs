@@ -432,14 +432,23 @@ impl Tool for ShellTool {
                 );
                 if self.sandbox.uses_powershell_workspace_drive() {
                     description.push_str(&format!(
-                        " The command starts in the PowerShell drive {}:\\ (the workspace root); Get-Location prints that drive, relative paths work (except that Remove-Item and Move-Item need the item piped, `Get-Item name | Remove-Item`, or its full path), and native programs get the real directory.",
+                        " The command starts in the PowerShell drive {}:\\ (the workspace root); Get-Location prints that drive, relative paths work, and native programs get the real directory.",
                         crate::sandbox::POWERSHELL_WORKSPACE_DRIVE
                     ));
                 }
             }
-            Some(crate::sandbox::ShellDialect::Cmd) => description.push_str(
-                " cmd.exe syntax: chain with '&' or '&&', redirect to NUL, and use %VAR% for environment variables.",
-            ),
+            Some(crate::sandbox::ShellDialect::Cmd) => {
+                description.push_str(
+                    " cmd.exe syntax: chain with '&' or '&&', redirect to NUL, and use %VAR% for environment variables.",
+                );
+                if self.sandbox.backend_name() == "appcontainer"
+                    && self.sandbox.containment_requested()
+                {
+                    description.push_str(
+                        " Under the default Windows sandbox `dir`, `del` and redirection to NUL are refused: list with `for %f in (*) do @echo %f`, or use PowerShell.",
+                    );
+                }
+            }
             _ => {}
         }
         if let Some(alias) = self.sandbox.shell_cwd_alias() {
@@ -2510,8 +2519,12 @@ pub(crate) fn sandbox_failure_note(
         && WINDOWS_CWD_MARKERS
             .iter()
             .any(|marker| lowered.contains(marker));
+    let local_remote_failure = sandbox.backend_name() == "appcontainer"
+        && lowered.contains("does not appear to be a git repository")
+        && lowered.contains("could not read from remote repository");
     if !network_failure
         && !cwd_failure
+        && !local_remote_failure
         && toolchain_hint.is_none()
         && !SANDBOX_FAILURE_MARKERS
             .iter()
@@ -2571,7 +2584,7 @@ pub(crate) fn sandbox_failure_note(
         && lowered.contains("access is denied")
     {
         note.push_str(
-            " In cmd.exe `dir` cannot enumerate directories here; `for %f in (*) do @echo %f` (files) and `for /d %d in (*) do @echo %d` (directories) work, as does PowerShell Get-ChildItem.",
+            " In cmd.exe `dir`, `del` and `>NUL` are refused in the default sandbox (a platform limit of these built-ins; the opt-in keys named in this note lift it); `for %f in (*) do @echo %f` (files) and `for /d %d in (*) do @echo %d` (directories) work, as does PowerShell Get-ChildItem.",
         );
     }
     if sandbox.uses_powershell_workspace_drive()
@@ -2579,6 +2592,11 @@ pub(crate) fn sandbox_failure_note(
     {
         note.push_str(
             " PowerShell Remove-Item and Move-Item cannot resolve a relative path here; pipe the item (`Get-Item name | Remove-Item`) or pass its full path (`Join-Path (Get-Location).ProviderPath name`).",
+        );
+    }
+    if local_remote_failure {
+        note.push_str(
+            " A local-path remote can only be fetched from, or pushed to, when its directory is inside the workspace or a configured root: add it to `windows-appcontainer-read-roots` (fetch, ls-remote) or `windows-appcontainer-write-roots` (push) in the global config (restart required), or clone it into the workspace.",
         );
     }
     if let Some(hint) = &toolchain_hint {
@@ -2716,17 +2734,38 @@ fn host_path_extensions() -> Vec<String> {
         .collect()
 }
 
-/// What to tell the user to change so a host-resolvable program becomes runnable.
-fn toolchain_advice(sandbox: &Sandbox) -> Option<String> {
+/// What to tell the user to change so a host-resolvable program becomes runnable. `directories`
+/// are the install directories that the opt-in toolchain grant would add for the unrunnable
+/// programs (resolved from the host `PATH`, never from sandboxed output).
+fn toolchain_advice(sandbox: &Sandbox, directories: &[String]) -> Option<String> {
     match sandbox.backend_name() {
-        "appcontainer" if !sandbox.windows_toolchain_discovery() => Some(
-            "Setting `windows-appcontainer-toolchain-discovery = true` (global config; read and execute only, and an administrator-owned install also needs an elevated launcher) or adding its install directory to `windows-appcontainer-read-roots` makes it runnable (restart required)."
-                .to_string(),
-        ),
-        "appcontainer" => Some(
-            "Add its install directory to `windows-appcontainer-read-roots` (restart required; an administrator-owned install also needs an elevated launcher)."
-                .to_string(),
-        ),
+        "appcontainer" => {
+            let usable: Vec<&String> = directories
+                .iter()
+                .filter(|directory| !directory.contains(['\'', '"', '\n']))
+                .collect();
+            let recipe = if usable.is_empty() {
+                "add its install directory to `windows-appcontainer-read-roots`".to_string()
+            } else {
+                let listed = usable
+                    .iter()
+                    .map(|directory| format!("'{directory}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "add the directory to the global config, for example `windows-appcontainer-read-roots = [{listed}]`"
+                )
+            };
+            if sandbox.windows_toolchain_discovery() {
+                Some(format!(
+                    "`windows-appcontainer-toolchain-discovery` is on but did not grant it; {recipe} (restart required; an administrator-owned install also needs an elevated launcher)."
+                ))
+            } else {
+                Some(format!(
+                    "One step: {recipe} (read and execute only; restart required; an administrator-owned install also needs an elevated launcher). Setting `windows-appcontainer-toolchain-discovery = true` grants such directories automatically for commands that name them."
+                ))
+            }
+        }
         "bwrap" => Some(
             "Add its install directory to `sandbox-toolchain-roots` (restart required)."
                 .to_string(),
@@ -2752,35 +2791,75 @@ fn off_executor<T>(work: impl FnOnce() -> T) -> T {
 /// roots and which setting changes that. Only the program's name and the setting are shown (never
 /// a host directory), and the only paths touched are the host `PATH` directories.
 fn host_command_unrunnable_hint(sandbox: &Sandbox, output: &str) -> Option<String> {
-    let advice = toolchain_advice(sandbox)?;
+    toolchain_advice(sandbox, &[])?;
     let path_var = std::env::var_os("PATH")?;
     let path_directories: Vec<String> = std::env::split_paths(&path_var)
         .map(|directory| directory.to_string_lossy().into_owned())
         .collect();
     let missing = missing_commands(output, &path_directories);
     if missing.is_empty() {
-        return None;
+        return launcher_started_unreadable_program_hint(sandbox, output);
     }
     let extensions = host_path_extensions();
-    let located: Vec<String> = off_executor(|| {
+    let located: Vec<(String, Option<String>)> = off_executor(|| {
         missing
             .into_iter()
-            .filter(|name| {
-                crate::sandbox::windows_toolchains::resolve_on_path(name, &path_var, &extensions)
-                    .is_some()
+            .filter_map(|name| {
+                let found = crate::sandbox::windows_toolchains::resolve_on_path(
+                    &name,
+                    &path_var,
+                    &extensions,
+                )?;
+                let directory = crate::sandbox::windows_toolchains::proposed_directory(&found)
+                    .map(|directory| directory.to_string_lossy().into_owned());
+                Some((name, directory))
             })
             .collect()
     });
     if located.is_empty() {
-        return None;
+        return launcher_started_unreadable_program_hint(sandbox, output);
     }
     let listed = located
         .iter()
-        .map(|name| format!("`{name}`"))
+        .map(|(name, _)| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(", ");
+    let mut directories: Vec<String> = Vec::new();
+    for directory in located
+        .iter()
+        .filter_map(|(_, directory)| directory.as_ref())
+    {
+        let directory = crate::sandbox::strip_verbatim_prefix(directory);
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    let advice = toolchain_advice(sandbox, &directories)?;
     Some(format!(
         "The program(s) {listed} exist on the host but the sandbox cannot run them: they are outside the sandbox's read roots. {advice}"
+    ))
+}
+
+/// A launcher (the Windows `py` launcher is the usual one) runs, but the program it starts
+/// (`Unable to create process using '<path>'`) is outside the read roots and is not on the host
+/// `PATH`, so it cannot be named from `PATH`. The path is already in the message above; only
+/// the key and the shape of the entry are given here, never a path taken from the output.
+fn launcher_started_unreadable_program_hint(sandbox: &Sandbox, output: &str) -> Option<String> {
+    if sandbox.backend_name() != "appcontainer"
+        || !output
+            .to_ascii_lowercase()
+            .contains("unable to create process using")
+    {
+        return None;
+    }
+    Some(format!(
+        "A launcher started a program that the sandbox cannot read (the path in the message above). {} Add that program's install directory, for example `windows-appcontainer-read-roots = ['C:\\Python312']`, to the global config (restart required; an administrator-owned install also needs an elevated launcher).{}",
+        "This is the default by decision.",
+        if sandbox.windows_toolchain_discovery() {
+            ""
+        } else {
+            " Setting `windows-appcontainer-toolchain-discovery = true` grants the directories of programs found on `PATH` automatically."
+        }
     ))
 }
 
@@ -4189,20 +4268,84 @@ mod tests {
         assert!(nul.contains("only an elevated launcher"), "{nul}");
     }
 
+    #[test]
+    fn a_launcher_that_starts_an_unreadable_program_gets_the_read_root_recipe() {
+        let sandbox = Sandbox::new(true, "appcontainer");
+        let output = "Unable to create process using 'C:\\hosted\\Python\\3.15.2\\x64\\python.exe --version': Access is denied.";
+        let note = sandbox_failure_note(&sandbox, false, true, output).unwrap();
+        assert!(
+            note.contains("windows-appcontainer-read-roots = ['"),
+            "{note}"
+        );
+        assert!(
+            note.contains("windows-appcontainer-toolchain-discovery = true"),
+            "{note}"
+        );
+        // The path from the output is never repeated by the note.
+        assert!(!note.contains("3.15.2"), "{note}");
+        assert_eq!(
+            sandbox_failure_note(&Sandbox::new(true, "bwrap"), false, true, output),
+            None
+        );
+    }
+
+    #[test]
+    fn a_local_remote_outside_the_granted_roots_gets_the_root_note() {
+        let sandbox = Sandbox::new(true, "appcontainer");
+        let output = "fatal: 'C:/elsewhere/r.git' does not appear to be a git repository\nfatal: Could not read from remote repository.";
+        let note = sandbox_failure_note(&sandbox, false, true, output).unwrap();
+        assert!(note.contains("windows-appcontainer-read-roots"), "{note}");
+        assert!(note.contains("windows-appcontainer-write-roots"), "{note}");
+        // A plain access failure of a real remote (no such text) does not get it.
+        assert_eq!(
+            sandbox_failure_note(
+                &sandbox,
+                false,
+                true,
+                "fatal: Authentication failed for 'x'\nfatal: Could not read from remote repository."
+            ),
+            None
+        );
+        assert_eq!(
+            sandbox_failure_note(&Sandbox::new(true, "bwrap"), false, true, output),
+            None
+        );
+    }
+
     #[cfg(unix)]
     #[test]
-    fn the_toolchain_hint_names_discovery_when_it_is_off_and_read_roots_when_it_is_on() {
+    fn the_toolchain_hint_gives_a_one_step_read_root_recipe_with_the_resolved_directory() {
         let off = Sandbox::new(true, "appcontainer");
         let note = sandbox_failure_note(&off, false, true, "bash: sh: command not found").unwrap();
         assert!(
-            note.contains("windows-appcontainer-toolchain-discovery"),
+            note.contains("windows-appcontainer-toolchain-discovery = true"),
             "{note}"
         );
-        assert!(note.contains("windows-appcontainer-read-roots"), "{note}");
+        assert!(
+            note.contains("windows-appcontainer-read-roots = ['"),
+            "{note}"
+        );
+        assert!(note.contains("One step:"), "{note}");
+        // The directory named is the one the opt-in grant would add: the resolved program's own.
+        let found = crate::sandbox::windows_toolchains::resolve_on_path(
+            "sh",
+            &std::env::var_os("PATH").unwrap(),
+            &[],
+        )
+        .unwrap();
+        let proposed = crate::sandbox::windows_toolchains::proposed_directory(&found).unwrap();
+        assert!(
+            note.contains(&format!("'{}'", proposed.display())),
+            "{note}"
+        );
         let on = Sandbox::new(true, "appcontainer").with_windows_toolchain_discovery(true);
         let note = sandbox_failure_note(&on, false, true, "bash: sh: command not found").unwrap();
-        assert!(!note.contains("toolchain-discovery"), "{note}");
-        assert!(note.contains("windows-appcontainer-read-roots"), "{note}");
+        assert!(note.contains("is on but did not grant it"), "{note}");
+        assert!(!note.contains("= true"), "{note}");
+        assert!(
+            note.contains("windows-appcontainer-read-roots = ['"),
+            "{note}"
+        );
     }
 
     #[cfg(unix)]
