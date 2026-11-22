@@ -58,6 +58,19 @@ pub(crate) fn retained_stale_grants() -> usize {
     }
 }
 
+/// Whether this launcher runs elevated (Windows; the doctor reports it because elevation decides
+/// which of the opt-in grants can take effect). Always false elsewhere.
+pub(crate) fn launcher_is_elevated() -> bool {
+    #[cfg(windows)]
+    {
+        windows::process_is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// PATH commands whose directory was not granted, with the reason (doctor).
 pub(crate) fn skipped_toolchain_report() -> Vec<String> {
     #[cfg(windows)]
@@ -2156,6 +2169,19 @@ fn runtime_file_roots(directory: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// The registered guarded Git runtime directory (the one holding the bundled `git.exe`) when
+/// the shell `command` text names git; `None` otherwise or when no runtime is registered.
+#[cfg(all(target_os = "windows", feature = "git-worktree"))]
+fn bundled_git_dir_for_shell(command: &str) -> Option<PathBuf> {
+    if !command.to_ascii_lowercase().contains("git") {
+        return None;
+    }
+    crate::git::runtime::protected_runtime_paths()
+        .ok()?
+        .into_iter()
+        .find(|path| path.is_dir() && path.join("git.exe").is_file())
+}
+
 /// `configured` with each runtime file appended once.
 #[cfg(any(test, feature = "git-worktree"))]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -3928,9 +3954,12 @@ impl Sandbox {
                     "an AppContainer root exposes a sandbox-home-masks path (or a mask is invalid); AppContainer cannot hide a path inside a granted root",
                 );
             }
-            return Some(
-                "selected filesystem profile is unavailable on this backend; Windows uses explicit AppContainer root keys",
-            );
+            if self.backend == "appcontainer" {
+                return Some(
+                    "the Windows AppContainer backend has no host-read or host-full profile (it reads only the workspace, the cache and what ALL APPLICATION PACKAGES already reads); use the workspace profile with windows-appcontainer-read-roots / windows-appcontainer-write-roots, or --no-sandbox to run unsandboxed",
+                );
+            }
+            return Some("selected filesystem profile is unavailable on this backend");
         }
         match self.backend.as_str() {
             "bwrap" => bwrap_unavailable_diagnostic(),
@@ -4352,7 +4381,16 @@ impl Sandbox {
                         &cache_dir,
                         &self.windows_appcontainer_read_roots,
                         &self.windows_appcontainer_write_roots,
-                    )?;
+                    )
+                    .map_err(|error| {
+                        if capability.dialect() == ShellDialect::Posix {
+                            format!(
+                                "{error}; a POSIX shell (Git Bash, MSYS) cannot initialise inside the Windows AppContainer (its runtime needs named kernel objects the container may not create): use --shell pwsh or --shell cmd with the sandbox, or --no-sandbox to run bash unsandboxed"
+                            )
+                        } else {
+                            error
+                        }
+                    })?;
                 }
                 Ok(())
             }
@@ -4962,6 +5000,26 @@ impl Sandbox {
         #[cfg(target_os = "windows")]
         if self.backend == "appcontainer" {
             let cache_dir = self.get_cached_cache_dir()?;
+            #[cfg_attr(not(feature = "git-worktree"), allow(unused_mut))]
+            let mut read_roots = self.windows_appcontainer_read_roots.clone();
+            #[cfg_attr(not(feature = "git-worktree"), allow(unused_mut))]
+            let mut shell_env = self.shell_env_extra();
+            #[cfg(feature = "git-worktree")]
+            if let Some(runtime) = bundled_git_dir_for_shell(command) {
+                // The host Git cannot open /dev/null inside the container; the bundled Git falls
+                // back to a private temporary file. Only the runtime's own files are granted
+                // (read/execute), and only for commands that name git.
+                read_roots = with_runtime_read_roots(&read_roots, runtime_file_roots(&runtime));
+                shell_env.retain(|(name, _)| !name.eq_ignore_ascii_case("PATH"));
+                let host_path = std::env::var_os("PATH").unwrap_or_default();
+                let joined = std::env::join_paths(
+                    std::iter::once(windows::child_process_path(&runtime))
+                        .chain(std::env::split_paths(&host_path)),
+                );
+                if let Ok(joined) = joined {
+                    shell_env.push(("PATH".to_string(), joined.to_string_lossy().into_owned()));
+                }
+            }
             return windows::build_shell_helper(
                 &self.shell,
                 &self.shell_prefix_args,
@@ -4969,10 +5027,10 @@ impl Sandbox {
                 command,
                 &cwd,
                 &cache_dir,
-                &self.windows_appcontainer_read_roots,
+                &read_roots,
                 &self.windows_appcontainer_write_roots,
                 self.pty_launch.as_ref(),
-                &self.shell_env_extra(),
+                &shell_env,
                 Some(windows::ShellLaunchOptions {
                     toolchain_discovery: self.windows_toolchain_discovery,
                     ancestor_listing: self.windows_ancestor_listing,
@@ -9593,6 +9651,25 @@ mod sandbox_tests {
             "{diagnostic}"
         );
         assert!(error.contains("unknown sandbox backend"), "{error}");
+    }
+
+    #[test]
+    fn appcontainer_host_profiles_are_refused_with_a_precise_remedy() {
+        for profile in [SandboxProfile::HostRead, SandboxProfile::HostFull] {
+            let sandbox = Sandbox::new(true, "appcontainer").with_general_profile(
+                profile,
+                Vec::new(),
+                Vec::new(),
+            );
+            assert_eq!(sandbox.policy(), SandboxPolicy::RequiredButUnavailable);
+            let diagnostic = sandbox.unavailable_diagnostic().unwrap();
+            assert!(
+                diagnostic.contains("no host-read or host-full profile")
+                    && diagnostic.contains("windows-appcontainer-read-roots")
+                    && diagnostic.contains("--no-sandbox"),
+                "{diagnostic}"
+            );
+        }
     }
 
     #[test]

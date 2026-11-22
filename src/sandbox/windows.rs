@@ -4089,7 +4089,7 @@ fn read_root_dacl_is_changeable(root: &Path) -> bool {
 /// Whether this process runs with an elevated (full administrator) token. The NUL device ACE is
 /// attempted only then: that DACL is machine-global, and an unelevated process is expected to be
 /// refused by the kernel anyway, so the check keeps the attempt (and its journal entry) explicit.
-fn process_is_elevated() -> bool {
+pub(crate) fn process_is_elevated() -> bool {
     let Ok(token) = primary_token() else {
         return false;
     };
@@ -5879,7 +5879,13 @@ fn sweep_stale_profile_journal(
         // untracked grant. Consequently they may contain roots the helper had not reached. Avoid
         // a no-op WRITE_DAC transaction on those paths; enterprise endpoint controls can make a
         // directory-tree DACL rewrite exceed the complete recovery ceiling.
-        if stale_effective == 0 {
+        // The exception is an inheritable root whose own ACE is already gone: a helper killed
+        // during the propagating revoke removes the root ACE first, and the inherited ACEs below
+        // it are then the only remaining grant. A bounded read-only scan finds them; a tree that
+        // cannot be scanned within the bound is treated as untouched.
+        if stale_effective == 0
+            && (kind == RootKind::Ancestor || !tree_carries_explicit_sid(&root, sid.0))
+        {
             continue;
         }
         if kind == RootKind::Ancestor {
@@ -7402,6 +7408,34 @@ fn attest_tree_has_no_explicit_sid(root: &Path, sid: PSID) -> Result<(), String>
     Ok(())
 }
 
+/// Whether any object at or below `root` carries an ACE naming `sid`. Read-only and bounded:
+/// links are never followed, and an error or an exceeded bound answers `false`.
+fn tree_carries_explicit_sid(root: &Path, sid: PSID) -> bool {
+    let mut pending = vec![root.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(path) = pending.pop() {
+        seen += 1;
+        if seen > MAX_CLEANUP_ATTESTATION_ENTRIES {
+            return false;
+        }
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            continue;
+        }
+        if access_path_has_explicit_sid(&path, sid).unwrap_or(false) {
+            return true;
+        }
+        if metadata.is_dir()
+            && let Ok(entries) = std::fs::read_dir(&path)
+        {
+            pending.extend(entries.flatten().map(|entry| entry.path()));
+        }
+    }
+    false
+}
+
 fn access_path_has_explicit_sid(path: &Path, sid: PSID) -> Result<bool, String> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| format!("inspect cleanup-attestation path: {error}"))?;
@@ -8185,6 +8219,295 @@ mod tests {
         change_null_device_ace(&file, sid.0, false).unwrap();
         // Revoking again finds nothing to remove and still succeeds.
         change_null_device_ace(&file, sid.0, false).unwrap();
+    }
+
+    struct DerivedSid(PSID);
+
+    impl Drop for DerivedSid {
+        fn drop(&mut self) {
+            unsafe { FreeSid(self.0) };
+        }
+    }
+
+    /// The SID an AppContainer profile name derives to; no profile needs to exist.
+    fn derive_profile_sid(name: &str) -> DerivedSid {
+        let wide = wide_string(name);
+        let mut sid = null_mut();
+        let result = unsafe { DeriveAppContainerSidFromAppContainerName(wide.as_ptr(), &mut sid) };
+        assert!(result >= 0 && !sid.is_null(), "derive fixture profile SID");
+        DerivedSid(sid)
+    }
+
+    /// A canonical temporary parent holding `cache`, `ws` and (created on demand) the private
+    /// control root that is the cache's sibling.
+    fn stale_sweep_parent() -> (PathBuf, PathBuf, PathBuf) {
+        let parent = std::env::temp_dir().join(format!(
+            "mini-agent-stale-sweep-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(parent.join("cache")).expect("create sweep cache");
+        std::fs::create_dir_all(parent.join("ws")).expect("create sweep workspace");
+        let parent = canonical_root(&parent, "sweep fixture parent").expect("canonical parent");
+        let cache = parent.join("cache");
+        let workspace = parent.join("ws");
+        (parent, cache, workspace)
+    }
+
+    /// Publish a journal for a never-created profile and release its lease, which is exactly
+    /// what a killed launcher leaves behind.
+    fn publish_synthetic_stale_journal(
+        journal_root: &ProfileJournalRootAuthority,
+        name: &str,
+        sid: &DerivedSid,
+        roots: Vec<PathBuf>,
+        null_device: bool,
+    ) -> PathBuf {
+        let journal = ProfileJournal {
+            version: PROFILE_JOURNAL_VERSION,
+            profile_name: name.to_string(),
+            sid: sid_text(sid.0).expect("fixture SID text"),
+            job_name: format!("{JOB_NAME_PREFIX}{}", uuid::Uuid::new_v4().simple()),
+            roots,
+            ancestor_roots: Vec::new(),
+            optional_roots: Vec::new(),
+            null_device,
+        };
+        let payload = serde_json::to_vec(&journal).expect("encode fixture journal");
+        let guard = ProfileControlGuard::acquire_until(Instant::now() + Duration::from_secs(5))
+            .expect("acquire profile control");
+        let (path, lease) =
+            publish_profile_record(journal_root, RecordKind::Journal, &payload, &guard)
+                .expect("publish fixture journal");
+        drop(lease);
+        drop(guard);
+        path
+    }
+
+    fn null_device_has_ace_for(sid: PSID) -> bool {
+        let file = open_null_device().expect("open the NUL device DACL");
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor = null_mut();
+        let result = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(result, 0, "read the NUL device DACL");
+        let _descriptor = Local(descriptor);
+        if dacl.is_null() {
+            return false;
+        }
+        (0..u32::from(unsafe { (*dacl).AceCount })).any(|index| {
+            let mut ace = null_mut();
+            assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
+            let header = unsafe { *ace.cast::<ACE_HEADER>() };
+            u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE
+                && unsafe {
+                    EqualSid(
+                        (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast(),
+                        sid,
+                    )
+                } != 0
+        })
+    }
+
+    #[test]
+    fn a_killed_helpers_nul_device_ace_is_revoked_by_the_next_sweep() {
+        if !process_is_elevated() {
+            // The NUL ACE is written only by an elevated launcher; the unelevated retention
+            // path is covered by the synthetic-journal test below.
+            return;
+        }
+        let (parent, cache, workspace) = stale_sweep_parent();
+        let ready = workspace.join("nul-ready.txt");
+        let mut command = build_helper_with_ready_roots_and_env(
+            installed_sandbox_test_executable(),
+            vec![
+                TARGET_PROBE_ARG.into(),
+                TARGET_SLEEP_ARG.into(),
+                "10".into(),
+            ],
+            &workspace,
+            &cache,
+            Some(ready.clone()),
+            &[],
+            &[],
+            None,
+            None,
+            &[],
+            Some(ShellLaunchOptions {
+                toolchain_discovery: false,
+                ancestor_listing: false,
+                null_device: true,
+                command: "",
+            }),
+        )
+        .expect("build NUL-entry helper");
+        command
+            .as_std_mut()
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut helper = command
+            .as_std_mut()
+            .spawn_guarded_until(Instant::now() + Duration::from_secs(5))
+            .expect("start NUL-entry helper");
+        wait_for_probe_file(&ready).expect("NUL-entry helper must become ready");
+        let proof = parse_crash_cleanup_proof(&ready).expect("crash proof");
+        let sid = sid_from_string(&proof.sid).expect("proof SID");
+        assert!(
+            null_device_has_ace_for(sid.0),
+            "the launch must have granted the NUL device"
+        );
+        helper.kill().expect("crash NUL-entry helper");
+        let _ = helper.wait();
+        assert!(proof.journal.exists());
+
+        let journal_root = profile_journal_root(&cache, &[], &[]).expect("journal root");
+        sweep_stale_profiles_until(&journal_root, Instant::now() + Duration::from_secs(60))
+            .expect("sweep the killed helper's journal");
+        assert!(
+            !null_device_has_ace_for(sid.0),
+            "the sweep must revoke the journaled NUL device ACE"
+        );
+        assert!(
+            !proof.journal.exists(),
+            "a fully revoked journal is removed"
+        );
+        drop(journal_root);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn a_nul_journal_an_unelevated_sweep_cannot_clear_is_retained() {
+        if process_is_elevated() {
+            return;
+        }
+        let (parent, cache, workspace) = stale_sweep_parent();
+        let journal_root = profile_journal_root(&cache, &[], &[]).expect("journal root");
+        let name = format!(
+            "{APPCONTAINER_PROFILE_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let sid = derive_profile_sid(&name);
+        let journal =
+            publish_synthetic_stale_journal(&journal_root, &name, &sid, vec![workspace], true);
+        let before = retained_stale_journals();
+        sweep_stale_profiles_until(&journal_root, Instant::now() + Duration::from_secs(60))
+            .expect("an unrevokable NUL entry never fails the sweep");
+        assert!(
+            journal.exists(),
+            "the journal is kept for an elevated launcher"
+        );
+        assert!(retained_stale_journals() > before);
+        drop(journal_root);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn a_sweep_repairs_a_revoke_killed_after_the_root_ace_was_removed() {
+        let (parent, cache, workspace) = stale_sweep_parent();
+        let child = workspace.join("child");
+        std::fs::create_dir_all(&child).expect("create child");
+        let leaf = child.join("leaf.txt");
+        std::fs::write(&leaf, b"leaf").expect("create leaf");
+        let name = format!(
+            "{APPCONTAINER_PROFILE_PREFIX}{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let sid = derive_profile_sid(&name);
+        let root = open_stable_path(
+            &workspace,
+            true,
+            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        .expect("open workspace");
+        update_access_ace(&root, true, sid.0, GRANT_ACCESS, FILE_GENERIC_READ)
+            .expect("grant inheritable read");
+        assert!(path_has_any_ace_for_sid(&leaf, sid.0));
+        // A helper killed mid-revoke: the root's own ACE is gone, the inherited copies remain.
+        update_handle_ace_with_propagation(
+            root.as_raw_handle(),
+            SE_FILE_OBJECT,
+            sid.0,
+            REVOKE_ACCESS,
+            0,
+            (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u32,
+            DirectoryAcePropagation::KernelOnly,
+        )
+        .expect("remove only the root ACE");
+        drop(root);
+        assert!(!access_path_has_explicit_sid(&workspace, sid.0).unwrap());
+        assert!(
+            path_has_any_ace_for_sid(&leaf, sid.0),
+            "fixture must leave the inherited ACE behind"
+        );
+
+        let journal_root = profile_journal_root(&cache, &[], &[]).expect("journal root");
+        let journal = publish_synthetic_stale_journal(
+            &journal_root,
+            &name,
+            &sid,
+            vec![workspace.clone()],
+            false,
+        );
+        sweep_stale_profiles_until(&journal_root, Instant::now() + Duration::from_secs(60))
+            .expect("sweep the half-revoked journal");
+        assert!(
+            !path_has_any_ace_for_sid(&leaf, sid.0),
+            "the sweep must remove the inherited ACE left below the root"
+        );
+        assert!(!journal.exists());
+        drop(journal_root);
+        let _ = std::fs::remove_dir_all(parent);
+    }
+
+    #[test]
+    fn a_non_local_dacl_on_an_ancestor_is_refused_not_propagated() {
+        let parent = std::env::temp_dir().join(format!(
+            "mini-agent-nonlocal-ancestor-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).expect("create fixture");
+        let parent = canonical_root(&parent, "fixture").expect("canonical fixture");
+        let child = parent.join("child");
+        let sid = sid_from_string("S-1-15-2-909-808-707-606-505-404-303").expect("fixture SID");
+        let handle = open_stable_path(
+            &parent,
+            true,
+            READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        )
+        .expect("open fixture");
+        // An inheritable ACE for the SID makes any later change to its entries non-local.
+        update_access_ace(&handle, true, sid.0, GRANT_ACCESS, FILE_GENERIC_READ)
+            .expect("seed inheritable ACE");
+        let before = dacl_ace_count(&child);
+        let error = update_access_ace_with(
+            &handle,
+            false,
+            sid.0,
+            GRANT_ACCESS,
+            ANCESTOR_NAME_ACCESS,
+            true,
+        )
+        .expect_err("a non-local change must be refused");
+        assert!(error.contains("refusing a DACL change"), "{error}");
+        let error = revoke_local_ancestor(&parent, sid.0)
+            .expect_err("a revoke that would propagate must be refused");
+        assert!(error.contains("refusing a DACL change"), "{error}");
+        assert_eq!(dacl_ace_count(&child), before, "nothing reached the child");
+        update_access_ace(&handle, true, sid.0, REVOKE_ACCESS, 0).expect("clean up");
+        drop(handle);
+        let _ = std::fs::remove_dir_all(parent);
     }
 
     fn installed_sandbox_test_executable() -> PathBuf {
