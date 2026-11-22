@@ -759,6 +759,17 @@ impl PermissionChecker {
                 }
                 ToolPerm::Granular(map) => {
                     for (pat, action) in map {
+                        if !is_regex
+                            && tool_name == "mcp_tool"
+                            && let Some(migrated) = migrate_legacy_exa_rule(pat)
+                        {
+                            let migrated = if widens_star(tool_name, *action) {
+                                widened_pattern(tool_name, &migrated)
+                            } else {
+                                Pattern::new(&migrated)
+                            };
+                            entries.push((migrated, *action));
+                        }
                         if !is_regex && is_path_tool_name(tool_name) {
                             entries.push((Pattern::new_path(pat), *action));
                             if let Some(canonical) = canonical_tool_path_pattern(pat) {
@@ -3305,6 +3316,15 @@ fn deny_probe_inputs<'a>(
         }
     }
     deny_inputs
+}
+
+/// Rewrites a rule written for the built-in Exa server's pre-2026-11-21 name
+/// (`mcp_tool:Exa Web Search:...`) to its valid id, so existing rules keep
+/// matching (mini-agent-n02qh). Returns `None` for any other rule.
+fn migrate_legacy_exa_rule(pattern: &str) -> Option<String> {
+    pattern
+        .strip_prefix("mcp_tool:Exa Web Search:")
+        .map(|rest| format!("mcp_tool:exa:{rest}"))
 }
 
 /// Tools whose permission identity is a URL (or URL-shaped destination list),

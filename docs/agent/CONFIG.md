@@ -3466,7 +3466,12 @@ listed API key environment variable when that variable is set):
 Set `enable-exa-mcp = false` to disable the Exa default without touching
 `mcp_servers`. Set `"mcp_servers": {}` to disable all MCP auto-configuration.
 
-A server you define yourself under a built-in's name (`Exa Web Search`,
+The built-in Exa server is registered under the id `exa` (it was `Exa Web
+Search` until 2026-11-21, a name the server-name check rejects). Permission
+rules written for `mcp_tool:Exa Web Search:...` keep matching it, and a
+server you defined under that old name is moved to `exa` when loaded.
+
+A server you define yourself under a built-in's name (`exa`,
 `Context7`, `Grep.app`) is kept whatever the toggle says: the toggles only add
 or omit the built-in registration, and saving the config (including `--setup`)
 never removes a user-defined entry.
