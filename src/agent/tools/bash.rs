@@ -426,9 +426,17 @@ impl Tool for ShellTool {
             .shell_capability()
             .map(|capability| capability.dialect())
         {
-            Some(crate::sandbox::ShellDialect::PowerShell) => description.push_str(
-                " PowerShell syntax: chain with ';' (a single '&' is not a separator), redirect to $null (not /dev/null), and use Get-ChildItem (cmd switches such as 'dir /b' do not apply).",
-            ),
+            Some(crate::sandbox::ShellDialect::PowerShell) => {
+                description.push_str(
+                    " PowerShell syntax: chain with ';' (a single '&' is not a separator), redirect to $null (not /dev/null), and use Get-ChildItem (cmd switches such as 'dir /b' do not apply).",
+                );
+                if self.sandbox.uses_powershell_workspace_drive() {
+                    description.push_str(&format!(
+                        " The command starts in the PowerShell drive {}:\\ (the workspace root); Get-Location prints that drive, relative paths work, and native programs get the real directory.",
+                        crate::sandbox::POWERSHELL_WORKSPACE_DRIVE
+                    ));
+                }
+            }
             Some(crate::sandbox::ShellDialect::Cmd) => description.push_str(
                 " cmd.exe syntax: chain with '&' or '&&', redirect to NUL, and use %VAR% for environment variables.",
             ),

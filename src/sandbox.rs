@@ -763,6 +763,25 @@ pub(crate) fn windows_utf8_output_prelude(dialect: ShellDialect, command: &str) 
     }
 }
 
+/// The PowerShell drive rooted at the workspace inside the Windows AppContainer.
+///
+/// PowerShell normalises every provider path by listing each parent directory to learn the
+/// case-correct names. The container may not list the parents of the workspace (that is the
+/// default; `windows-appcontainer-ancestor-listing` grants it), so `Set-Location` and relative
+/// paths fail and PowerShell falls back to `C:\`. A drive whose root is the workspace has no
+/// parents to list: the same normalisation succeeds and commands start in the workspace.
+pub(crate) const POWERSHELL_WORKSPACE_DRIVE: &str = "ws";
+
+/// Statements that define [`POWERSHELL_WORKSPACE_DRIVE`] over `root` and make it the location.
+/// A failure is ignored: the command then runs where PowerShell started.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn powershell_workspace_drive_prelude(root: &str) -> String {
+    format!(
+        "try {{ New-PSDrive -Name {POWERSHELL_WORKSPACE_DRIVE} -PSProvider FileSystem -Root '{}' -Scope Global -ErrorAction Stop | Out-Null; Set-Location -LiteralPath '{POWERSHELL_WORKSPACE_DRIVE}:\\' -ErrorAction Stop }} catch {{}}; ",
+        root.replace('\'', "''")
+    )
+}
+
 /// Render a Windows path for text pasted into a shell command: `canonicalize`
 /// returns the verbatim `\\?\C:\dir` (or `\\?\UNC\host\share`) spelling,
 /// which cmd.exe rejects as a current directory and Git Bash mangles.
@@ -2176,10 +2195,52 @@ fn bundled_git_dir_for_shell(command: &str) -> Option<PathBuf> {
     if !command.to_ascii_lowercase().contains("git") {
         return None;
     }
-    crate::git::runtime::protected_runtime_paths()
-        .ok()?
-        .into_iter()
+    match crate::git::runtime::protected_runtime_paths() {
+        Ok(paths) => {
+            let found = select_bundled_git_dir(&paths);
+            if found.is_none() {
+                tracing::warn!(
+                    registered = paths.len(),
+                    "sandbox: no bundled Git runtime is registered; the shell uses the host git"
+                );
+            }
+            found
+        }
+        Err(error) => {
+            tracing::warn!(%error, "sandbox: the bundled Git runtime is unavailable to the shell");
+            None
+        }
+    }
+}
+
+/// The registered protected directory that holds the bundled `git.exe`.
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+fn select_bundled_git_dir(protected: &[PathBuf]) -> Option<PathBuf> {
+    protected
+        .iter()
         .find(|path| path.is_dir() && path.join("git.exe").is_file())
+        .cloned()
+}
+
+/// Doctor text: which `git` the contained shell resolves first.
+pub(crate) fn contained_shell_git_note() -> String {
+    #[cfg(all(target_os = "windows", feature = "git-worktree"))]
+    {
+        match crate::git::runtime::protected_runtime_paths() {
+            Ok(paths) => match select_bundled_git_dir(&paths) {
+                Some(dir) => format!("bundled Git first on PATH ({})", dir.display()),
+                None => format!(
+                    "host PATH (no bundled Git runtime among {} registered path(s))",
+                    paths.len()
+                ),
+            },
+            Err(error) => format!("host PATH ({error})"),
+        }
+    }
+    #[cfg(not(all(target_os = "windows", feature = "git-worktree")))]
+    {
+        "host PATH".to_string()
+    }
 }
 
 /// `configured` with each runtime file appended once.
@@ -3627,6 +3688,12 @@ impl Sandbox {
             })
     }
 
+    /// Whether the requested filesystem profile cannot be provided by this backend at all (as
+    /// opposed to a backend that failed its availability preflight).
+    pub(crate) fn profile_is_unsupported(&self) -> bool {
+        self.enabled && !self.profile_supported()
+    }
+
     pub fn profile(&self) -> SandboxProfile {
         self.profile
     }
@@ -4241,6 +4308,16 @@ impl Sandbox {
         self.enabled
     }
 
+    /// Whether commands run in PowerShell inside the Windows AppContainer, where the workspace
+    /// is reached through the [`POWERSHELL_WORKSPACE_DRIVE`] drive.
+    pub(crate) fn uses_powershell_workspace_drive(&self) -> bool {
+        cfg!(windows)
+            && self.enabled
+            && self.backend == "appcontainer"
+            && self.shell_capability().map(ShellCapability::dialect)
+                == Some(ShellDialect::PowerShell)
+    }
+
     /// The configured backend name (`bwrap`, `seatbelt`, `appcontainer`, ...).
     pub(crate) fn backend_name(&self) -> &str {
         &self.backend
@@ -4560,6 +4637,13 @@ impl Sandbox {
                 format!(
                     "cd -- '{}' || exit 1; {command}",
                     path.replace('\'', "'\\''")
+                )
+            }
+            ShellDialect::PowerShell if self.uses_powershell_workspace_drive() => {
+                let inner = resolved.strip_prefix(&root).unwrap_or(Path::new(""));
+                format!(
+                    "Set-Location -LiteralPath '{POWERSHELL_WORKSPACE_DRIVE}:\\{}'; if (-not $?) {{ exit 1 }}; {command}",
+                    inner.to_string_lossy().replace('\'', "''")
                 )
             }
             ShellDialect::PowerShell => format!(
@@ -5000,6 +5084,18 @@ impl Sandbox {
         #[cfg(target_os = "windows")]
         if self.backend == "appcontainer" {
             let cache_dir = self.get_cached_cache_dir()?;
+            let drive_script;
+            let script = if self.uses_powershell_workspace_drive() {
+                drive_script = format!(
+                    "{}{command}",
+                    powershell_workspace_drive_prelude(&strip_verbatim_prefix(
+                        &cwd.to_string_lossy()
+                    ))
+                );
+                drive_script.as_str()
+            } else {
+                command
+            };
             #[cfg_attr(not(feature = "git-worktree"), allow(unused_mut))]
             let mut read_roots = self.windows_appcontainer_read_roots.clone();
             #[cfg_attr(not(feature = "git-worktree"), allow(unused_mut))]
@@ -5024,7 +5120,7 @@ impl Sandbox {
                 &self.shell,
                 &self.shell_prefix_args,
                 &self.shell_command_arg,
-                command,
+                script,
                 &cwd,
                 &cache_dir,
                 &read_roots,
@@ -12611,6 +12707,40 @@ echo COMMITTED"#;
             "PowerShell errors must not carry ANSI colour sequences into tool output"
         );
         assert_eq!(windows_utf8_output_prelude(ShellDialect::Posix, "ls"), "ls");
+    }
+
+    #[test]
+    fn powershell_workspace_drive_prelude_quotes_the_root_and_never_fails_the_command() {
+        let prelude = powershell_workspace_drive_prelude(r"C:\Users\o'brien\ws");
+        assert!(prelude.starts_with("try { New-PSDrive -Name ws -PSProvider FileSystem -Root "));
+        assert!(
+            prelude.contains(r"-Root 'C:\Users\o''brien\ws' "),
+            "{prelude}"
+        );
+        assert!(
+            prelude.contains(r"Set-Location -LiteralPath 'ws:\'"),
+            "{prelude}"
+        );
+        assert!(
+            prelude.ends_with("catch {}; "),
+            "a failed drive must not stop the command"
+        );
+    }
+
+    #[test]
+    fn the_bundled_git_directory_is_the_protected_one_that_holds_git_exe() {
+        let scratch = TempDir::new("bundled-git");
+        let runtime = scratch.path().join("git-runtime");
+        let other = scratch.path().join("other");
+        std::fs::create_dir_all(&runtime).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(runtime.join("git.exe"), b"exe").unwrap();
+        assert_eq!(
+            select_bundled_git_dir(&[other.clone(), runtime.clone()]),
+            Some(runtime)
+        );
+        assert_eq!(select_bundled_git_dir(&[other]), None);
+        assert_eq!(select_bundled_git_dir(&[]), None);
     }
 
     #[test]

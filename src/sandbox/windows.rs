@@ -8359,14 +8359,16 @@ mod tests {
             .spawn_guarded_until(Instant::now() + Duration::from_secs(5))
             .expect("start NUL-entry helper");
         wait_for_probe_file(&ready).expect("NUL-entry helper must become ready");
-        let proof = parse_crash_cleanup_proof(&ready).expect("crash proof");
-        let sid = sid_from_string(&proof.sid).expect("proof SID");
+        // The journal is leased by the live helper; only the readiness marker is read here.
+        let live = parse_cleanup_proof(&ready).expect("readiness proof");
+        let sid = sid_from_string(&live.sid).expect("proof SID");
         assert!(
             null_device_has_ace_for(sid.0),
             "the launch must have granted the NUL device"
         );
         helper.kill().expect("crash NUL-entry helper");
         let _ = helper.wait();
+        let proof = parse_crash_cleanup_proof(&ready).expect("crash proof");
         assert!(proof.journal.exists());
 
         let journal_root = profile_journal_root(&cache, &[], &[]).expect("journal root");
@@ -8415,8 +8417,6 @@ mod tests {
         let (parent, cache, workspace) = stale_sweep_parent();
         let child = workspace.join("child");
         std::fs::create_dir_all(&child).expect("create child");
-        let leaf = child.join("leaf.txt");
-        std::fs::write(&leaf, b"leaf").expect("create leaf");
         let name = format!(
             "{APPCONTAINER_PROFILE_PREFIX}{}",
             uuid::Uuid::new_v4().simple()
@@ -8431,7 +8431,7 @@ mod tests {
         .expect("open workspace");
         update_access_ace(&root, true, sid.0, GRANT_ACCESS, FILE_GENERIC_READ)
             .expect("grant inheritable read");
-        assert!(path_has_any_ace_for_sid(&leaf, sid.0));
+        assert!(path_has_any_ace_for_sid(&child, sid.0));
         // A helper killed mid-revoke: the root's own ACE is gone, the inherited copies remain.
         update_handle_ace_with_propagation(
             root.as_raw_handle(),
@@ -8446,7 +8446,7 @@ mod tests {
         drop(root);
         assert!(!access_path_has_explicit_sid(&workspace, sid.0).unwrap());
         assert!(
-            path_has_any_ace_for_sid(&leaf, sid.0),
+            path_has_any_ace_for_sid(&child, sid.0),
             "fixture must leave the inherited ACE behind"
         );
 
@@ -8461,7 +8461,7 @@ mod tests {
         sweep_stale_profiles_until(&journal_root, Instant::now() + Duration::from_secs(60))
             .expect("sweep the half-revoked journal");
         assert!(
-            !path_has_any_ace_for_sid(&leaf, sid.0),
+            !path_has_any_ace_for_sid(&child, sid.0),
             "the sweep must remove the inherited ACE left below the root"
         );
         assert!(!journal.exists());
@@ -9860,12 +9860,14 @@ mod tests {
         let active = root.path().to_path_buf();
         std::fs::create_dir(active.join("workspace")).expect("create active workspace");
 
-        let error = recover_preserved_preflight_roots(
+        // A root whose owner lease is held belongs to a concurrently running session: it is
+        // skipped untouched (not recovered, not an error). Only an unverifiable root without a
+        // held lease fails closed.
+        recover_preserved_preflight_roots(
             &parent,
             Instant::now() + GENERAL_PREFLIGHT_CLEANUP_TIMEOUT,
         )
-        .expect_err("live owner lease must block recovery");
-        assert!(error.contains("active or unverifiable"));
+        .expect("a live owner lease must be skipped, not recovered");
         assert!(active.join(PREFLIGHT_OWNER_FILE).exists());
         assert!(active.join("workspace").exists());
 

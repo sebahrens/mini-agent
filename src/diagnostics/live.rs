@@ -185,7 +185,7 @@ pub(crate) async fn tool_in_sandbox(sandbox: &crate::sandbox::Sandbox, program: 
 pub(crate) fn appcontainer_extras_line(sandbox: &crate::sandbox::Sandbox) -> String {
     let state = |on: bool| if on { "on" } else { "off" };
     let mut line = format!(
-        "ancestor-listing={}, null-device={}, toolchain-discovery={}; launcher {}",
+        "ancestor-listing={}, null-device={}, toolchain-discovery={}; launcher {}; shell git: {}",
         state(sandbox.windows_ancestor_listing()),
         state(sandbox.windows_null_device()),
         state(sandbox.windows_toolchain_discovery()),
@@ -194,6 +194,7 @@ pub(crate) fn appcontainer_extras_line(sandbox: &crate::sandbox::Sandbox) -> Str
         } else {
             "not elevated"
         },
+        crate::sandbox::contained_shell_git_note(),
     );
     if sandbox.windows_toolchain_discovery() {
         let roots = crate::sandbox::discovered_toolchain_root_count();

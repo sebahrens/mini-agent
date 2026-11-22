@@ -525,6 +525,12 @@ fn configured_sandbox_validation_probe<'a>(
                 .or_else(|| sandbox.unavailable_reason())
                 .map(|diagnostic| format!("\n{diagnostic}"))
                 .unwrap_or_default();
+            if sandbox.profile_is_unsupported() {
+                anyhow::bail!(
+                    "sandbox profile '{}' is not supported by the '{backend}' backend — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly){reason}",
+                    sandbox.profile().name()
+                );
+            }
             anyhow::bail!(
                 "sandbox backend '{backend}' is unavailable or has no successful production preflight — refusing to start with unsandboxed execution (use --no-sandbox to disable sandboxing explicitly){reason}"
             );

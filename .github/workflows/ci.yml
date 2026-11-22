@@ -1884,8 +1884,8 @@ jobs:
           if ($nativeExit -ne 0) {
             throw "Native general-sandbox regressions failed with exit code $nativeExit"
           }
-          if (-not ($native -match '^test result: ok\. 50 passed; 0 failed; 0 ignored;')) {
-            throw 'Native general-sandbox regressions did not execute all fifty tests'
+          if (-not ($native -match '^test result: ok\. 55 passed; 0 failed; 0 ignored;')) {
+            throw 'Native general-sandbox regressions did not execute all fifty-five tests'
           }
           cargo test --locked atomic_write_tests -- --test-threads=1
           if ($LASTEXITCODE -ne 0) {

@@ -1847,7 +1847,7 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
             "preflight_diagnostics_cached_result_never_reprobes_or_emits_private_error_data",
             "timed_out_general_preflight_reaps_tree_and_removes_recovery_state",
             ".Count -ne 1", "$nativeExit = $LASTEXITCODE", "if ($nativeExit -ne 0)",
-            r"'^test result: ok\. 50 passed; 0 failed; 0 ignored;'",
+            r"'^test result: ok\. 55 passed; 0 failed; 0 ignored;'",
         ]:
             if item not in native:
                 raise AssertionError("missing native diagnostic execution guard: " + item)
@@ -1904,7 +1904,7 @@ class WindowsGeneralPreflightDiagnosticsCiTests(unittest.TestCase):
         for before, after in [
             ("preflight_diagnostics_bound_closed_timing_and_late_exit_categories", "missing_bound_test"),
             ("preflight_diagnostics_cached_result_never_reprobes_or_emits_private_error_data", "missing_cache_test"),
-            ("50 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 50 ignored;"),
+            ("55 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 55 ignored;"),
             ("$observerExit = $LASTEXITCODE", "$observerExit = 0"),
             ("2 passed; 0 failed; 0 ignored;", "0 passed; 0 failed; 2 ignored;"),
             ("--exact --nocapture --test-threads=1", "--ignored --nocapture --test-threads=1"),
