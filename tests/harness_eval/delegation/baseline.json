@@ -1,0 +1,1473 @@
+{
+ "measured": "2026-11-22",
+ "bead": "mini-agent-zmhfp",
+ "binary": "main 48a8e49c (debug build)",
+ "provider": "openrouter",
+ "models": {
+  "main": "anthropic/claude-sonnet-5.5"
+ },
+ "caveats": [
+  "small n; single operator run; no confidence intervals",
+  "scripts/delegation_eval.py was run from a local copy with two changes: task_enabled written at top level instead of under [subagents], and delegation_raw/usage_raw added to each record (see HARNESS_EVAL.md findings)",
+  "costs are OpenRouter reported cost and depend on prompt-cache warmth, which varied between runs"
+ ],
+ "delegation_lane": {
+  "natural_prompts": {
+   "description": "tasks.json plus two added tasks (find_definition_module, count_test_functions); the model chose not to delegate in any delegated-arm run",
+   "tasks": [
+    {
+     "name": "cross_file_callers",
+     "prompt": "Find every file under src/ that calls load_config and write their paths, sorted, one per line, to answer.txt.",
+     "files": {
+      "src/a.rs": "fn run() { load_config(); }\n",
+      "src/b.rs": "fn other() { helper(); }\n",
+      "src/c.rs": "fn go() { load_config(); load_config(); }\n",
+      "src/config.rs": "pub fn load_config() {}\n"
+     },
+     "expected_files": {
+      "answer.txt": "src/a.rs\nsrc/c.rs\n"
+     }
+    },
+    {
+     "name": "known_path_read",
+     "prompt": "Read version.txt and write its content, unchanged, to answer.txt.",
+     "files": {
+      "version.txt": "1.4.2\n"
+     },
+     "expected_files": {
+      "answer.txt": "1.4.2\n"
+     }
+    },
+    {
+     "name": "independent_questions",
+     "prompt": "Answer both questions in answer.txt, one line each: how many TODO markers are in docs/, and how many in src/?",
+     "files": {
+      "docs/a.md": "TODO one\nTODO two\n",
+      "docs/b.md": "done\n",
+      "src/x.rs": "// TODO fix\n",
+      "src/y.rs": "// ok\n"
+     },
+     "expected_files": {
+      "answer.txt": "docs: 2\nsrc: 1\n"
+     }
+    },
+    {
+     "name": "find_definition_module",
+     "prompt": "Which file under src/ defines the function parse_header? Write its path followed by a newline to answer.txt.",
+     "files": {
+      "src/a.rs": "fn x() { parse_header(); }\n",
+      "src/b.rs": "pub fn parse_header() {}\n",
+      "src/c.rs": "fn y() {}\n",
+      "src/d.rs": "// parse_header mentioned in a comment only\n"
+     },
+     "expected_files": {
+      "answer.txt": "src/b.rs\n"
+     }
+    },
+    {
+     "name": "count_test_functions",
+     "prompt": "Count the functions named test_* across all files under tests/ and write the number, followed by a newline, to answer.txt.",
+     "files": {
+      "tests/one.rs": "fn test_a() {}\nfn test_b() {}\nfn helper() {}\n",
+      "tests/two.rs": "fn test_c() {}\n",
+      "tests/three.rs": "fn helper2() {}\nfn test_d() {}\nfn test_e() {}\n"
+     },
+     "expected_files": {
+      "answer.txt": "5\n"
+     }
+    }
+   ],
+   "records": [
+    {
+     "task": "cross_file_callers",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 4,
+     "total_tokens": 113073,
+     "cost_usd": 0.085351,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "cross_file_callers",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 4,
+     "total_tokens": 96090,
+     "cost_usd": 0.0721183,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "known_path_read",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 83782,
+     "cost_usd": 0.0775425,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "known_path_read",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 71241,
+     "cost_usd": 0.0664139,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "independent_questions",
+     "arm": "delegated",
+     "success": false,
+     "num_turns": 4,
+     "total_tokens": 113474,
+     "cost_usd": 0.0854595,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "independent_questions",
+     "arm": "direct",
+     "success": false,
+     "num_turns": 4,
+     "total_tokens": 96429,
+     "cost_usd": 0.0732184,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "find_definition_module",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 84185,
+     "cost_usd": 0.0784486,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "find_definition_module",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 71613,
+     "cost_usd": 0.0671975,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "count_test_functions",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 4,
+     "total_tokens": 113733,
+     "cost_usd": 0.0857848,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "count_test_functions",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 4,
+     "total_tokens": 96768,
+     "cost_usd": 0.0736648,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    }
+   ]
+  },
+  "forced_delegation_prompts": {
+   "description": "same tasks with 'Delegate the searching to a subagent with the task tool' appended; independent_questions reworded to a fixed format",
+   "tasks": [
+    {
+     "name": "cross_file_callers_forced",
+     "prompt": "Find every file under src/ that calls load_config and write their paths, sorted, one per line, to answer.txt. Delegate the searching to a subagent with the task tool and then write answer.txt yourself from its report.",
+     "files": {
+      "src/a.rs": "fn run() { load_config(); }\n",
+      "src/b.rs": "fn other() { helper(); }\n",
+      "src/c.rs": "fn go() { load_config(); load_config(); }\n",
+      "src/config.rs": "pub fn load_config() {}\n"
+     },
+     "expected_files": {
+      "answer.txt": "src/a.rs\nsrc/c.rs\n"
+     }
+    },
+    {
+     "name": "known_path_read_forced",
+     "prompt": "Read version.txt and write its content, unchanged, to answer.txt. Delegate the searching to a subagent with the task tool and then write answer.txt yourself from its report.",
+     "files": {
+      "version.txt": "1.4.2\n"
+     },
+     "expected_files": {
+      "answer.txt": "1.4.2\n"
+     }
+    },
+    {
+     "name": "independent_questions_fixed_forced",
+     "prompt": "Answer both questions in answer.txt as two lines formatted exactly 'docs: N' and 'src: N': how many lines containing TODO are in docs/, and how many in src/? Delegate the searching to a subagent with the task tool and then write answer.txt yourself from its report.",
+     "files": {
+      "docs/a.md": "TODO one\nTODO two\n",
+      "docs/b.md": "done\n",
+      "src/x.rs": "// TODO fix\n",
+      "src/y.rs": "// ok\n"
+     },
+     "expected_files": {
+      "answer.txt": "docs: 2\nsrc: 1\n"
+     }
+    },
+    {
+     "name": "find_definition_module_forced",
+     "prompt": "Which file under src/ defines the function parse_header? Write its path followed by a newline to answer.txt. Delegate the searching to a subagent with the task tool and then write answer.txt yourself from its report.",
+     "files": {
+      "src/a.rs": "fn x() { parse_header(); }\n",
+      "src/b.rs": "pub fn parse_header() {}\n",
+      "src/c.rs": "fn y() {}\n",
+      "src/d.rs": "// parse_header mentioned in a comment only\n"
+     },
+     "expected_files": {
+      "answer.txt": "src/b.rs\n"
+     }
+    },
+    {
+     "name": "count_test_functions_forced",
+     "prompt": "Count the functions named test_* across all files under tests/ and write the number, followed by a newline, to answer.txt. Delegate the searching to a subagent with the task tool and then write answer.txt yourself from its report.",
+     "files": {
+      "tests/one.rs": "fn test_a() {}\nfn test_b() {}\nfn helper() {}\n",
+      "tests/two.rs": "fn test_c() {}\n",
+      "tests/three.rs": "fn helper2() {}\nfn test_d() {}\nfn test_e() {}\n"
+     },
+     "expected_files": {
+      "answer.txt": "5\n"
+     }
+    }
+   ],
+   "run_a_records": [
+    {
+     "task": "cross_file_callers_forced",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 114925,
+     "cost_usd": 0.1289166,
+     "children": 1,
+     "contract_pass": 0,
+     "repair_used": 1,
+     "host_replaced": 0,
+     "child_tokens": 28239,
+     "child_cost_units": 45318
+    },
+    {
+     "task": "cross_file_callers_forced",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 4,
+     "total_tokens": 96907,
+     "cost_usd": 0.0761261,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "known_path_read_forced",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 101579,
+     "cost_usd": 0.1097572,
+     "children": 1,
+     "contract_pass": 1,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 15427,
+     "child_cost_units": 25665
+    },
+    {
+     "task": "known_path_read_forced",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 4,
+     "total_tokens": 95515,
+     "cost_usd": 0.0720401,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "independent_questions_fixed_forced",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 110885,
+     "cost_usd": 0.1159416,
+     "children": 1,
+     "contract_pass": 1,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 24574,
+     "child_cost_units": 37270
+    },
+    {
+     "task": "independent_questions_fixed_forced",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 72512,
+     "cost_usd": 0.071626,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "find_definition_module_forced",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 108675,
+     "cost_usd": 0.1085266,
+     "children": 1,
+     "contract_pass": 1,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 22932,
+     "child_cost_units": 33113
+    },
+    {
+     "task": "find_definition_module_forced",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 71906,
+     "cost_usd": 0.0687145,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    },
+    {
+     "task": "count_test_functions_forced",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 115577,
+     "cost_usd": 0.130912,
+     "children": 1,
+     "contract_pass": 0,
+     "repair_used": 1,
+     "host_replaced": 0,
+     "child_tokens": 28878,
+     "child_cost_units": 47107
+    },
+    {
+     "task": "count_test_functions_forced",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 4,
+     "total_tokens": 97176,
+     "cost_usd": 0.0751234,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0
+    }
+   ],
+   "run_b_records": [
+    {
+     "task": "cross_file_callers_forced",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 4,
+     "total_tokens": 135978,
+     "cost_usd": 0.1289618,
+     "children": 1,
+     "contract_pass": 0,
+     "repair_used": 1,
+     "host_replaced": 1,
+     "child_tokens": 19489,
+     "child_cost_units": 35090,
+     "delegation_raw": {
+      "children": 1,
+      "contract_pass": 0,
+      "contract_repaired": 0,
+      "contract_normalized": 0,
+      "contract_unstructured": 1,
+      "repair_used": 1,
+      "host_replaced": 1,
+      "writeup_used": 0,
+      "stopped_turn_budget": 0,
+      "stopped_deadline": 0,
+      "failed": 0,
+      "turns": 2,
+      "tool_calls": 2,
+      "total_tokens": 19489,
+      "cached_input_tokens": 7223,
+      "cost_units": 35090,
+      "calls_with_differing_prefixes": 0,
+      "rows_truncated": false
+     }
+    },
+    {
+     "task": "cross_file_callers_forced",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 72117,
+     "cost_usd": 0.0702128,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0,
+     "delegation_raw": {}
+    },
+    {
+     "task": "known_path_read_forced",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 108919,
+     "cost_usd": 0.109697,
+     "children": 1,
+     "contract_pass": 1,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 23036,
+     "child_cost_units": 33376,
+     "delegation_raw": {
+      "children": 1,
+      "contract_pass": 1,
+      "contract_repaired": 0,
+      "contract_normalized": 0,
+      "contract_unstructured": 0,
+      "repair_used": 0,
+      "host_replaced": 0,
+      "writeup_used": 0,
+      "stopped_turn_budget": 0,
+      "stopped_deadline": 0,
+      "failed": 0,
+      "turns": 3,
+      "tool_calls": 3,
+      "total_tokens": 23036,
+      "cached_input_tokens": 14713,
+      "cost_units": 33376,
+      "calls_with_differing_prefixes": 0,
+      "rows_truncated": false
+     }
+    },
+    {
+     "task": "known_path_read_forced",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 4,
+     "total_tokens": 95549,
+     "cost_usd": 0.0722733,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0,
+     "delegation_raw": {}
+    },
+    {
+     "task": "independent_questions_fixed_forced",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 115727,
+     "cost_usd": 0.1326124,
+     "children": 1,
+     "contract_pass": 0,
+     "repair_used": 1,
+     "host_replaced": 0,
+     "child_tokens": 28750,
+     "child_cost_units": 47428,
+     "delegation_raw": {
+      "children": 1,
+      "contract_pass": 0,
+      "contract_repaired": 1,
+      "contract_normalized": 0,
+      "contract_unstructured": 0,
+      "repair_used": 1,
+      "host_replaced": 0,
+      "writeup_used": 0,
+      "stopped_turn_budget": 0,
+      "stopped_deadline": 0,
+      "failed": 0,
+      "turns": 3,
+      "tool_calls": 4,
+      "total_tokens": 28750,
+      "cached_input_tokens": 15211,
+      "cost_units": 47428,
+      "calls_with_differing_prefixes": 0,
+      "rows_truncated": false
+     }
+    },
+    {
+     "task": "independent_questions_fixed_forced",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 72480,
+     "cost_usd": 0.0712364,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0,
+     "delegation_raw": {}
+    },
+    {
+     "task": "find_definition_module_forced",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 108338,
+     "cost_usd": 0.1073133,
+     "children": 1,
+     "contract_pass": 1,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 22746,
+     "child_cost_units": 32524,
+     "delegation_raw": {
+      "children": 1,
+      "contract_pass": 1,
+      "contract_repaired": 0,
+      "contract_normalized": 0,
+      "contract_unstructured": 0,
+      "repair_used": 0,
+      "host_replaced": 0,
+      "writeup_used": 0,
+      "stopped_turn_budget": 0,
+      "stopped_deadline": 0,
+      "failed": 0,
+      "turns": 3,
+      "tool_calls": 2,
+      "total_tokens": 22746,
+      "cached_input_tokens": 14559,
+      "cost_units": 32524,
+      "calls_with_differing_prefixes": 0,
+      "rows_truncated": false
+     }
+    },
+    {
+     "task": "find_definition_module_forced",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 71953,
+     "cost_usd": 0.0692541,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0,
+     "delegation_raw": {}
+    },
+    {
+     "task": "count_test_functions_forced",
+     "arm": "delegated",
+     "success": true,
+     "num_turns": 3,
+     "total_tokens": 115612,
+     "cost_usd": 0.1297368,
+     "children": 1,
+     "contract_pass": 0,
+     "repair_used": 1,
+     "host_replaced": 0,
+     "child_tokens": 29019,
+     "child_cost_units": 46905,
+     "delegation_raw": {
+      "children": 1,
+      "contract_pass": 0,
+      "contract_repaired": 1,
+      "contract_normalized": 0,
+      "contract_unstructured": 0,
+      "repair_used": 1,
+      "host_replaced": 0,
+      "writeup_used": 0,
+      "stopped_turn_budget": 0,
+      "stopped_deadline": 0,
+      "failed": 0,
+      "turns": 3,
+      "tool_calls": 5,
+      "total_tokens": 29019,
+      "cached_input_tokens": 15180,
+      "cost_units": 46905,
+      "calls_with_differing_prefixes": 0,
+      "rows_truncated": false
+     }
+    },
+    {
+     "task": "count_test_functions_forced",
+     "arm": "direct",
+     "success": true,
+     "num_turns": 4,
+     "total_tokens": 97458,
+     "cost_usd": 0.0758782,
+     "children": 0,
+     "contract_pass": 0,
+     "repair_used": 0,
+     "host_replaced": 0,
+     "child_tokens": 0,
+     "child_cost_units": 0,
+     "delegation_raw": {}
+    }
+   ]
+  }
+ },
+ "sibling_cache_reuse": [
+  {
+   "stagger": 0,
+   "run": 0,
+   "cost": 0.1633288,
+   "children": 4,
+   "differing": 0,
+   "rows": [
+    {
+     "total_tokens": 14516,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14324,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14508,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14325,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14510,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14319,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14514,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14320,
+     "stop": "completed",
+     "contract": "pass"
+    }
+   ],
+   "deleg": {
+    "children": 4,
+    "contract_pass": 4,
+    "contract_repaired": 0,
+    "contract_normalized": 0,
+    "contract_unstructured": 0,
+    "repair_used": 0,
+    "host_replaced": 0,
+    "writeup_used": 0,
+    "stopped_turn_budget": 0,
+    "stopped_deadline": 0,
+    "failed": 0,
+    "turns": 8,
+    "tool_calls": 4,
+    "total_tokens": 58048,
+    "cached_input_tokens": 28308,
+    "cost_units": 90044,
+    "calls_with_differing_prefixes": 0,
+    "rows_truncated": false
+   }
+  },
+  {
+   "stagger": 750,
+   "run": 0,
+   "cost": 0.1135244,
+   "children": 4,
+   "differing": 0,
+   "rows": [
+    {
+     "total_tokens": 14515,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14325,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14464,
+     "cached_input_tokens": 13928,
+     "input_tokens": 14324,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14509,
+     "cached_input_tokens": 13928,
+     "input_tokens": 14319,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14507,
+     "cached_input_tokens": 13928,
+     "input_tokens": 14320,
+     "stop": "completed",
+     "contract": "pass"
+    }
+   ],
+   "deleg": {
+    "children": 4,
+    "contract_pass": 4,
+    "contract_repaired": 0,
+    "contract_normalized": 0,
+    "contract_unstructured": 0,
+    "repair_used": 0,
+    "host_replaced": 0,
+    "writeup_used": 0,
+    "stopped_turn_budget": 0,
+    "stopped_deadline": 0,
+    "failed": 0,
+    "turns": 8,
+    "tool_calls": 4,
+    "total_tokens": 57995,
+    "cached_input_tokens": 48861,
+    "cost_units": 69226,
+    "calls_with_differing_prefixes": 0,
+    "rows_truncated": false
+   }
+  },
+  {
+   "stagger": 0,
+   "run": 1,
+   "cost": 0.1637765,
+   "children": 4,
+   "differing": 0,
+   "rows": [
+    {
+     "total_tokens": 14488,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14324,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14511,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14319,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14521,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14320,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14548,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14325,
+     "stop": "completed",
+     "contract": "pass"
+    }
+   ],
+   "deleg": {
+    "children": 4,
+    "contract_pass": 4,
+    "contract_repaired": 0,
+    "contract_normalized": 0,
+    "contract_unstructured": 0,
+    "repair_used": 0,
+    "host_replaced": 0,
+    "writeup_used": 0,
+    "stopped_turn_budget": 0,
+    "stopped_deadline": 0,
+    "failed": 0,
+    "turns": 8,
+    "tool_calls": 4,
+    "total_tokens": 58068,
+    "cached_input_tokens": 28308,
+    "cost_units": 90144,
+    "calls_with_differing_prefixes": 0,
+    "rows_truncated": false
+   }
+  },
+  {
+   "stagger": 750,
+   "run": 1,
+   "cost": 0.1076903,
+   "children": 4,
+   "differing": 0,
+   "rows": [
+    {
+     "total_tokens": 14166,
+     "cached_input_tokens": 6953,
+     "input_tokens": 14077,
+     "stop": "completed",
+     "contract": "plain"
+    },
+    {
+     "total_tokens": 14157,
+     "cached_input_tokens": 13680,
+     "input_tokens": 14076,
+     "stop": "completed",
+     "contract": "plain"
+    },
+    {
+     "total_tokens": 14154,
+     "cached_input_tokens": 13680,
+     "input_tokens": 14072,
+     "stop": "completed",
+     "contract": "plain"
+    },
+    {
+     "total_tokens": 14152,
+     "cached_input_tokens": 13680,
+     "input_tokens": 14071,
+     "stop": "completed",
+     "contract": "plain"
+    }
+   ],
+   "deleg": {
+    "children": 4,
+    "contract_pass": 0,
+    "contract_repaired": 0,
+    "contract_normalized": 0,
+    "contract_unstructured": 0,
+    "repair_used": 0,
+    "host_replaced": 0,
+    "writeup_used": 0,
+    "stopped_turn_budget": 0,
+    "stopped_deadline": 0,
+    "failed": 0,
+    "turns": 8,
+    "tool_calls": 4,
+    "total_tokens": 56629,
+    "cached_input_tokens": 47993,
+    "cost_units": 66240,
+    "calls_with_differing_prefixes": 0,
+    "rows_truncated": false
+   }
+  },
+  {
+   "stagger": 0,
+   "run": 2,
+   "cost": 0.1638017,
+   "children": 4,
+   "differing": 0,
+   "rows": [
+    {
+     "total_tokens": 14490,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14325,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14516,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14324,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14515,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14320,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14541,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14319,
+     "stop": "completed",
+     "contract": "pass"
+    }
+   ],
+   "deleg": {
+    "children": 4,
+    "contract_pass": 4,
+    "contract_repaired": 0,
+    "contract_normalized": 0,
+    "contract_unstructured": 0,
+    "repair_used": 0,
+    "host_replaced": 0,
+    "writeup_used": 0,
+    "stopped_turn_budget": 0,
+    "stopped_deadline": 0,
+    "failed": 0,
+    "turns": 8,
+    "tool_calls": 4,
+    "total_tokens": 58062,
+    "cached_input_tokens": 28308,
+    "cost_units": 90114,
+    "calls_with_differing_prefixes": 0,
+    "rows_truncated": false
+   }
+  },
+  {
+   "stagger": 750,
+   "run": 2,
+   "cost": 0.113627,
+   "children": 4,
+   "differing": 0,
+   "rows": [
+    {
+     "total_tokens": 14500,
+     "cached_input_tokens": 13928,
+     "input_tokens": 14319,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14504,
+     "cached_input_tokens": 13928,
+     "input_tokens": 14320,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14504,
+     "cached_input_tokens": 7077,
+     "input_tokens": 14325,
+     "stop": "completed",
+     "contract": "pass"
+    },
+    {
+     "total_tokens": 14511,
+     "cached_input_tokens": 13928,
+     "input_tokens": 14324,
+     "stop": "completed",
+     "contract": "pass"
+    }
+   ],
+   "deleg": {
+    "children": 4,
+    "contract_pass": 4,
+    "contract_repaired": 0,
+    "contract_normalized": 0,
+    "contract_unstructured": 0,
+    "repair_used": 0,
+    "host_replaced": 0,
+    "writeup_used": 0,
+    "stopped_turn_budget": 0,
+    "stopped_deadline": 0,
+    "failed": 0,
+    "turns": 8,
+    "tool_calls": 4,
+    "total_tokens": 58019,
+    "cached_input_tokens": 48861,
+    "cost_units": 69346,
+    "calls_with_differing_prefixes": 0,
+    "rows_truncated": false
+   }
+  }
+ ],
+ "context_inheritance": {
+  "run_a_objective_one_sentence": [
+   {
+    "task": "handoff",
+    "rep": 0,
+    "arm": "fresh",
+    "cost": 0.030189,
+    "children": 1,
+    "child_tokens": 7228,
+    "child_cost_units": 14620,
+    "contract": [
+     "plain"
+    ],
+    "correct": true,
+    "result": "Marlin release handoff: deadline 2027-03-21, owner Priya Raman, budget cap 4200 EUR, rejected vendor Acme Corp.",
+    "usage": {
+     "input_tokens": 67136,
+     "output_tokens": 447,
+     "cached_input_tokens": 59215,
+     "cache_creation_input_tokens": 7911
+    }
+   },
+   {
+    "task": "handoff",
+    "rep": 0,
+    "arm": "inherit",
+    "cost": 0.043773,
+    "children": 1,
+    "child_tokens": 18127,
+    "child_cost_units": 31053,
+    "contract": [
+     "repaired"
+    ],
+    "correct": false,
+    "result": "Release Marlin \u2014 deadline 2027-03-21 (moved from 2027-03-14), owner Priya Raman, budget cap 4200 EUR (3800 EUR is obsolete), rejected vendor Acme Corp.",
+    "usage": {
+     "input_tokens": 77698,
+     "output_tokens": 922,
+     "cached_input_tokens": 66535,
+     "cache_creation_input_tokens": 11147
+    }
+   },
+   {
+    "task": "drain",
+    "rep": 0,
+    "arm": "fresh",
+    "cost": 0.0319921,
+    "children": 1,
+    "child_tokens": 7391,
+    "child_cost_units": 15510,
+    "contract": [
+     "plain"
+    ],
+    "correct": true,
+    "result": "Drain **web-3**, which is the busiest at 90. Its load is split evenly, 45 to each remaining server:\n\n- web-1: 71 + 45 = **116**\n- web-2: 52 + 45 = **97**\n\nThe total stays at 213 before and after.",
+    "usage": {
+     "input_tokens": 66299,
+     "output_tokens": 634,
+     "cached_input_tokens": 58371,
+     "cache_creation_input_tokens": 7918
+    }
+   },
+   {
+    "task": "drain",
+    "rep": 0,
+    "arm": "inherit",
+    "cost": 0.0148391,
+    "children": 1,
+    "child_tokens": 7381,
+    "child_cost_units": 9263,
+    "contract": [
+     "plain"
+    ],
+    "correct": true,
+    "result": "Drain **web-3**, the busiest server at 90. Its load is split evenly, 45 to each remaining server:\n\n- **web-1:** 71 + 45 = **116**\n- **web-2:** 52 + 45 = **97**\n\nThe total is unchanged at 213.",
+    "usage": {
+     "input_tokens": 65969,
+     "output_tokens": 620,
+     "cached_input_tokens": 65116,
+     "cache_creation_input_tokens": 843
+    }
+   },
+   {
+    "task": "naming",
+    "rep": 0,
+    "arm": "fresh",
+    "cost": 0.0365321,
+    "children": 1,
+    "child_tokens": 7589,
+    "child_cost_units": 16110,
+    "contract": [
+     "plain"
+    ],
+    "correct": true,
+    "result": "1. `ma_user_is_admin_p`: snake_case with the `ma_` prefix. It returns a boolean, so it ends in `_p`. It doesn't touch the network.\n2. `ma_fetch_latest_price_net`: snake_case with the `ma_` prefix. It touches the network, so it ends in `_net`. It returns a price rather than a boolean, so it has no `_p`.\n3. `ma_compute_total`: snake_case with the `ma_` prefix. It's a pure computation that returns neither a boolean nor anything over the network, so it has no suffix.\n\nThe rules only fix the prefix, the case and the suffixes. The words in the middle were the child's choice.",
+    "usage": {
+     "input_tokens": 66667,
+     "output_tokens": 996,
+     "cached_input_tokens": 58371,
+     "cache_creation_input_tokens": 8286
+    }
+   },
+   {
+    "task": "naming",
+    "rep": 0,
+    "arm": "inherit",
+    "cost": 0.0205128,
+    "children": 1,
+    "child_tokens": 14664,
+    "child_cost_units": 17165,
+    "contract": [
+     "plain"
+    ],
+    "correct": false,
+    "result": "The child did not give any names. It said it couldn't tell which three functions were meant, so it produced no answer.\n\n- **Why it stopped:** It saw the naming rules but not the three function descriptions from my request. It checked the empty working directory and memory and found nothing either.\n- **Rules it reported:**\n  - Use snake_case with the prefix `ma_`.\n  - Boolean-returning functions end with `_p`.\n  - Anything touching the network ends with `_net`.\n  - The camelCase rule is dropped.\n- **Open question it raised:** The rules don't say which suffix comes first for a function that is both boolean and network-touching. It wouldn't guess.\n\nI stuck to the single child you asked for and did not supply names myself. If you want, I can resume that child with the three function descriptions spelled out.",
+    "usage": {
+     "input_tokens": 73464,
+     "output_tokens": 981,
+     "cached_input_tokens": 72063,
+     "cache_creation_input_tokens": 1389
+    }
+   }
+  ],
+  "run_b_objective_states_question": [
+   {
+    "task": "handoff",
+    "rep": 0,
+    "arm": "fresh",
+    "cost": 0.0135592,
+    "children": 1,
+    "child_tokens": 7217,
+    "child_cost_units": 7869,
+    "contract": [
+     "plain"
+    ],
+    "correct": true,
+    "result": "Marlin release handoff: deadline 2027-03-21, owner Priya Raman, budget cap 4200 EUR, rejected vendor Acme Corp.",
+    "usage": {
+     "input_tokens": 66866,
+     "output_tokens": 436,
+     "cached_input_tokens": 65817,
+     "cache_creation_input_tokens": 1039
+    }
+   },
+   {
+    "task": "handoff",
+    "rep": 0,
+    "arm": "inherit",
+    "cost": 0.0123645,
+    "children": 1,
+    "child_tokens": 7291,
+    "child_cost_units": 8113,
+    "contract": [
+     "plain"
+    ],
+    "correct": false,
+    "result": "Release Marlin handoff: codename Marlin; deadline 2027-03-21 (moved from 2027-03-14); owner Priya Raman; budget cap 4200 EUR (3800 EUR is obsolete); rejected vendor Acme Corp.",
+    "usage": {
+     "input_tokens": 66827,
+     "output_tokens": 333,
+     "cached_input_tokens": 65845,
+     "cache_creation_input_tokens": 972
+    }
+   },
+   {
+    "task": "handoff",
+    "rep": 1,
+    "arm": "inherit",
+    "cost": 0.033675,
+    "children": 1,
+    "child_tokens": 15483,
+    "child_cost_units": 24504,
+    "contract": [
+     "pass"
+    ],
+    "correct": true,
+    "result": "Release Marlin \u2014 deadline 2027-03-21, owner Priya Raman, budget cap 4200 EUR, rejected vendor Acme Corp.",
+    "usage": {
+     "input_tokens": 75478,
+     "output_tokens": 551,
+     "cached_input_tokens": 66885,
+     "cache_creation_input_tokens": 8581
+    }
+   },
+   {
+    "task": "handoff",
+    "rep": 1,
+    "arm": "fresh",
+    "cost": 0.0299031,
+    "children": 1,
+    "child_tokens": 7228,
+    "child_cost_units": 14620,
+    "contract": [
+     "plain"
+    ],
+    "correct": true,
+    "result": "Marlin release handoff: deadline 2027-03-21, owner Priya Raman, budget cap 4200 EUR, rejected vendor Acme Corp.",
+    "usage": {
+     "input_tokens": 67285,
+     "output_tokens": 421,
+     "cached_input_tokens": 59381,
+     "cache_creation_input_tokens": 7894
+    }
+   },
+   {
+    "task": "drain",
+    "rep": 0,
+    "arm": "fresh",
+    "cost": 0.0141961,
+    "children": 1,
+    "child_tokens": 7260,
+    "child_cost_units": 8379,
+    "contract": [
+     "plain"
+    ],
+    "correct": true,
+    "result": "Drain **web-3**, which has the highest load at 90. Its load is split equally, 45 each, across the other two servers:\n\n- web-1: 71 + 45 = **116**\n- web-2: 52 + 45 = **97**\n\nThe total is unchanged at 213.",
+    "usage": {
+     "input_tokens": 66115,
+     "output_tokens": 536,
+     "cached_input_tokens": 65186,
+     "cache_creation_input_tokens": 919
+    }
+   },
+   {
+    "task": "drain",
+    "rep": 0,
+    "arm": "inherit",
+    "cost": 0.019147,
+    "children": 1,
+    "child_tokens": 7296,
+    "child_cost_units": 8472,
+    "contract": [
+     "plain"
+    ],
+    "correct": true,
+    "result": "Drain **web-3**, which is the busiest at 90. Its load is split evenly across the other two servers, so each gets +45:\n\n- web-1: 71 + 45 = **116**\n- web-2: 52 + 45 = **97**\n\nThe total stays at 213.",
+    "usage": {
+     "input_tokens": 95910,
+     "output_tokens": 655,
+     "cached_input_tokens": 94655,
+     "cache_creation_input_tokens": 1243
+    }
+   },
+   {
+    "task": "drain",
+    "rep": 1,
+    "arm": "inherit",
+    "cost": 0.0454029,
+    "children": 1,
+    "child_tokens": 10861,
+    "child_cost_units": 24624,
+    "contract": [
+     "repaired"
+    ],
+    "correct": true,
+    "result": "Drain **web-3**, which is the busiest at 90. Its load splits evenly, 45 to each remaining server:\n\n- **web-1:** 71 + 45 = **116**\n- **web-2:** 52 + 45 = **97**\n\nBoth new loads are above the old maximum of 90. The rule doesn't say whether that is acceptable. The child also read \"evenly\" as an equal split (45 each) rather than a split proportional to current load.",
+    "usage": {
+     "input_tokens": 69163,
+     "output_tokens": 1266,
+     "cached_input_tokens": 58399,
+     "cache_creation_input_tokens": 10750
+    }
+   },
+   {
+    "task": "drain",
+    "rep": 1,
+    "arm": "fresh",
+    "cost": 0.0235016,
+    "children": 1,
+    "child_tokens": 10403,
+    "child_cost_units": 14710,
+    "contract": [
+     "repaired"
+    ],
+    "correct": true,
+    "result": "Drain **web-3**, which has the highest load at 90. Its load splits equally across the two remaining servers, 45 each. The new loads are:\n\n- **web-1:** 71 + 45 = **116**\n- **web-2:** 52 + 45 = **97**\n\nThe total load is unchanged at 213. The child worked only from the loads I gave it and did not check them against a live system.",
+    "usage": {
+     "input_tokens": 68962,
+     "output_tokens": 1055,
+     "cached_input_tokens": 66436,
+     "cache_creation_input_tokens": 2512
+    }
+   },
+   {
+    "task": "naming",
+    "rep": 0,
+    "arm": "fresh",
+    "cost": 0.0189756,
+    "children": 1,
+    "child_tokens": 7535,
+    "child_cost_units": 9229,
+    "contract": [
+     "plain"
+    ],
+    "correct": true,
+    "result": "The child returned these names:\n\n1. `ma_is_admin_p` is boolean, so it gets `_p`. It doesn't use the network.\n2. `ma_fetch_latest_price_net` touches the network, so it gets `_net`. It returns a price, so it doesn't get `_p`.\n3. `ma_compute_total` is pure computation, so it gets only the `ma_` prefix.\n\nThe rules fix the prefix and suffixes but not the middle words. The child chose `is_admin`, `fetch_latest_price` and `compute_total` from the descriptions.",
+    "usage": {
+     "input_tokens": 66578,
+     "output_tokens": 903,
+     "cached_input_tokens": 65206,
+     "cache_creation_input_tokens": 1362
+    }
+   },
+   {
+    "task": "naming",
+    "rep": 0,
+    "arm": "inherit",
+    "cost": 0.017014,
+    "children": 1,
+    "child_tokens": 14764,
+    "child_cost_units": 17206,
+    "contract": [
+     "plain"
+    ],
+    "correct": false,
+    "result": "1. `ma_user_admin_p`\n2. `ma_fetch_latest_price_net`\n3. `ma_compute_total`",
+    "usage": {
+     "input_tokens": 73336,
+     "output_tokens": 696,
+     "cached_input_tokens": 72200,
+     "cache_creation_input_tokens": 1124
+    }
+   },
+   {
+    "task": "naming",
+    "rep": 1,
+    "arm": "inherit",
+    "cost": 0.0303674,
+    "children": 1,
+    "child_tokens": 7391,
+    "child_cost_units": 15720,
+    "contract": [
+     "plain"
+    ],
+    "correct": true,
+    "result": "1. `ma_user_is_admin_p`\n2. `ma_fetch_latest_price_net`\n3. `ma_compute_total`\n\nThe child took the naming rules from our conversation. It did not check them against the repository or look for existing functions.",
+    "usage": {
+     "input_tokens": 66016,
+     "output_tokens": 549,
+     "cached_input_tokens": 58399,
+     "cache_creation_input_tokens": 7607
+    }
+   },
+   {
+    "task": "naming",
+    "rep": 1,
+    "arm": "fresh",
+    "cost": 0.0197999,
+    "children": 1,
+    "child_tokens": 7617,
+    "child_cost_units": 9462,
+    "contract": [
+     "plain"
+    ],
+    "correct": false,
+    "result": "The child returned these names:\n\n1. `ma_user_admin_p`\n2. `ma_fetch_latest_price_net`\n3. `ma_compute_total`\n\nThe child noted that my brief was muddled about suffix order when both `_p` and `_net` apply. It read that as `_p` first, then `_net`. None of these three functions is both boolean and networked, so the names aren't affected. The base words (`user_admin`, `fetch_latest_price`, `compute_total`) were the child's own choice.",
+    "usage": {
+     "input_tokens": 66685,
+     "output_tokens": 933,
+     "cached_input_tokens": 65099,
+     "cache_creation_input_tokens": 1576
+    }
+   }
+  ]
+ },
+ "compaction": {
+  "mid_turn_run": {
+   "context_window": 60000,
+   "files": "8 files, 331645 bytes total",
+   "cost_usd": 0.994336,
+   "compactions": 7,
+   "summariser_usage": {
+    "input_tokens": 362813,
+    "cached_input_tokens": 223538,
+    "cache_creation_input_tokens": 139247,
+    "output_tokens": 6282,
+    "cost_usd": 0.4333473
+   },
+   "per_compaction": [
+    [
+     50951,
+     50144,
+     803,
+     0.0146
+    ],
+    [
+     51635,
+     28899,
+     22732,
+     0.0677
+    ],
+    [
+     51897,
+     28899,
+     22994,
+     0.0694
+    ],
+    [
+     51935,
+     28899,
+     23032,
+     0.0699
+    ],
+    [
+     52190,
+     28899,
+     23287,
+     0.0714
+    ],
+    [
+     52204,
+     28899,
+     23301,
+     0.0704
+    ],
+    [
+     52001,
+     28899,
+     23098,
+     0.0699
+    ]
+   ],
+   "per_compaction_columns": [
+    "input_tokens",
+    "cached_input_tokens",
+    "cache_creation_input_tokens",
+    "cost_usd"
+   ]
+  },
+  "between_turns_run": {
+   "turn1": {
+    "context_window": 150000,
+    "cost_usd": 0.2371153
+   },
+   "turn2": {
+    "context_window": 60000,
+    "compactions": 1,
+    "summariser_usage": {
+     "input_tokens": 7605,
+     "cached_input_tokens": 0,
+     "cache_creation_input_tokens": 861,
+     "output_tokens": 1008,
+     "cost_usd": 0.0257205
+    },
+    "turn_cost_usd": 0.2643284
+   }
+  }
+ },
+ "total_spend_usd": 6.01
+}

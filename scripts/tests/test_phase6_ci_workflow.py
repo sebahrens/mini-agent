@@ -155,6 +155,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         "clippy", "test", "all-features", "parallel-test-smoke",
         "windows-default-compile", "windows-hooks-compile", "mcp-stdio", "lsp-lifecycle",
     )
+    SHARED_CACHE_JOBS = ("test", "parallel-test-smoke", "windows-default-compile")
     CLEAN_ROOM_CONTAINMENT_JOBS = (
         "macos-worker-containment-gate", "windows-worker-containment-gate",
         "windows-general-sandbox-policy", "phase6-cross-platform-gate",
@@ -175,9 +176,24 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     body.index("- name: Install Rust"),
                 )
                 rust = body.split("- name: Install Rust\n", 1)[1].split("\n      - name:", 1)[0]
-                self.assertIn("cache-key: ${{ steps.cache-key.outputs.key }}", rust)
-                self.assertNotIn("cache-shared-key:", rust)
+                # Jobs that build the identical dependency graph share one cache
+                # through the derived key (OS, ImageOS and row all inside it), so
+                # the shared key can never revive cross-image restoration.
+                self.assertIn(
+                    "cache-shared-key: ${{ steps.cache-key.outputs.key }}"
+                    if name in self.SHARED_CACHE_JOBS
+                    else "cache-key: ${{ steps.cache-key.outputs.key }}",
+                    rust,
+                )
                 self.assertNotRegex(rust, r"(?m)^          cache: false")
+                # Pull requests restore main's caches and never save their own.
+                save_if = re.search(r"(?m)^          cache-save-if: (.*)$", rust)
+                self.assertIsNotNone(save_if, f"{name} must declare cache-save-if")
+                self.assertTrue(
+                    save_if.group(1) == '"false"'
+                    or save_if.group(1).startswith("${{ github.ref == 'refs/heads/main'"),
+                    save_if.group(1),
+                )
 
     def test_containment_gates_stay_uncached_for_clean_room_evidence(self) -> None:
         for name in self.CLEAN_ROOM_CONTAINMENT_JOBS:
@@ -726,6 +742,33 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             },
         )
 
+    def test_pull_requests_run_only_the_default_macos_test_row(self) -> None:
+        # The non-default macOS rows and the macOS parallel smoke are removed
+        # from the pull-request matrix (not skipped), so ci-success keeps
+        # seeing a plain success for `test` and `parallel-test-smoke`.
+        pr_os = (
+            "os: ${{ github.event_name == 'pull_request' "
+            "&& 'macos-latest' || 'not-excluded' }}"
+        )
+        header = job_body(self.workflow, "test").split("    steps:\n", 1)[0]
+        dynamic = re.findall(
+            r'- ' + re.escape(pr_os) + r'\n\s+features: "([^"]*)"', header
+        )
+        self.assertEqual(
+            set(dynamic),
+            {
+                "--no-default-features --features sandbox",
+                "--no-default-features --features js",
+                "--no-default-features --features js,sandbox",
+                "--no-default-features --features hooks,advisor,lsp,multimodal,pdf",
+                "--no-default-features --features hooks,js,subagents,skills,sandbox",
+            },
+        )
+        self.assertNotIn("", dynamic)
+        smoke = job_body(self.workflow, "parallel-test-smoke").split("    steps:\n", 1)[0]
+        self.assertIn("- " + pr_os + "\n", smoke)
+        self.assertNotIn("pull_request", job_body(self.workflow, "ci-success"))
+
     def test_matrix_isolates_process_global_worker_and_skill_tests(self) -> None:
         body = job_body(self.workflow, "test")
         full_path = (
@@ -806,8 +849,19 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         all_features_header = job_body(self.workflow, "all-features").split(
             "    steps:\n", 1
         )[0]
-        for header in (matrix_header, all_features_header):
-            self.assertIn("RUST_MIN_STACK: 8388608", header)
+        self.assertIn("RUST_MIN_STACK: 8388608", all_features_header)
+        # The matrix job exports it after Install Rust so the variable does not
+        # enter rust-cache's key and split the cache it shares with other jobs.
+        test_body = job_body(self.workflow, "test")
+        self.assertNotIn("RUST_MIN_STACK", matrix_header)
+        self.assertLess(
+            test_body.index("- name: Install Rust"),
+            test_body.index("echo 'RUST_MIN_STACK=8388608' >> \"$GITHUB_ENV\""),
+        )
+        self.assertLess(
+            test_body.index("echo 'RUST_MIN_STACK=8388608' >> \"$GITHUB_ENV\""),
+            test_body.index("on Linux"),
+        )
 
         all_features = job_body(self.workflow, "all-features")
         main_step = all_features.split("name: Test all features", 1)[1].split(
