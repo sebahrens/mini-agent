@@ -1935,25 +1935,7 @@ impl<'a> App<'a> {
                 Some(event) = recv_agent_stream_item(&mut self.run.agent_rx), if self.run.agent_rx.is_some() => {
                     match event {
                         AgentStreamItem::Event(event) => {
-                            if match &event {
-                                AgentEvent::ToolResult { name, .. } => {
-                                    crate::agent::runner::tool_may_mutate_workspace(name)
-                                }
-                                AgentEvent::FileMutation { .. }
-                                | AgentEvent::Done { .. }
-                                | AgentEvent::Error { .. } => true,
-                                _ => false,
-                            } {
-                                self.loop_state.git_poll.mark_changed(std::time::Instant::now());
-                            }
-                            // This measured large child is unrelated to input, but
-                            // its inline storage inflated every event-loop poll.
-                            crate::startup::heap_future(|| self.handle_agent_event(event)).await?;
-                            // Streaming paints the chat directly and would leave an
-                            // open picker erased until the next key; repaint it.
-                            if self.input.picker.as_ref().is_some_and(|picker| picker.active()) {
-                                self.refresh()?;
-                            }
+                            self.handle_agent_stream_event(event).await?;
                         }
                         AgentStreamItem::Closed => {
                             crate::startup::heap_future(|| self.handle_agent_stream_closed()).await?;
@@ -2975,6 +2957,28 @@ impl<'a> App<'a> {
         crate::startup::heap_future(|| self.handle_standard_user_event(ev)).await
     }
 
+    /// A plain Esc stops a running turn only when nothing else owns Esc: no
+    /// prompt, picker, selection, search, plan approval, share or Vim editor
+    /// (mini-agent-z8nnm). Idle Esc keeps its rewind meaning.
+    fn esc_interrupts_run(&self, key: KeyEvent) -> bool {
+        let owned = self.permission_prompt.is_some()
+            || self.question_prompt.is_some()
+            || self.renderer.chain_prompt.is_some()
+            || self.renderer.chain_but_mode
+            || self.renderer.selection_active
+            || self.transcript_search.is_some()
+            || self.chain.plan.pending.is_some()
+            || self.input.picker.as_ref().is_some_and(Picker::active)
+            || self.input.vim_enabled();
+        #[cfg(feature = "export")]
+        let owned = owned || share_app::cancel_active();
+        key.code == KeyCode::Esc
+            && key.modifiers.is_empty()
+            && key.kind == crossterm::event::KeyEventKind::Press
+            && (self.run.is_running || self.run.validation_active())
+            && !owned
+    }
+
     /// Modal/operator choices retain their raw default keys. Configuration
     /// cannot synthesize an approval or steal a picker's query/navigation.
     fn keyboard_action(&self, key: KeyEvent) -> Option<KeyAction> {
@@ -3187,7 +3191,7 @@ impl<'a> App<'a> {
                     _ => {}
                 }
                 let is_ctrl_c = action == Some(KeyAction::Interrupt);
-                let is_ctrl_d = action == Some(KeyAction::Eof);
+                let is_ctrl_d = action == Some(KeyAction::Eof) || self.esc_interrupts_run(key);
                 if is_ctrl_c {
                     let validation_active = self.run.validation_active();
                     let target =
@@ -4035,6 +4039,42 @@ impl<'a> App<'a> {
             && self.run.pending_turn.is_some()
             && self.ui.cfg.resolve_compact_enabled()
             && crate::retry::is_context_length_error_message(message)
+    }
+
+    /// One event from the running turn, plus the repaint it owes. A turn end
+    /// flips `is_running` without any input event to follow it, so the status
+    /// row, spinner and terminal title must be redrawn here (mini-agent-xm2tu).
+    async fn handle_agent_stream_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {
+        if match &event {
+            AgentEvent::ToolResult { name, .. } => {
+                crate::agent::runner::tool_may_mutate_workspace(name)
+            }
+            AgentEvent::FileMutation { .. }
+            | AgentEvent::Done { .. }
+            | AgentEvent::Error { .. } => true,
+            _ => false,
+        } {
+            self.loop_state
+                .git_poll
+                .mark_changed(std::time::Instant::now());
+        }
+        let was_running = self.run.is_running;
+        // This measured large child is unrelated to input, but its inline
+        // storage inflated every event-loop poll.
+        crate::startup::heap_future(|| self.handle_agent_event(event)).await?;
+        // Streaming paints the chat directly and would leave an open picker
+        // erased until the next key; repaint it. A run-state change repaints
+        // the bottom region so the idle prompt replaces the spinner.
+        if was_running != self.run.is_running
+            || self
+                .input
+                .picker
+                .as_ref()
+                .is_some_and(|picker| picker.active())
+        {
+            self.refresh()?;
+        }
+        Ok(())
     }
 
     async fn handle_agent_event(&mut self, event: AgentEvent) -> anyhow::Result<()> {

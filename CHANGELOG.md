@@ -15,6 +15,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- Esc interrupts a running turn when no picker, prompt, selection or Vim editor owns it, and the status line shows `esc to interrupt` (`ctrl+c to interrupt` in Vim mode) (mini-agent-z8nnm).
 - `compact_size_fraction` (default 0.75; `0` disables) starts automatic compaction, between turns and at tool-batch boundaries, when the encoded session nears the 32 MiB save ceiling, so image-heavy sessions compact before saving stops (mini-agent-fmmhs).
 - TUI compaction on the session model over Anthropic or OpenAI forks the conversation's own request (same system prompt, tools and prefix, tools disabled) so the summary reads the prompt cache; other routes, a `compaction_model`, sessions with images or native replay history keep the text summarizer (mini-agent-o2nut).
 - `--stream-json-schema claude` partial streams now frame `message_start`/`content_block_start`/`content_block_stop`/`message_delta`/`message_stop` with per-block indexes; turn-budget exhaustion reports `error_max_turns`; results carry `uuid`, `duration_api_ms` and `permission_denials`, and records a `uuid` (mini-agent-5ux7e).
@@ -153,6 +154,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- The TUI repaints the idle prompt, spinner and terminal title as soon as a turn ends instead of waiting for a key press (mini-agent-xm2tu).
+- `/undo` + Enter runs the plain conversation undo; `/undo stash` needs an explicit argument (Tab) (mini-agent-zgfwi).
+- The permission prompt's option line wraps at option boundaries, not mid-word (mini-agent-wu1q9).
+- Headless `-p` prompts no longer enter the TUI input history (mini-agent-ukk9a).
 - Windows AppContainer shell: three opt-in, default-off, global-only keys fix the default-start symptoms for people who accept what they expose: `windows-appcontainer-ancestor-listing` (PowerShell starts in the workspace and `cmd dir`/Git resolve it: the container may list the names, sizes and timestamps in each parent of the workspace and the drive root; system-owned parents need an elevated launcher), `windows-appcontainer-null-device` (an elevated launcher lets Git, `>nul` and `DEVNULL` open NUL) and `windows-appcontainer-toolchain-discovery` (read/execute on the install directories of the python, node, ... a command names). Managed policy can force each off; a failure matching the symptom names the key; `--doctor` and `--print-config` show their state (mini-agent-p5g08, mini-agent-bybjh).
 - Windows AppContainer shell: cmd.exe no longer prints "Access is denied." before every command (its UTF-8 prelude redirected to `nul`), PowerShell output is plain text (no ANSI colour sequences in ACP), `--doctor` probes `python` then `py` through the configured shell and reports the failing line, and a failed command naming a program the host resolves says it is outside the read roots without showing host directories (mini-agent-p5g08, mini-agent-bybjh).
 - Windows: sessions started at the same time no longer fail the production preflight with "no successful production preflight" (preflights are serialised across processes and a live session's preflight root is skipped, not recovered), and the startup refusal includes the preflight reason (mini-agent-pc1dr).

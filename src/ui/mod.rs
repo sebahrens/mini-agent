@@ -355,16 +355,27 @@ fn draw_main_frame(
     let image_label = clipboard_image::labels(&ui.session.pending_media);
     #[cfg(not(feature = "multimodal"))]
     let image_label = String::new();
-    let statusline_key = if vim_label.is_empty() && image_label.is_empty() {
-        base_statusline_key
+    // The key that stops a running turn (mini-agent-z8nnm). Vim mode keeps Esc
+    // for the editor, so it advertises Ctrl+C there.
+    let interrupt_hint = if !run.is_running || renderer.permission_prompt.is_some() {
+        ""
+    } else if input.vim_enabled() {
+        "ctrl+c to interrupt"
     } else {
-        use std::hash::{Hash, Hasher};
-        let mut state = std::collections::hash_map::DefaultHasher::new();
-        base_statusline_key.hash(&mut state);
-        vim_label.hash(&mut state);
-        image_label.hash(&mut state);
-        state.finish()
+        "esc to interrupt"
     };
+    let statusline_key =
+        if vim_label.is_empty() && image_label.is_empty() && interrupt_hint.is_empty() {
+            base_statusline_key
+        } else {
+            use std::hash::{Hash, Hasher};
+            let mut state = std::collections::hash_map::DefaultHasher::new();
+            base_statusline_key.hash(&mut state);
+            vim_label.hash(&mut state);
+            image_label.hash(&mut state);
+            interrupt_hint.hash(&mut state);
+            state.finish()
+        };
     let statusline = renderer.cached_statusline(statusline_key, || {
         let mut lines = crate::ui::statusline::build(ui.session, &statusline_ctx);
         if !image_label.is_empty() {
@@ -410,6 +421,22 @@ fn draw_main_frame(
                     },
                 },
             );
+        }
+        if !interrupt_hint.is_empty()
+            && let Some(line) = lines.first_mut()
+        {
+            line.push(crate::ui::statusline::StatusSpan::Text {
+                text: format!(" {interrupt_hint}"),
+                fg: None,
+                bg: None,
+                layout: crate::ui::statusline::SpanLayout::Item {
+                    // Dropped first on a narrow terminal.
+                    priority: 1,
+                    plain: format!(" {interrupt_hint}"),
+                    compact: None,
+                    dynamic_color: false,
+                },
+            });
         }
         lines
     });

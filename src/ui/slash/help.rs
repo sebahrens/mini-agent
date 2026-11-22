@@ -641,6 +641,10 @@ fn keys_lines(
     );
     emit(
         false,
+        "  Esc                    interrupt a running turn (Ctrl+C with Vim mode)",
+    );
+    emit(
+        false,
         "  Esc Esc                rewind picker (empty input)",
     );
     emit(
