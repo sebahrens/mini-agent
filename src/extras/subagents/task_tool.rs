@@ -5701,6 +5701,7 @@ fn report_withheld_by_host(response: &str, violations: &[&'static str]) -> bool 
 /// not normalize is delivered as clearly delimited DATA by
 /// [`unstructured_report`] (mini-agent-zc1gc), bounded by the default output
 /// cap; the scheduler quotes the whole report again inside its fence.
+#[cfg(test)]
 fn host_repaired_report(response: &str, violations: &[&'static str]) -> String {
     host_repaired_report_bounded(response, violations, DEFAULT_MAX_OUTPUT_BYTES)
 }

@@ -6505,7 +6505,7 @@ where
                 Some(&mutations),
                 retry_config,
                 turn_token_budget,
-                history.into(),
+                history,
                 RunnerStreamPolicy::default(),
                 completion_verification,
                 native_capture,

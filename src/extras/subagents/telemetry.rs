@@ -75,8 +75,10 @@ pub(crate) struct ChildTelemetry {
     pub cost_units: u64,
 }
 
-static ROWS: LazyLock<Mutex<HashMap<String, (Vec<ChildTelemetry>, usize)>>> =
-    LazyLock::new(Default::default);
+/// Rows of one session and how many children finished in all.
+type SessionRows = (Vec<ChildTelemetry>, usize);
+
+static ROWS: LazyLock<Mutex<HashMap<String, SessionRows>>> = LazyLock::new(Default::default);
 
 /// Record a finished child for `session_id`.
 pub(crate) fn record(session_id: &str, row: ChildTelemetry) {
