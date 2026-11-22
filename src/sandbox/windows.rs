@@ -4092,6 +4092,10 @@ fn read_root_dacl_is_changeable(root: &Path) -> bool {
 /// attempted only then: that DACL is machine-global, and an unelevated process is expected to be
 /// refused by the kernel anyway, so the check keeps the attempt (and its journal entry) explicit.
 pub(crate) fn process_is_elevated() -> bool {
+    #[cfg(test)]
+    if TEST_FORCE_UNELEVATED.load(Ordering::Acquire) {
+        return false;
+    }
     let Ok(token) = primary_token() else {
         return false;
     };
@@ -5944,6 +5948,15 @@ fn sweep_stale_profile_journal(
     }
     journal_root.remove_file(path, "remove stale AppContainer journal")
 }
+
+/// Test hook: answer "not elevated" to exercise the unelevated paths on an elevated runner.
+#[cfg(test)]
+static TEST_FORCE_UNELEVATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Serialises the tests whose result depends on [`process_is_elevated`].
+#[cfg(test)]
+static ELEVATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Stale journals this process found that it could not fully clear (reported by `--doctor`).
 static RETAINED_STALE_JOURNALS: AtomicUsize = AtomicUsize::new(0);
@@ -8259,6 +8272,9 @@ mod tests {
 
     #[test]
     fn the_nul_device_ace_is_granted_and_revoked_only_when_elevated() {
+        let _serial = ELEVATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sid = sid_from_string("S-1-5-21-111-222-333-6666").unwrap();
         if !process_is_elevated() {
             // Unelevated runners must be refused by the kernel, not silently succeed.
@@ -8375,6 +8391,9 @@ mod tests {
 
     #[test]
     fn a_killed_helpers_nul_device_ace_is_revoked_by_the_next_sweep() {
+        let _serial = ELEVATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !process_is_elevated() {
             // The NUL ACE is written only by an elevated launcher; the unelevated retention
             // path is covered by the synthetic-journal test below.
@@ -8442,10 +8461,11 @@ mod tests {
     }
 
     #[test]
-    fn a_nul_journal_an_unelevated_sweep_cannot_clear_is_retained() {
-        if process_is_elevated() {
-            return;
-        }
+    fn a_nul_journal_an_unelevated_sweep_cannot_clear_is_retained_until_an_elevated_one_runs() {
+        let _serial = ELEVATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let really_elevated = process_is_elevated();
         let (parent, cache, workspace) = stale_sweep_parent();
         let journal_root = profile_journal_root(&cache, &[], &[]).expect("journal root");
         let name = format!(
@@ -8453,16 +8473,38 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         );
         let sid = derive_profile_sid(&name);
+        if really_elevated {
+            let device = open_null_device().expect("open the NUL device DACL");
+            change_null_device_ace(&device, sid.0, true).expect("seed the NUL ACE");
+        }
         let journal =
             publish_synthetic_stale_journal(&journal_root, &name, &sid, vec![workspace], true);
+
+        // A launcher that is not elevated cannot withdraw the NUL ACE: the journal is kept.
+        TEST_FORCE_UNELEVATED.store(true, Ordering::Release);
         let before = retained_stale_journals();
-        sweep_stale_profiles_until(&journal_root, Instant::now() + Duration::from_secs(60))
-            .expect("an unrevokable NUL entry never fails the sweep");
+        let unelevated =
+            sweep_stale_profiles_until(&journal_root, Instant::now() + Duration::from_secs(60));
+        TEST_FORCE_UNELEVATED.store(false, Ordering::Release);
+        unelevated.expect("an unrevokable NUL entry never fails the sweep");
         assert!(
             journal.exists(),
             "the journal is kept for an elevated launcher"
         );
         assert!(retained_stale_journals() > before);
+        if really_elevated {
+            assert!(null_device_has_ace_for(sid.0), "nothing was revoked");
+        }
+
+        // The next elevated sweep (a real one only when this runner is elevated) clears it.
+        if really_elevated {
+            sweep_stale_profiles_until(&journal_root, Instant::now() + Duration::from_secs(60))
+                .expect("an elevated sweep clears the retained journal");
+            assert!(!null_device_has_ace_for(sid.0));
+            assert!(!journal.exists());
+        } else {
+            std::fs::remove_file(&journal).expect("remove the retained fixture journal");
+        }
         drop(journal_root);
         let _ = std::fs::remove_dir_all(parent);
     }

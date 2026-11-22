@@ -1856,7 +1856,7 @@ jobs:
             'preflight_root_authority_attests_exact_noninheriting_package_traversal',
             'vanished_stale_journal_is_skipped_not_fatal',
             'a_killed_helpers_nul_device_ace_is_revoked_by_the_next_sweep',
-            'a_nul_journal_an_unelevated_sweep_cannot_clear_is_retained',
+            'a_nul_journal_an_unelevated_sweep_cannot_clear_is_retained_until_an_elevated_one_runs',
             'a_sweep_repairs_a_revoke_killed_after_the_root_ace_was_removed',
             'a_non_local_dacl_on_an_ancestor_is_refused_not_propagated',
             'preflight_diagnostics_bound_closed_timing_and_late_exit_categories',
