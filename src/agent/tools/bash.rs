@@ -2716,17 +2716,38 @@ fn host_path_extensions() -> Vec<String> {
         .collect()
 }
 
-/// What to tell the user to change so a host-resolvable program becomes runnable.
-fn toolchain_advice(sandbox: &Sandbox) -> Option<String> {
+/// What to tell the user to change so a host-resolvable program becomes runnable. `directories`
+/// are the install directories that the opt-in toolchain grant would add for the unrunnable
+/// programs (resolved from the host `PATH`, never from sandboxed output).
+fn toolchain_advice(sandbox: &Sandbox, directories: &[String]) -> Option<String> {
     match sandbox.backend_name() {
-        "appcontainer" if !sandbox.windows_toolchain_discovery() => Some(
-            "Setting `windows-appcontainer-toolchain-discovery = true` (global config; read and execute only, and an administrator-owned install also needs an elevated launcher) or adding its install directory to `windows-appcontainer-read-roots` makes it runnable (restart required)."
-                .to_string(),
-        ),
-        "appcontainer" => Some(
-            "Add its install directory to `windows-appcontainer-read-roots` (restart required; an administrator-owned install also needs an elevated launcher)."
-                .to_string(),
-        ),
+        "appcontainer" => {
+            let usable: Vec<&String> = directories
+                .iter()
+                .filter(|directory| !directory.contains(['\'', '"', '\n']))
+                .collect();
+            let recipe = if usable.is_empty() {
+                "add its install directory to `windows-appcontainer-read-roots`".to_string()
+            } else {
+                let listed = usable
+                    .iter()
+                    .map(|directory| format!("'{directory}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "add the directory to the global config, for example `windows-appcontainer-read-roots = [{listed}]`"
+                )
+            };
+            if sandbox.windows_toolchain_discovery() {
+                Some(format!(
+                    "`windows-appcontainer-toolchain-discovery` is on but did not grant it; {recipe} (restart required; an administrator-owned install also needs an elevated launcher)."
+                ))
+            } else {
+                Some(format!(
+                    "One step: {recipe} (read and execute only; restart required; an administrator-owned install also needs an elevated launcher). Setting `windows-appcontainer-toolchain-discovery = true` grants such directories automatically for commands that name them."
+                ))
+            }
+        }
         "bwrap" => Some(
             "Add its install directory to `sandbox-toolchain-roots` (restart required)."
                 .to_string(),
@@ -2752,7 +2773,7 @@ fn off_executor<T>(work: impl FnOnce() -> T) -> T {
 /// roots and which setting changes that. Only the program's name and the setting are shown (never
 /// a host directory), and the only paths touched are the host `PATH` directories.
 fn host_command_unrunnable_hint(sandbox: &Sandbox, output: &str) -> Option<String> {
-    let advice = toolchain_advice(sandbox)?;
+    toolchain_advice(sandbox, &[])?;
     let path_var = std::env::var_os("PATH")?;
     let path_directories: Vec<String> = std::env::split_paths(&path_var)
         .map(|directory| directory.to_string_lossy().into_owned())
@@ -2762,12 +2783,18 @@ fn host_command_unrunnable_hint(sandbox: &Sandbox, output: &str) -> Option<Strin
         return None;
     }
     let extensions = host_path_extensions();
-    let located: Vec<String> = off_executor(|| {
+    let located: Vec<(String, Option<String>)> = off_executor(|| {
         missing
             .into_iter()
-            .filter(|name| {
-                crate::sandbox::windows_toolchains::resolve_on_path(name, &path_var, &extensions)
-                    .is_some()
+            .filter_map(|name| {
+                let found = crate::sandbox::windows_toolchains::resolve_on_path(
+                    &name,
+                    &path_var,
+                    &extensions,
+                )?;
+                let directory = crate::sandbox::windows_toolchains::proposed_directory(&found)
+                    .map(|directory| directory.to_string_lossy().into_owned());
+                Some((name, directory))
             })
             .collect()
     });
@@ -2776,9 +2803,20 @@ fn host_command_unrunnable_hint(sandbox: &Sandbox, output: &str) -> Option<Strin
     }
     let listed = located
         .iter()
-        .map(|name| format!("`{name}`"))
+        .map(|(name, _)| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(", ");
+    let mut directories: Vec<String> = Vec::new();
+    for directory in located
+        .iter()
+        .filter_map(|(_, directory)| directory.as_ref())
+    {
+        let directory = crate::sandbox::strip_verbatim_prefix(directory);
+        if !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    let advice = toolchain_advice(sandbox, &directories)?;
     Some(format!(
         "The program(s) {listed} exist on the host but the sandbox cannot run them: they are outside the sandbox's read roots. {advice}"
     ))
@@ -4191,18 +4229,38 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_toolchain_hint_names_discovery_when_it_is_off_and_read_roots_when_it_is_on() {
+    fn the_toolchain_hint_gives_a_one_step_read_root_recipe_with_the_resolved_directory() {
         let off = Sandbox::new(true, "appcontainer");
         let note = sandbox_failure_note(&off, false, true, "bash: sh: command not found").unwrap();
         assert!(
-            note.contains("windows-appcontainer-toolchain-discovery"),
+            note.contains("windows-appcontainer-toolchain-discovery = true"),
             "{note}"
         );
-        assert!(note.contains("windows-appcontainer-read-roots"), "{note}");
+        assert!(
+            note.contains("windows-appcontainer-read-roots = ['"),
+            "{note}"
+        );
+        assert!(note.contains("One step:"), "{note}");
+        // The directory named is the one the opt-in grant would add: the resolved program's own.
+        let found = crate::sandbox::windows_toolchains::resolve_on_path(
+            "sh",
+            &std::env::var_os("PATH").unwrap(),
+            &[],
+        )
+        .unwrap();
+        let proposed = crate::sandbox::windows_toolchains::proposed_directory(&found).unwrap();
+        assert!(
+            note.contains(&format!("'{}'", proposed.display())),
+            "{note}"
+        );
         let on = Sandbox::new(true, "appcontainer").with_windows_toolchain_discovery(true);
         let note = sandbox_failure_note(&on, false, true, "bash: sh: command not found").unwrap();
-        assert!(!note.contains("toolchain-discovery"), "{note}");
-        assert!(note.contains("windows-appcontainer-read-roots"), "{note}");
+        assert!(note.contains("is on but did not grant it"), "{note}");
+        assert!(!note.contains("= true"), "{note}");
+        assert!(
+            note.contains("windows-appcontainer-read-roots = ['"),
+            "{note}"
+        );
     }
 
     #[cfg(unix)]
