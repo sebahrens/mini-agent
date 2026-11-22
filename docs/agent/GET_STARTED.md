@@ -441,7 +441,7 @@ wait immediately; completed work and accounting are retained before final output
 
 `--output stream-json` writes one JSON object per line: `system` (logical session ID/name,
 provider/model, and `ephemeral`), `assistant_text`, `tool_call`, `tool_result`, `usage`, optional
-`goal` updates, optional `file_mutation` records, and a final `result`. Calls and results share `id`; `provider_call_id` records
+`goal` updates, optional `file_mutation` records, `subagent_started` and `subagent_tool_call` records (see below), and a final `result`. Calls and results share `id`; `provider_call_id` records
 the provider identifier separately (its preview is capped at 512 bytes). Tool result events include `is_error`; text/arguments and
 tool previews are limited to 8 KiB (`--stream-json-preview-bytes`) and mark truncation. JSON escapes terminal control and deceptive
 Unicode characters while preserving decoded argument data. These events reflect observed SDK
@@ -472,6 +472,7 @@ unchanged. Mapping:
 | `tool_result` | `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":...,"content":...,"is_error":...}]}}` |
 | `text_delta` / `reasoning_delta` (`--include-partial-messages`) | `stream_event` records framed per message: `message_start`, then per content block `content_block_start` (own `index`; thinking and text never share one), `content_block_delta` with that `index`, `content_block_stop`, and `message_delta` + `message_stop` when the final `assistant` record (or the `result`) arrives |
 | `result` | same fields plus `subtype` (`success`, `error_max_turns` for turn-budget exhaustion, `error_max_budget_usd`, `error_during_execution`), `uuid`, `duration_api_ms` (model-wait time; tool execution excluded), `permission_denials` (always `[]`; denied calls appear as error tool results) and `usage.cache_read_input_tokens`; `duration_ms`, `num_turns`, `is_error`, `total_cost_usd` as above |
+| `subagent_started` (`agent_type`, `source`), `subagent_tool_call` (`name`, `args`, `truncated`) | pass through unchanged; both carry `parent_tool_use_id`, the `id` of the outer `task` `tool_call`, and appear between that call and its `tool_result` for foreground children (background children are not streamed; `/tasks <id>` shows their bounded tool log) |
 | `usage`, `file_mutation`, `file_mutation_gap`, `goal`, `system` `capabilities`, `input_error`, `control_request` | pass through unchanged (extension records without a Claude counterpart; consumers should ignore unknown types) |
 
 A record whose text or arguments were cut at `--stream-json-preview-bytes` carries `"truncated":true`.

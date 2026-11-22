@@ -6507,7 +6507,49 @@ where
         }
         turn
     });
-    crate::agent::tools::mutation_diff::scope_observer(mutations.observer(), work).await
+    let work = crate::agent::tools::mutation_diff::scope_observer(mutations.observer(), work);
+    // Foreground subagents report their start and tool calls through the
+    // parent's event channel; headless runs had none (mini-agent-zdcj5). Only
+    // stream-json shows them, so other formats keep the old, channel-less path.
+    #[cfg(feature = "subagents")]
+    if output.format == crate::cli::OutputFormat::StreamJson {
+        return run_with_subagent_events(output, work).await;
+    }
+    work.await
+}
+
+/// Drive `work` while draining the subagent events its children send, emitting
+/// each as a stream-json record. Events still queued when `work` ends are
+/// flushed; a child clone of the sender cannot keep this waiting.
+#[cfg(feature = "subagents")]
+async fn run_with_subagent_events<F>(
+    output: crate::print::HeadlessOutputPolicy,
+    work: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    let (tx, mut rx) = mpsc::channel(256);
+    let scoped = crate::extras::subagents::scope_subagent_event_tx(tx, work);
+    tokio::pin!(scoped);
+    let mut open = true;
+    let result = loop {
+        tokio::select! {
+            biased;
+            event = rx.recv(), if open => match event {
+                Some(event) => {
+                    let _ = output.subagent_event(&event).await;
+                }
+                None => open = false,
+            },
+            result = &mut scoped => break result,
+        }
+    };
+    rx.close();
+    while let Ok(event) = rx.try_recv() {
+        let _ = output.subagent_event(&event).await;
+    }
+    result
 }
 
 // Mirrors `run_print`'s public parameter list plus the test-only stream policy;
@@ -7754,6 +7796,37 @@ where
 mod tests {
     // mini-agent-sskdu.100: the envelope test needs no `Value` tree and keeps
     // the same verdicts.
+    // mini-agent-zdcj5: stream-json headless runs give foreground children an
+    // event channel, drained while the turn runs, and flush it when done.
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn stream_json_headless_runs_scope_a_subagent_event_channel() {
+        let output = crate::print::HeadlessOutputPolicy {
+            format: crate::cli::OutputFormat::StreamJson,
+            pure_stdout: false,
+            quiet: true,
+            legacy_stream: false,
+        };
+        assert!(crate::extras::subagents::clone_subagent_event_tx().is_none());
+        let seen = super::run_with_subagent_events(output, async {
+            let tx = crate::extras::subagents::clone_subagent_event_tx()
+                .expect("children can reach the channel");
+            for n in 0..400 {
+                // More than the channel holds: the drain keeps it moving.
+                tx.send(crate::event::AgentEvent::SubagentToolCall {
+                    name: "read".into(),
+                    args: serde_json::json!({"n": n}),
+                    outer: None,
+                })
+                .await
+                .unwrap();
+            }
+            "done"
+        })
+        .await;
+        assert_eq!(seen, "done");
+    }
+
     #[test]
     fn image_envelope_detection_matches_the_value_based_check() {
         use super::result_has_image_parts as has;

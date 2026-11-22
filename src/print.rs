@@ -715,6 +715,32 @@ pub(crate) struct HeadlessOutputPolicy {
     pub legacy_stream: bool,
 }
 
+/// The stream-json record of a subagent event (mini-agent-zdcj5), tagged with
+/// the outer `task` call's id; `None` for every other event.
+#[cfg(feature = "subagents")]
+fn subagent_event_record(event: &crate::event::AgentEvent) -> Option<serde_json::Value> {
+    use crate::event::AgentEvent;
+    Some(match event {
+        AgentEvent::SubagentStarted {
+            agent_type,
+            source,
+            outer,
+        } => {
+            let (agent_type, _) = bounded_progress(agent_type, 256);
+            let (source, _) = bounded_progress(source, 512);
+            serde_json::json!({"type":"subagent_started", "agent_type":agent_type,
+                "source":source, "parent_tool_use_id":outer})
+        }
+        AgentEvent::SubagentToolCall { name, args, outer } => {
+            let (args, truncated) = bounded_json_value(args, progress_bytes());
+            let (name, name_truncated) = bounded_progress(name, 256);
+            serde_json::json!({"type":"subagent_tool_call", "name":name, "args":args,
+                "truncated":truncated || name_truncated, "parent_tool_use_id":outer})
+        }
+        _ => return None,
+    })
+}
+
 /// The opt-in token-level record; `text` is already bounded by the caller.
 fn partial_event(kind: &str, text: &str, truncated: bool) -> serde_json::Value {
     serde_json::json!({"type":kind, "message_id":current_message_id(), "text":text, "truncated":truncated})
@@ -781,6 +807,21 @@ impl HeadlessOutputPolicy {
             }
         }
         Ok(())
+    }
+
+    /// A subagent's start or tool call as a stream-json record tagged with the
+    /// outer `task` call's id (`parent_tool_use_id`), so automation can see a
+    /// child's progress between the `task` tool_call and its tool_result
+    /// (mini-agent-zdcj5). Other events and other formats emit nothing.
+    #[cfg(feature = "subagents")]
+    pub(crate) async fn subagent_event(
+        self,
+        event: &crate::event::AgentEvent,
+    ) -> anyhow::Result<()> {
+        match subagent_event_record(event) {
+            Some(record) => self.emit_event(record).await,
+            None => Ok(()),
+        }
     }
 
     /// A provider retry, so a run waiting out a long `Retry-After` does not
@@ -4108,6 +4149,39 @@ mod headless_goal_tests {
 
 #[cfg(test)]
 mod tests {
+    // mini-agent-zdcj5: child progress is a stream-json record tagged with the
+    // outer task call's id.
+    #[cfg(feature = "subagents")]
+    #[test]
+    fn subagent_events_become_tagged_stream_records() {
+        use crate::event::AgentEvent;
+        let started = super::subagent_event_record(&AgentEvent::SubagentStarted {
+            agent_type: "explore".into(),
+            source: "compiled-in explorer".into(),
+            outer: Some("call-7".into()),
+        })
+        .unwrap();
+        assert_eq!(started["type"], "subagent_started");
+        assert_eq!(started["parent_tool_use_id"], "call-7");
+        assert_eq!(started["agent_type"], "explore");
+        let call = super::subagent_event_record(&AgentEvent::SubagentToolCall {
+            name: "read".into(),
+            args: serde_json::json!({"path": "src/a.rs"}),
+            outer: None,
+        })
+        .unwrap();
+        assert_eq!(call["type"], "subagent_tool_call");
+        assert_eq!(call["args"]["path"], "src/a.rs");
+        assert!(call["parent_tool_use_id"].is_null());
+        assert!(
+            super::subagent_event_record(&AgentEvent::ToolLoop {
+                name: "read".into(),
+                message: "x".into(),
+            })
+            .is_none()
+        );
+    }
+
     // mini-agent-nvnkx.17
     #[test]
     fn a_retry_is_visible_as_a_stderr_line_and_a_stream_json_event() {
