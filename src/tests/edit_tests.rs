@@ -1702,3 +1702,43 @@ async fn utf16_bom_files_are_read_decoded_and_edited_in_their_own_encoding() {
     assert!(error.contains("UTF-16 byte-order mark"), "{error}");
     assert_eq!(std::fs::read(broken.path()).unwrap(), bytes);
 }
+
+#[tokio::test]
+async fn z5zdmu_failed_hashedit_lets_the_asked_for_reread_through() {
+    use crate::agent::tools::{ReadArgs, ReadTracker};
+    select_edit_system(EditSystem::Hashedit);
+    let tmp = TempFile::new("hash_reread.txt");
+    let original = "hello world\n";
+    std::fs::write(tmp.path(), original).unwrap();
+    let tracker = ReadTracker::new(true);
+    let read = ReadTool::new_with_tracker(None, None, None, 1024, tracker.clone());
+    let args = || ReadArgs {
+        path: tmp.path().into(),
+        ..Default::default()
+    };
+    read.call(args()).await.unwrap();
+    let blocked = read.call(args()).await.unwrap_err().to_string();
+    assert!(blocked.contains("already read"), "{blocked}");
+
+    let tool = edit::EditTool::new_with_tracker(None, None, None, tracker);
+    let bad_tag = crc32_hex(b"different content");
+    let error = tool
+        .call(EditArgs {
+            fuzzy: false,
+            path: tmp.path().into(),
+            replace_all: false,
+            block: None,
+            file_crc: Some(crc32_hex(original.as_bytes())),
+            edits: Some(vec![EditOp {
+                line: Some(format!("   1|{bad_tag} hello world")),
+                lines: None,
+                text: "bye".into(),
+            }]),
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("Tag mismatch"), "{error}");
+    let again = read.call(args()).await.unwrap();
+    assert!(again.contains("hello world"), "{again}");
+}
