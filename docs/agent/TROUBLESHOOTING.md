@@ -129,6 +129,33 @@ start; the reason names the missing containment (bubblewrap on Linux, a validate
 LPAC gate on Windows). The rest of the agent works. Run `mini-agent --js-runtime-check` to see the
 same check on its own.
 
+On Windows the LPAC gate accepts only supported install locations: under `%USERPROFILE%` or
+`%LOCALAPPDATA%` (the per-user MSI), `%CARGO_HOME%\bin` (default `%USERPROFILE%\.cargo\bin`), a cargo
+`target\debug` or `target\release` directory, `%TEMP%`/`%TMP%`, and Program Files, ProgramData or
+the Windows directory. An executable anywhere else (for example `cargo install --root` on another
+drive) reports `<path> is not a supported install location for the JavaScript tool`; copy
+`mini-agent.exe` to a supported location. See [WINDOWS_INSTALL.md](WINDOWS_INSTALL.md).
+
+### Git tool unavailable on Windows
+
+The structured `git` tool needs the AppContainer sandbox: with `--no-sandbox` it is not offered
+(`Windows structured Git requires AppContainer`; run git through the shell tool instead).
+`mini-agent --git-runtime-check` runs the bundled Git inside the container
+(`git rev-parse --git-dir`, which succeeds or reports "not a git repository" when the executable, its
+DLLs and the working directory all work). The runtime directory
+(`<local data>\git-runtime\<id>`) holds `git.exe` and its DLL closure; every file is granted to the
+container as a read/execute root, one grant per file (the files have protected private ACLs, so a
+directory grant would not be inherited). Probe failures:
+
+- Exit code `-1073741515` (0xC0000135) or `-1073741790` (0xC0000022): the container could not read a
+  DLL beside `git.exe`.
+- `fatal: could not open '/dev/null'`: the container has no access to the NUL device (Git opens it
+  first).
+- `cannot resolve its working directory inside the Windows AppContainer`: upstream Git resolves the
+  working directory with `GetFinalPathNameByHandleW` and a DOS volume name, which an AppContainer is
+  denied. The structured tool is withheld because every operation would fail; use git through the
+  shell tool.
+
 ### [sandbox network: blocked host:port (reason)]
 
 A contained command reached a host that `sandbox-network = "allowlist"` does not permit. Add the host

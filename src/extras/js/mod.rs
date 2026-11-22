@@ -25,6 +25,19 @@ pub(crate) async fn verify_runtime(
     use anyhow::{Context, ensure};
     use rig::tool::Tool;
 
+    // The worker error is deliberately closed ("containment is unavailable"); the
+    // cached preflight status carries the actionable reason (for example an
+    // unsupported Windows install location), so report it here.
+    if let Ok(crate::sandbox::worker::WorkerContainmentStatus::Unavailable {
+        backend,
+        reason,
+        ..
+    }) = tokio::task::spawn_blocking(crate::sandbox::worker::containment_status).await
+    {
+        anyhow::bail!(
+            "JavaScript runtime self-check: containment is unavailable ({backend}): {reason}"
+        );
+    }
     let allow = host::AllowConfig::from_settings(workspace.root(), None, None, None, false, false)
         .with_workspace_binding(workspace);
     let tool = tool::JsTool::new(
