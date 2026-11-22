@@ -682,6 +682,16 @@ pub struct Config {
         alias = "windows_appcontainer_read_roots"
     )]
     pub windows_appcontainer_read_roots: Vec<std::path::PathBuf>,
+    /// `windows-appcontainer-toolchain-discovery`: let the AppContainer shell
+    /// read and execute the install directories of the toolchains the host
+    /// `PATH` resolves (python, node, ...). Default true; global-only.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "windows-appcontainer-toolchain-discovery",
+        alias = "windows_appcontainer_toolchain_discovery"
+    )]
+    pub windows_appcontainer_toolchain_discovery: Option<bool>,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",

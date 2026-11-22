@@ -261,6 +261,9 @@ pub(crate) async fn run_all(
             cli.resolve_windows_appcontainer_read_roots(cfg),
             cli.resolve_windows_appcontainer_write_roots(cfg),
         )
+        .with_windows_toolchain_discovery(
+            cfg.windows_appcontainer_toolchain_discovery.unwrap_or(true),
+        )
         .with_bwrap_read_roots(cli.resolve_sandbox_toolchain_roots(cfg))
         .with_workspace_binding(workspace);
     let probe = sandbox.clone();

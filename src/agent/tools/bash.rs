@@ -2363,13 +2363,19 @@ fn bound_output_lines_with_hint(text: String, max_output_lines: Option<u64>, hin
 
 /// Output fragments that a sandbox denial produces and that an unrelated
 /// failure rarely does. Matched case-insensitively against the retained output.
-const SANDBOX_FAILURE_MARKERS: [&str; 5] = [
+const SANDBOX_FAILURE_MARKERS: [&str; 7] = [
     "operation not permitted",
     "read-only file system",
     "sandbox-exec",
     "bwrap:",
     "not enough quota is available",
+    "could not open '/dev/null'",
+    "\\.\\nul' is denied",
 ];
+
+/// Spellings of the Windows NUL device refusing the AppContainer (Git for Windows opens
+/// `/dev/null` first; .NET names `\\.\NUL`).
+const WINDOWS_NUL_MARKERS: [&str; 2] = ["could not open '/dev/null'", "\\.\\nul' is denied"];
 
 /// Spellings of a denied network: resolver, curl, git, npm, cargo and pip
 /// failures when the shell has no network (or only a refusing proxy). These
@@ -2423,7 +2429,9 @@ pub(crate) fn sandbox_failure_note(
         .iter()
         .any(|marker| lowered.contains(marker))
         || proxy_connection_refused(&lowered);
+    let toolchain_hint = host_command_unrunnable_hint(sandbox, output);
     if !network_failure
+        && toolchain_hint.is_none()
         && !SANDBOX_FAILURE_MARKERS
             .iter()
             .any(|marker| lowered.contains(marker))
@@ -2450,6 +2458,19 @@ pub(crate) fn sandbox_failure_note(
             " \"Not enough quota\" means the sandbox's active-process cap was reached; lower build/test parallelism (for example make -j, msbuild -m, pytest -n).",
         );
     }
+    if sandbox.backend_name() == "appcontainer"
+        && WINDOWS_NUL_MARKERS
+            .iter()
+            .any(|marker| lowered.contains(marker))
+    {
+        note.push_str(
+            " The Windows AppContainer cannot open the NUL device unless mini-agent runs elevated, so Git, redirections to nul and Python or Node DEVNULL fail in this shell; use the git tool for Git operations.",
+        );
+    }
+    if let Some(hint) = &toolchain_hint {
+        note.push(' ');
+        note.push_str(hint);
+    }
     if network_failure && shell_network_denied(sandbox) {
         note.push_str(
             " The user can run /sandbox network allowlist (asks per host) or allow for this session.",
@@ -2461,6 +2482,165 @@ pub(crate) fn sandbox_failure_note(
     }
     note.push(']');
     Some(note)
+}
+
+/// A command the shell could not find or start, as its output names it.
+#[derive(Debug, PartialEq, Eq)]
+enum MissingCommand {
+    /// A bare command name ("python").
+    Name(String),
+    /// A full executable path the shell could not start.
+    Path(String),
+}
+
+/// Commands named by "not found / not recognized / unable to create process"
+/// output of PowerShell, cmd.exe and POSIX shells (at most three, in order).
+fn missing_commands(output: &str) -> Vec<MissingCommand> {
+    fn quoted_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+        let rest = &line[line.to_ascii_lowercase().find(marker)? + marker.len()..];
+        let rest = rest.strip_prefix('\'')?;
+        Some(&rest[..rest.find('\'')?])
+    }
+    let mut found: Vec<MissingCommand> = Vec::new();
+    let mut push = |candidate: MissingCommand| {
+        if found.len() < 3 && !found.contains(&candidate) {
+            found.push(candidate);
+        }
+    };
+    for line in output.lines() {
+        let line = line.trim();
+        let lowered = line.to_ascii_lowercase();
+        let name = if let Some(name) = quoted_after(line, "the term ")
+            && lowered.contains("is not recognized")
+        {
+            Some(name)
+        } else if lowered.contains("is not recognized as an internal or external command") {
+            line.strip_prefix('\'')
+                .and_then(|rest| rest.split('\'').next())
+        } else if let Some(prefix) = lowered
+            .strip_suffix(": command not found")
+            .or_else(|| lowered.strip_suffix(": not found"))
+        {
+            let end = line[..prefix.len()].rsplit(": ").next().unwrap_or("");
+            (!end.is_empty()).then_some(end)
+        } else {
+            None
+        };
+        if let Some(name) = name
+            && !name.is_empty()
+            && !name.contains(['/', '\\', ' '])
+        {
+            push(MissingCommand::Name(name.to_string()));
+            continue;
+        }
+        if let Some(rest) = quoted_after_unclosed(line, "unable to create process using ") {
+            push(MissingCommand::Path(rest.to_string()));
+        }
+    }
+    found
+}
+
+/// The executable path in `Unable to create process using 'C:\x\python.exe -m y'`:
+/// the quoted text up to the first `.exe`/`.com`/`.bat`/`.cmd` suffix.
+fn quoted_after_unclosed<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
+    let rest = &line[line.to_ascii_lowercase().find(marker)? + marker.len()..];
+    let rest = rest.strip_prefix('\'')?;
+    let lowered = rest.to_ascii_lowercase();
+    [".exe", ".com", ".bat", ".cmd"]
+        .iter()
+        .filter_map(|suffix| lowered.find(suffix).map(|at| at + suffix.len()))
+        .min()
+        .map(|end| &rest[..end])
+}
+
+/// First match of `name` in the directories of `path_var`, trying each
+/// `PATHEXT` suffix (empty on non-Windows hosts).
+fn resolve_on_path(
+    name: &str,
+    path_var: &std::ffi::OsStr,
+    extensions: &[String],
+) -> Option<std::path::PathBuf> {
+    for directory in std::env::split_paths(path_var) {
+        if directory.as_os_str().is_empty() {
+            continue;
+        }
+        let bare = directory.join(name);
+        let candidates = std::iter::once(bare.clone()).chain(extensions.iter().map(|extension| {
+            let mut spelled = bare.clone().into_os_string();
+            spelled.push(extension);
+            std::path::PathBuf::from(spelled)
+        }));
+        for candidate in candidates {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn host_path_extensions() -> Vec<String> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|extension| extension.starts_with('.'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The setting that adds read-only toolchain roots for `backend`, if it has one.
+fn toolchain_roots_setting(backend: &str) -> Option<&'static str> {
+    match backend {
+        "appcontainer" => Some("windows-appcontainer-read-roots"),
+        "bwrap" => Some("sandbox-toolchain-roots"),
+        _ => None,
+    }
+}
+
+/// When the failed command's output says a program could not be found or
+/// started, and the host `PATH` resolves it, tell the model the program exists
+/// but is outside the sandbox's read roots, and name the setting that adds it.
+fn host_command_unrunnable_hint(sandbox: &Sandbox, output: &str) -> Option<String> {
+    let setting = toolchain_roots_setting(sandbox.backend_name())?;
+    let missing = missing_commands(output);
+    if missing.is_empty() {
+        return None;
+    }
+    let path_var = std::env::var_os("PATH")?;
+    let extensions = host_path_extensions();
+    let mut located = Vec::new();
+    for command in missing {
+        let resolved = match command {
+            MissingCommand::Name(name) => {
+                resolve_on_path(&name, &path_var, &extensions).map(|path| (name, path))
+            }
+            MissingCommand::Path(path) => {
+                let path = std::path::PathBuf::from(path);
+                let name = path.file_stem()?.to_string_lossy().into_owned();
+                path.is_file().then_some((name, path))
+            }
+        };
+        if let Some(entry) = resolved {
+            located.push(entry);
+        }
+    }
+    if located.is_empty() {
+        return None;
+    }
+    let listed = located
+        .iter()
+        .map(|(name, path)| {
+            let directory = path.parent().unwrap_or(path);
+            format!("`{name}` ({})", directory.display())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "The program(s) {listed} exist on the host but the sandbox cannot run them: the install directory is outside the sandbox's read roots. The user can add that directory to `{setting}` (restart required)."
+    ))
 }
 
 /// Note for a command that hit its deadline under containment: with no
@@ -3630,6 +3810,120 @@ mod tests {
             sandbox_failure_note(&on, true, true, "Operation not permitted")
                 .unwrap()
                 .contains("escalate=true")
+        );
+    }
+
+    #[test]
+    fn missing_commands_are_parsed_from_powershell_cmd_and_posix_output() {
+        use MissingCommand::{Name, Path};
+        assert_eq!(
+            missing_commands(
+                "python: The term 'python' is not recognized as a name of a cmdlet, function, script file, or executable program."
+            ),
+            vec![Name("python".into())]
+        );
+        assert_eq!(
+            missing_commands("'node' is not recognized as an internal or external command,"),
+            vec![Name("node".into())]
+        );
+        assert_eq!(
+            missing_commands("bash: python3: command not found"),
+            vec![Name("python3".into())]
+        );
+        assert_eq!(
+            missing_commands("/bin/sh: 1: cargo: not found"),
+            vec![Name("cargo".into())]
+        );
+        assert_eq!(
+            missing_commands(
+                "Unable to create process using 'C:\\tools\\py\\python.exe -m pip': Access is denied."
+            ),
+            vec![Path("C:\\tools\\py\\python.exe".into())]
+        );
+        assert!(missing_commands("everything fine").is_empty());
+        // A path-shaped name is not a bare command.
+        assert!(missing_commands("The term './x/y' is not recognized as a name").is_empty());
+    }
+
+    #[test]
+    fn a_host_path_command_missing_in_the_sandbox_names_the_read_roots_setting() {
+        let root = std::env::temp_dir().join(format!("mini-agent-hint-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let tool = if cfg!(windows) {
+            "hintcmd.exe"
+        } else {
+            "hintcmd"
+        };
+        std::fs::write(root.join(tool), b"x").unwrap();
+        let found = resolve_on_path(
+            "hintcmd",
+            std::env::join_paths([&root]).unwrap().as_os_str(),
+            &host_path_extensions(),
+        )
+        .expect("resolved on the temporary PATH");
+        assert_eq!(found, root.join(tool));
+        assert_eq!(resolve_on_path("nothing-here", root.as_os_str(), &[]), None);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            toolchain_roots_setting("appcontainer"),
+            Some("windows-appcontainer-read-roots")
+        );
+        assert_eq!(
+            toolchain_roots_setting("bwrap"),
+            Some("sandbox-toolchain-roots")
+        );
+        assert_eq!(toolchain_roots_setting("seatbelt"), None);
+        // No contained backend that supports roots: no hint, so no note.
+        let seatbelt = Sandbox::new(true, "seatbelt");
+        assert_eq!(
+            sandbox_failure_note(&seatbelt, false, true, "bash: hintcmd: command not found"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_refused_nul_device_is_attributed_to_the_appcontainer() {
+        let appcontainer = Sandbox::new(true, "appcontainer");
+        for output in [
+            "fatal: could not open '/dev/null' for reading and writing: Permission denied",
+            "Exception calling \"Open\": \"Access to the path '\\\\.\\NUL' is denied.\"",
+        ] {
+            let note = sandbox_failure_note(&appcontainer, false, true, output)
+                .unwrap_or_else(|| panic!("no note for {output}"));
+            assert!(note.contains("NUL device"), "{note}");
+            assert!(note.contains("git tool"), "{note}");
+        }
+        // Other backends do not claim the AppContainer's NUL limitation.
+        let bwrap = Sandbox::new(true, "bwrap");
+        let note = sandbox_failure_note(
+            &bwrap,
+            false,
+            true,
+            "fatal: could not open '/dev/null' for reading and writing: Permission denied",
+        )
+        .expect("still a sandbox marker");
+        assert!(!note.contains("NUL device"), "{note}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_command_that_the_host_path_resolves_gets_the_toolchain_roots_hint() {
+        let bwrap = Sandbox::new(true, "bwrap");
+        let note = sandbox_failure_note(&bwrap, false, true, "bash: sh: command not found")
+            .expect("hint for a command present on the host PATH");
+        assert!(note.contains("`sh`"), "{note}");
+        assert!(note.contains("sandbox-toolchain-roots"), "{note}");
+        assert!(note.contains("outside the sandbox's read roots"), "{note}");
+        assert!(note.contains("exist on the host"), "{note}");
+        // Not on the host PATH either: a plain missing command is not the sandbox.
+        assert_eq!(
+            sandbox_failure_note(
+                &bwrap,
+                false,
+                true,
+                "bash: definitely-not-installed-xyz: command not found"
+            ),
+            None
         );
     }
 

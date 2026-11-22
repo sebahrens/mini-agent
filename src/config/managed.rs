@@ -1121,6 +1121,8 @@ impl ManagedPolicy {
         }
         if sandbox.max_profile.is_some() {
             self.clamp_roots(cfg);
+            // PATH-derived toolchain roots are not on the policy's allowed_roots list.
+            cfg.windows_appcontainer_toolchain_discovery = Some(false);
         }
         if sandbox.forbid_home_mounts && !cfg.sandbox_home_mounts.is_empty() {
             cfg.sandbox_home_mounts.clear();

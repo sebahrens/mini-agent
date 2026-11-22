@@ -11,6 +11,7 @@
 use super::profile_journal::{
     MAX_CONTROL_RECORD_BYTES, RecordKind, is_staging_leaf, validate_payload,
 };
+use super::windows_toolchains;
 
 pub(super) mod general_owner;
 #[cfg(test)]
@@ -190,6 +191,15 @@ const STALE_JOB_CLEANUP_EXIT_CODE: u32 = 126;
 /// ties back to the sandbox in its failure note.
 const MAX_JOB_PROCESSES: u32 = 1024;
 const ACL_MUTEX_WAIT_MS: u32 = 5_000;
+/// Access the container receives, on the directory itself and without inheritance, on every
+/// named ancestor of the workspace that does not already admit application packages. Windows
+/// resolves the working directory by name: PowerShell, cmd.exe built-ins such as `dir` and
+/// `del`, and `GetLongPathName` enumerate each ancestor to find the correctly cased child, so a
+/// traverse-only grant leaves the shell in `C:\` or refusing `dir`. The grant lets the container
+/// list the *names* inside each ancestor (not read any file or subdirectory content: nothing is
+/// inherited, so children keep their own ACLs) and never write.
+const ANCESTOR_NAME_ACCESS: u32 =
+    FILE_TRAVERSE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE;
 const GENERAL_PREFLIGHT_RUN_TIMEOUT: Duration = Duration::from_secs(30);
 const GENERAL_PREFLIGHT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 const GENERAL_PREFLIGHT_RECOVERY_TIMEOUT: Duration = Duration::from_secs(15);
@@ -296,6 +306,14 @@ struct LaunchRequest {
     write_roots: Vec<PathBuf>,
     configured_read_roots: Vec<PathBuf>,
     configured_write_roots: Vec<PathBuf>,
+    /// Read/execute roots proposed from the host `PATH` (see `windows_toolchains`). They are
+    /// part of `read_roots` but granted best effort: a root whose DACL this user cannot change is
+    /// skipped instead of failing the launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    optional_read_roots: Vec<PathBuf>,
+    /// Best-effort read/write on the NUL device for this container (`grant_null_device`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    null_device: bool,
     parent_pid: u32,
     parent_created: u64,
     ready_path: Option<PathBuf>,
@@ -1975,6 +1993,13 @@ fn recover_verified_preflight_profiles(cache: &Path, deadline: Instant) -> Resul
     Ok(())
 }
 
+/// What a model-shell launch adds to the container beyond the explicit roots.
+#[derive(Clone, Copy)]
+pub(crate) struct ShellLaunchOptions {
+    /// Grant read/execute on the host `PATH` toolchains (`windows_toolchains`).
+    pub(crate) toolchain_discovery: bool,
+}
+
 pub(crate) fn build_shell_helper(
     shell: &str,
     prefix_args: &[String],
@@ -1986,6 +2011,7 @@ pub(crate) fn build_shell_helper(
     configured_write_roots: &[PathBuf],
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
     extra_env: &[(String, String)],
+    shell_options: Option<ShellLaunchOptions>,
 ) -> Result<tokio::process::Command, String> {
     let program = resolve_program(shell, cwd)?;
     let arguments = prefix_args
@@ -2002,6 +2028,7 @@ pub(crate) fn build_shell_helper(
         configured_write_roots,
         pty,
         extra_env,
+        shell_options,
     )
 }
 
@@ -2023,6 +2050,7 @@ pub(crate) fn build_direct_helper(
         configured_write_roots,
         None,
         &[],
+        None,
     )
 }
 
@@ -2132,7 +2160,7 @@ fn build_helper(
     cwd: &Path,
     cache: &Path,
 ) -> Result<tokio::process::Command, String> {
-    build_helper_configured(program, arguments, cwd, cache, &[], &[], None, &[])
+    build_helper_configured(program, arguments, cwd, cache, &[], &[], None, &[], None)
 }
 
 fn build_helper_configured(
@@ -2144,6 +2172,7 @@ fn build_helper_configured(
     configured_write_roots: &[PathBuf],
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
     extra_env: &[(String, String)],
+    shell_options: Option<ShellLaunchOptions>,
 ) -> Result<tokio::process::Command, String> {
     build_helper_with_ready_roots_and_env(
         program,
@@ -2156,6 +2185,7 @@ fn build_helper_configured(
         None,
         pty,
         extra_env,
+        shell_options,
     )
 }
 
@@ -2208,8 +2238,10 @@ fn prepare_launch_request(
     let write_roots = collect_write_roots(&workspace, &configured_write_roots)?;
     let read_roots = collect_read_roots(&program, &workspace, &cache, &configured_read_roots)?;
     // Windows revalidates every named ancestor when the AppContainer resolves its current
-    // directory, even when CreateProcess received that same directory as `cwd`. Grant only
-    // FILE_TRAVERSE on ancestors that do not already admit application packages.
+    // directory, even when CreateProcess received that same directory as `cwd`, and the shells
+    // enumerate every ancestor to case-correct it. Grant only traverse and name listing
+    // (`ANCESTOR_NAME_ACCESS`, non-inheriting) on ancestors that do not already admit
+    // application packages.
     let traverse_roots = workspace
         .ancestors()
         .skip(1)
@@ -2247,6 +2279,63 @@ fn prepare_launch_request(
     })
 }
 
+impl LaunchRequest {
+    /// Propose read/execute roots for the toolchains the host `PATH` resolves and merge them
+    /// into the read-root set. The proposals never overlap a writable root, the workspace, the
+    /// application cache or its private control root, so the closed explicit-root policy is
+    /// re-validated over the merged set and any conflict stays a hard error.
+    fn add_toolchain_read_roots(&mut self) -> Result<(), String> {
+        let proposed = discovered_toolchain_roots();
+        if proposed.is_empty() {
+            return Ok(());
+        }
+        let mut excluded = vec![self.workspace.clone(), self.cache.clone()];
+        excluded.extend(self.cache.parent().map(Path::to_path_buf));
+        excluded.extend(private_control_root_candidate(&self.cache).ok());
+        excluded.extend(self.write_roots.iter().cloned());
+        excluded.extend(self.configured_write_roots.iter().cloned());
+        let mut optional: Vec<PathBuf> = windows_toolchains::without_overlaps(proposed, &excluded)
+            .into_iter()
+            .filter(|root| !self.configured_read_roots.contains(root))
+            .filter(|root| reject_remote_access_path(root).is_ok())
+            .filter(|root| canonical_access_path(root).is_ok_and(|canonical| &canonical == root))
+            .collect();
+        if optional.is_empty() {
+            return Ok(());
+        }
+        optional.sort();
+        optional.dedup();
+        let mut all_configured = self.configured_read_roots.clone();
+        all_configured.extend(optional.iter().cloned());
+        all_configured.sort();
+        all_configured.dedup();
+        let read_roots =
+            collect_read_roots(&self.program, &self.workspace, &self.cache, &all_configured)?;
+        validate_explicit_root_policy(
+            &self.program,
+            &self.workspace,
+            &self.cache,
+            &all_configured,
+            &self.configured_write_roots,
+            &read_roots,
+            &self.write_roots,
+        )?;
+        self.read_roots = read_roots;
+        self.optional_read_roots = optional;
+        Ok(())
+    }
+}
+
+/// The proposed toolchain roots of this process, resolved once from the host `PATH`.
+fn discovered_toolchain_roots() -> &'static [PathBuf] {
+    static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        windows_toolchains::DiscoveryEnvironment::from_process()
+            .map(|environment| windows_toolchains::discover(&environment))
+            .unwrap_or_default()
+    })
+}
+
 fn build_helper_with_ready_and_roots(
     program: PathBuf,
     arguments: Vec<String>,
@@ -2269,6 +2358,7 @@ fn build_helper_with_ready_and_roots(
         workspace,
         pty,
         &[],
+        None,
     )
 }
 
@@ -2283,6 +2373,7 @@ fn build_helper_with_ready_roots_and_env(
     workspace: Option<&Path>,
     pty: Option<&crate::sandbox::pty::PtyLaunch>,
     extra_env: &[(String, String)],
+    shell_options: Option<ShellLaunchOptions>,
 ) -> Result<tokio::process::Command, String> {
     let mut request = prepare_launch_request(
         program,
@@ -2294,6 +2385,13 @@ fn build_helper_with_ready_roots_and_env(
         configured_write_roots,
         workspace,
     )?;
+    if let Some(options) = shell_options {
+        // Only model-shell launches get the PATH toolchains and the NUL device.
+        request.null_device = true;
+        if options.toolchain_discovery {
+            request.add_toolchain_read_roots()?;
+        }
+    }
     request.extra_env = extra_env.to_vec();
     request.pty = pty.map(|launch| PtyRequest {
         rows: launch.rows,
@@ -3230,7 +3328,9 @@ fn run_helper() -> Result<i32, String> {
     let all_packages = sid_from_string("S-1-15-2-1")?;
     let mut traverse_roots = Vec::new();
     for root in requested_traverse_roots {
-        if effective_path_rights(&root, all_packages.0)? & FILE_TRAVERSE == 0 {
+        if effective_path_rights(&root, all_packages.0)? & ANCESTOR_NAME_ACCESS
+            != ANCESTOR_NAME_ACCESS
+        {
             traverse_roots.push(root);
         }
     }
@@ -3239,10 +3339,17 @@ fn run_helper() -> Result<i32, String> {
         canonicalize_access_roots(request.read_roots.iter().map(PathBuf::as_path), &workspace)?;
     let write_roots =
         canonicalize_access_roots(request.write_roots.iter().map(PathBuf::as_path), &workspace)?;
-    let configured_read_roots = canonicalize_access_roots(
+    let optional_read_roots = canonicalize_access_roots(
+        request.optional_read_roots.iter().map(PathBuf::as_path),
+        &workspace,
+    )?;
+    let mut configured_read_roots = canonicalize_access_roots(
         request.configured_read_roots.iter().map(PathBuf::as_path),
         &workspace,
     )?;
+    configured_read_roots.extend(optional_read_roots.iter().cloned());
+    configured_read_roots.sort();
+    configured_read_roots.dedup();
     let configured_write_roots = canonicalize_access_roots(
         request.configured_write_roots.iter().map(PathBuf::as_path),
         &workspace,
@@ -3307,6 +3414,15 @@ fn run_helper() -> Result<i32, String> {
             } else {
                 mark_helper_failure_stage(HELPER_STAGE_CONFIGURED_READ_GRANT);
             }
+            if optional_read_roots.contains(&root)
+                && !request.configured_read_roots.contains(&root)
+                && !read_root_dacl_is_changeable(&root)
+            {
+                // A PATH-derived toolchain root this user cannot change the DACL of (an
+                // administrator-owned install) is simply not exposed; no ACE was written.
+                grants.acl_roots.retain(|candidate| candidate != &root);
+                continue;
+            }
             grant_read_root(&root, &mut grants, &parent)?;
         }
     }
@@ -3317,8 +3433,18 @@ fn run_helper() -> Result<i32, String> {
             .chain(grants.write_roots.iter())
             .any(|covered| root.starts_with(covered))
         {
-            grant_access_root(&root, &mut grants, &parent, FILE_TRAVERSE, false, false)?;
+            grant_access_root(
+                &root,
+                &mut grants,
+                &parent,
+                ANCESTOR_NAME_ACCESS,
+                false,
+                false,
+            )?;
         }
+    }
+    if request.null_device {
+        grant_null_device(&mut grants);
     }
     // This desktop-only firewall API reads host configuration and is intentionally unavailable
     // inside AppContainer. Attest the freshly-created profile SID from the trusted helper before
@@ -3563,6 +3689,8 @@ struct AccessGrants {
     write_roots: Vec<PathBuf>,
     acl_roots: Vec<PathBuf>,
     objects: Vec<GrantedObject>,
+    /// The NUL device handle that carries this container's temporary ACE, if one was granted.
+    null_device: Option<File>,
     cleaned: bool,
     cleanup_attempted: bool,
     cleanup_allowed: bool,
@@ -3588,6 +3716,7 @@ impl AccessGrants {
             write_roots,
             acl_roots,
             objects: Vec::new(),
+            null_device: None,
             cleaned: false,
             cleanup_attempted: false,
             cleanup_allowed: true,
@@ -3625,6 +3754,19 @@ impl AccessGrants {
             {
                 first_error = Some(error);
             }
+        }
+        if let Some(file) = &self.null_device
+            && let Err(error) = update_handle_ace(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                self.sid(),
+                REVOKE_ACCESS,
+                0,
+                0,
+            )
+            && first_error.is_none()
+        {
+            first_error = Some(error);
         }
         if let Some(error) = first_error {
             return Err(error);
@@ -3676,6 +3818,60 @@ fn grant_read_root(root: &Path, grants: &mut AccessGrants, parent: &Handle) -> R
         false,
         true,
     )
+}
+
+/// Whether the current user can rewrite `root`'s DACL, the right the read grant needs. Opening
+/// with the same access and sharing as the grant proves it without mutating anything.
+fn read_root_dacl_is_changeable(root: &Path) -> bool {
+    let directory = std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.is_dir());
+    open_stable_path(
+        root,
+        directory,
+        READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+    .is_ok()
+}
+
+/// Give this launch's AppContainer read/write on the NUL device, when this process may.
+///
+/// The default DACL of `\\.\NUL` does not admit AppContainers, so inside the sandbox
+/// `cmd.exe` redirections to `nul`, Git for Windows (which opens `/dev/null` before doing
+/// anything), Python's `subprocess.DEVNULL` and Node's ignored stdio all fail with "Access is
+/// denied". Rewriting that device DACL needs `WRITE_DAC` on it, which only an elevated
+/// administrator has; every other launch simply leaves NUL unavailable (the failure note names
+/// it). The ACE names only this launch's unique profile SID, grants read and write on a device
+/// that discards its input and yields end-of-file, never touches a file, and is revoked in
+/// `AccessGrants::cleanup`; the device object does not survive a reboot.
+fn grant_null_device(grants: &mut AccessGrants) {
+    let path = wide_string("\\\\.\\NUL");
+    let raw = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            READ_CONTROL | WRITE_DAC,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            0,
+            null_mut(),
+        )
+    };
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+        return;
+    }
+    let file = unsafe { File::from_raw_handle(raw) };
+    if update_handle_ace(
+        file.as_raw_handle(),
+        SE_FILE_OBJECT,
+        grants.sid(),
+        GRANT_ACCESS,
+        FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+        0,
+    )
+    .is_ok()
+    {
+        grants.null_device = Some(file);
+    }
 }
 
 fn trusted_machine_read_file(path: &Path) -> Result<bool, String> {

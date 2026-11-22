@@ -309,6 +309,12 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
     )
     .shaped(ConfigShape::Strings),
     aliased(
+        "windows-appcontainer-toolchain-discovery",
+        &["windows_appcontainer_toolchain_discovery"],
+    )
+    .described("Global-only: let the Windows AppContainer shell read and execute the install directories of the toolchains the host PATH resolves (python, node, npm, cargo, go, java, ...); never write. Default true; false limits reads to the workspace, cache and windows-appcontainer-read-roots.")
+    .shaped(ConfigShape::Bool),
+    aliased(
         "windows-appcontainer-write-roots",
         &["windows_appcontainer_write_roots"],
     )

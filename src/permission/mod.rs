@@ -381,6 +381,7 @@ pub(crate) struct ConfiguredSandboxKey {
     home_masks: Vec<String>,
     appcontainer_read_roots: Vec<std::path::PathBuf>,
     appcontainer_write_roots: Vec<std::path::PathBuf>,
+    appcontainer_toolchain_discovery: bool,
     toolchain_roots: Vec<std::path::PathBuf>,
     network: crate::sandbox::SandboxNetwork,
     network_hosts: Vec<String>,
@@ -414,6 +415,9 @@ impl ConfiguredSandboxKey {
             home_masks: cfg.sandbox_home_masks.clone(),
             appcontainer_read_roots: cli.resolve_windows_appcontainer_read_roots(cfg),
             appcontainer_write_roots: cli.resolve_windows_appcontainer_write_roots(cfg),
+            appcontainer_toolchain_discovery: cfg
+                .windows_appcontainer_toolchain_discovery
+                .unwrap_or(true),
             toolchain_roots: cli.resolve_sandbox_toolchain_roots(cfg),
             network: cli.resolve_sandbox_network(cfg),
             network_hosts: cfg.sandbox_network_hosts.clone(),
@@ -446,6 +450,7 @@ impl ConfiguredSandboxKey {
                 self.appcontainer_read_roots.clone(),
                 self.appcontainer_write_roots.clone(),
             )
+            .with_windows_toolchain_discovery(self.appcontainer_toolchain_discovery)
             .with_bwrap_read_roots(self.toolchain_roots.clone())
             .with_network(self.network)
             .with_network_hosts(self.network_hosts.clone())

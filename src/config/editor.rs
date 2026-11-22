@@ -123,6 +123,7 @@ pub(crate) fn prepare(
             | "permission_mode_cycle"
             | "sandbox_required"
             | "shell_auto_allow_sandboxed"
+            | "windows_appcontainer_toolchain_discovery"
             | "permission_checks_required"
     ) {
         return Err("This setting can only be changed in global configuration");
