@@ -441,7 +441,7 @@ wait immediately; completed work and accounting are retained before final output
 
 `--output stream-json` writes one JSON object per line: `system` (logical session ID/name,
 provider/model, and `ephemeral`), `assistant_text`, `tool_call`, `tool_result`, `usage`, optional
-`goal` updates, optional `file_mutation` records, and a final `result`. Assistant text is buffered until its block ends, so there is one `assistant_text` record per text block (split only at the preview cap), not one per stream flush. A run stopped by `--max-agent-turns` or `--max-budget-usd` carries the limit in `stop_detail` and, when the model wrote no closing text, in `result`. Calls and results share `id`; `provider_call_id` records
+`goal` updates, optional `file_mutation` records, `subagent_started` and `subagent_tool_call` records (see below), and a final `result`. Assistant text is buffered until its block ends, so there is one `assistant_text` record per text block (split only at the preview cap), not one per stream flush. A run stopped by `--max-agent-turns` or `--max-budget-usd` carries the limit in `stop_detail` and, when the model wrote no closing text, in `result`. Calls and results share `id`; `provider_call_id` records
 the provider identifier separately (its preview is capped at 512 bytes). Tool result events include `is_error`; text/arguments and
 tool previews are limited to 8 KiB (`--stream-json-preview-bytes`) and mark truncation. JSON escapes terminal control and deceptive
 Unicode characters while preserving decoded argument data. These events reflect observed SDK
@@ -472,6 +472,7 @@ unchanged. Mapping:
 | `tool_result` | `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":...,"content":...,"is_error":...}]}}` |
 | `text_delta` / `reasoning_delta` (`--include-partial-messages`) | `stream_event` records framed per message: `message_start`, then per content block `content_block_start` (own `index`; thinking and text never share one), `content_block_delta` with that `index`, `content_block_stop`, and `message_delta` + `message_stop` when the final `assistant` record (or the `result`) arrives |
 | `result` | same fields plus `subtype` (`success`, `error_max_turns` for turn-budget exhaustion, `error_max_budget_usd`, `error_during_execution`), `uuid`, `duration_api_ms` (model-wait time; tool execution excluded), `permission_denials` (always `[]`; denied calls appear as error tool results) and `usage.cache_read_input_tokens`; `duration_ms`, `num_turns`, `is_error`, `total_cost_usd` as above |
+| `subagent_started` (`agent_type`, `source`), `subagent_tool_call` (`name`, `args`, `truncated`) | pass through unchanged; both carry `parent_tool_use_id`, the `id` of the outer `task` `tool_call`, and appear between that call and its `tool_result` for foreground children (background children are not streamed; `/tasks <id>` shows their bounded tool log) |
 | `usage`, `file_mutation`, `file_mutation_gap`, `goal`, `system` `capabilities`, `input_error`, `control_request` | pass through unchanged (extension records without a Claude counterpart; consumers should ignore unknown types) |
 
 A record whose text or arguments were cut at `--stream-json-preview-bytes` carries `"truncated":true`.
@@ -583,7 +584,7 @@ The object is the first and only line on stdout. `duration_ms` is the wall clock
 multi-turn stream-json run, since the previous `result`), `num_turns` counts the provider rounds in
 the run's transcript (assistant messages; 0 when no model round ran, such as an explicit `!command`
 or a preflight failure), and `is_error` is `true` for every `stop_reason` other than `completed`
-(a met goal, `goal_met`, is not an error). `usage` and the cost include delegated `task` children, listed per child in `subagent_usage`; `total_cost_usd` repeats `cost` under Claude Code's
+(a met goal, `goal_met`, is not an error). `usage` and the cost include delegated `task` children, listed per child in `subagent_usage`, with a `subagent_delegation` object beside it (children run, `contract_pass`/`contract_repaired`/`contract_normalized`/`contract_unstructured`, `repair_used`, `host_replaced`, `writeup_used`, `stopped_turn_budget`/`stopped_deadline`/`failed`, turns, tool calls, tokens, cached tokens, cost units, and one row per child); `total_cost_usd` repeats `cost` under Claude Code's
 result-message name; `cost` stays. `usage` and `cost` cover the turn's requests and
 an automatic compaction that ran before the turn. `result` is the text of the turn's final
 completion: text the agent wrote before a tool call is saved as its own message in the session but

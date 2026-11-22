@@ -5705,6 +5705,18 @@ wait
             );
         }
 
+        // mini-agent-irrra: the branch line and short status of a workspace.
+        #[tokio::test]
+        async fn short_status_names_the_branch_and_changes() {
+            let fixture = Fixture::new("isolation-short-status");
+            std::fs::write(fixture.root().join("wip.txt"), "x").unwrap();
+            let status = crate::extras::git_worktree::short_status(fixture.root())
+                .await
+                .unwrap();
+            assert!(status.starts_with("## main"), "{status}");
+            assert!(status.contains("wip.txt"), "{status}");
+        }
+
         #[tokio::test]
         async fn isolated_child_cannot_write_the_parent_workspace() {
             let fixture = Fixture::new("isolation-no-parent-write");

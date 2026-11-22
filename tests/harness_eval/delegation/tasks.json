@@ -1,0 +1,41 @@
+{
+  "description": "Delegated-versus-direct evaluation lane (mini-agent-964ao). Each task runs twice with scripts/delegation_eval.py: once with the task tool enabled, once with [subagents] task_enabled = false. The fixtures are small on purpose; a recorded baseline belongs next to this file as baseline.json.",
+  "tasks": [
+    {
+      "name": "cross_file_callers",
+      "prompt": "Find every file under src/ that calls load_config and write their paths, sorted, one per line, to answer.txt.",
+      "files": {
+        "src/a.rs": "fn run() { load_config(); }\n",
+        "src/b.rs": "fn other() { helper(); }\n",
+        "src/c.rs": "fn go() { load_config(); load_config(); }\n",
+        "src/config.rs": "pub fn load_config() {}\n"
+      },
+      "expected_files": {
+        "answer.txt": "src/a.rs\nsrc/c.rs\n"
+      }
+    },
+    {
+      "name": "known_path_read",
+      "prompt": "Read version.txt and write its content, unchanged, to answer.txt.",
+      "files": {
+        "version.txt": "1.4.2\n"
+      },
+      "expected_files": {
+        "answer.txt": "1.4.2\n"
+      }
+    },
+    {
+      "name": "independent_questions",
+      "prompt": "Answer both questions in answer.txt, one line each: how many TODO markers are in docs/, and how many in src/?",
+      "files": {
+        "docs/a.md": "TODO one\nTODO two\n",
+        "docs/b.md": "done\n",
+        "src/x.rs": "// TODO fix\n",
+        "src/y.rs": "// ok\n"
+      },
+      "expected_files": {
+        "answer.txt": "docs: 2\nsrc: 1\n"
+      }
+    }
+  ]
+}

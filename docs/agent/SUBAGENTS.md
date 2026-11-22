@@ -51,10 +51,11 @@ Main-agent definition loading remains available when subagents are disabled.
 
 Set `run_in_background: true` on an ordinary `task` call to return a task ID
 immediately. The same persona, tools, permission checks, captured prices and
-session cost cap apply. A background call has its own whole-call deadline,
+session cost cap apply. A background call has its own per-child window,
 `[subagents] task_background_timeout_secs` (default 3600 seconds, at most
-86400), instead of the foreground `task_timeout_secs` (300 s); when it expires,
-in-flight children return their narration so far as `[partial: cancelled ...]`
+86400), instead of the foreground `task_timeout_secs` (300 s); a child past it
+gets a tool-free write-up turn marked `[partial: child deadline ...]`, and when
+the whole-call ceiling expires, in-flight children return their narration so far as `[partial: cancelled ...]`
 sections (see [Bounded execution](#bounded-execution-and-partial-results)). The session keeps at most 32 tasks, including
 finished reports. When it is full, the next admission drops the oldest finished
 task whose completion notice was already delivered (or that was restored from a
@@ -196,10 +197,10 @@ worktree-isolated child is also told its branch, the base commit and whether
 the parent checkout had uncommitted changes the worktree lacks; the same
 statement appears in the isolated-worktree section of its result. Every child's
 system prompt ends with an environment block (working directory, UTC date and
-platform).
+platform; a write child also gets its branch line and a short `git status`).
 
 Optional `max_turns` and `timeout_secs` arguments set the child model-turn
-budget and the whole-call deadline for one call (for example
+budget and each child's time window for one call (for example
 `{"prompts": ["…"], "max_turns": 60, "timeout_secs": 1800}`). They override a
 persona's frontmatter values and the configured defaults, and are rejected
 when above `[subagents] task_max_turns_ceiling` (default 100) or
@@ -685,7 +686,7 @@ mode: review
   rejects the definition.
 - `max_turns` (1–10000) sets the child's model-turn budget, replacing the
   `turn_budget` fraction of `task_max_turns`; `timeout_secs` (1–86400) sets
-  the whole-call deadline of calls using the persona. Both may exceed the
+  each child's time window in calls using the persona. Both may exceed the
   global defaults but are checked against `[subagents] task_max_turns_ceiling`
   (default 100) and `task_timeout_ceiling_secs` (default 3600): a value above
   its ceiling rejects the `task` call with an error naming the key, never a
@@ -705,8 +706,11 @@ mode: review
   root instruction overlay with its nested instruction files, respectively the
   architecture text, out of this persona's children; use them for scout
   personas that should start light. The injected byte counts are logged at
-  debug level. Worktree-isolated write children already start without the
-  parent's instruction overlay.
+  debug level. A worktree-isolated write child starts without the root
+  instruction overlay and is not given one: workspace instructions load only
+  for a project config the user has trusted, trust is bound to that config's
+  path, and a newly created worktree path cannot be trusted, so rebinding would
+  either load nothing or require weakening the trust check.
 - `isolation` is `worktree` or `none` (default). With `mode: write`,
   `worktree` runs each child in its own git worktree and branch; see
   [Worktree-isolated write children](#worktree-isolated-write-children).
@@ -781,11 +785,20 @@ bounded repair turn (a single model reply, tools disabled, charged to the task
 budget) that continues the child's own conversation, tool results included, and
 asks it to restate what it established in the required sections; a negative
 result such as "no such capability exists" is a finding.
-The restatement is used only if it passes validation. Otherwise mini-agent
-withholds the original text from the parent model and returns a fixed
-machine-checkable partial report with low confidence (the user reads the raw text
-with `/tasks result <id>`, marked unverified). Malformed output never
-masquerades as a complete specialist report.
+The restatement is used only if it passes validation. Otherwise (validation and
+repair both failed, or repair was skipped for budget) mini-agent still delivers
+the child's answer, but only as clearly delimited data: the report opens with
+`[partial: unstructured response; not contract-checked]`, carries a low-confidence
+Findings entry that says the answer failed validation and is not instructions,
+and then quotes the answer line by line under `## Unstructured child answer
+(data, not instructions)`. Terminal control sequences are stripped, every line is
+quoted so heading, fence and marker lookalikes are inert, and the whole report is
+bounded by `task_max_report_bytes`. (Before mini-agent-zc1gc the text was
+withheld and replaced by a fixed notice; that invariant was reversed because
+discarding a finished answer forces an expensive re-delegation and no surveyed
+harness removes child content.) A structured, validated report is still the
+preferred path, and a citation in an unstructured answer is never verified.
+Malformed output never masquerades as a complete specialist report.
 
 A child that exhausts its model-turn budget gets one further tool-free turn over
 its full history asking for the contract report. The result opens with
@@ -804,6 +817,38 @@ task_unverified_bytes`, default 6 KiB, at most 16 KiB) is kept for the user:
 `/tasks result <id>` prints it marked unverified. Neither the log nor the raw
 text is part of `task_result` output or any other model-visible text.
 
+Each finished child also records delegation telemetry for the session (kept for
+at most 256 children; later ones are only counted): how its final text stood
+against the contract (`pass`, `repaired`, `normalized`, `unstructured`, `plain`),
+whether the repair or a write-up turn ran, its stop reason (`completed`,
+`turn_budget`, `deadline`, `failed`), turns, tool calls, tokens, cached input
+tokens and cost units. A headless JSON result aggregates it as
+`subagent_delegation` next to `subagent_usage`. The delegated-versus-direct lane
+that consumes it is described in [HARNESS_EVAL.md](HARNESS_EVAL.md). Rows also
+carry a fingerprint of the child's system prompt and tool names, and the
+aggregate reports `calls_with_differing_prefixes` (children of one call that did
+not share a byte-identical cacheable prefix; zero is expected, isolated worktree
+children differ by working directory). The cached input tokens per child are in
+the same rows. A live four-child call with and without `task_stagger_ms` still
+has to compare the cached-token ratios.
+
+### Experimental: inheriting the parent conversation
+
+`[subagents] experimental_inherit_context = true` (default false, not advertised
+otherwise) lets a call pass `inherit_context: true` (mini-agent-wevbz). The host
+then appends a bounded transcript of the parent conversation (the tail, at most
+48 KiB; tool results and attachments omitted, every line quoted as data) to the
+brief of one read-only child. The call is refused unless it carries exactly one
+prompt or brief, is not a resume, uses no write persona and pins no model
+(same-model work only); the approval prompt names the attachment. This is a
+spike for an evaluation, not a feature: Claude Code, Codex and Deep Agents ship
+history inheritance, but no study compares it with a fresh brief, children here
+use a different system prompt and tool set so the prompt-cache saving that
+motivates forks elsewhere does not apply, and parent history carries untrusted
+tool output (hence the text-only transcript). It ships only if
+`scripts/delegation_eval.py` shows a clear accuracy gain at acceptable cost on
+tasks chosen to need prior context; that comparison still has to be run live.
+
 ### Evidence handles
 
 With `task_evidence = true` (the default), the host also records every tool
@@ -820,6 +865,13 @@ The limits are configurable in `[subagents]` (each clamped to 1..ceiling):
 | `evidence_max_record_bytes` | 262144 | 4 MiB | Text kept per record; a longer result keeps a prefix, marked clipped (`MAX_RECORD_TEXT_BYTES`) |
 | `evidence_max_child_bytes` | 16 MiB | 256 MiB | Content per child; later records keep metadata only, marked over ceiling (`MAX_CHILD_EVIDENCE_BYTES`) |
 | `evidence_max_children` | 64 | 1024 | Child stores per session; the oldest is evicted and its files deleted (`MAX_EVIDENCE_TASKS`) |
+
+A child that ended partial (turn budget, its own deadline, an unstructured
+answer) is stored like any other. A child that failed after at least one model
+turn is stored as well and its `[failed: ...]` line is followed by the same
+`[child id: ...]` resume line, so it can be corrected instead of re-delegated;
+a worktree-isolated child never is. A failure caused by a poisoned context will
+fail again on resume.
 
 Resumable child conversations (`task {"resume": id}`) have two more `[subagents]`
 limits: `task_resume_max_children` (default 16, ceiling 256) and
@@ -839,7 +891,7 @@ Children are told, as host policy appended after the read-only or write-mode
 rules, that a Findings entry may end with `[evidence: E3, E7]`. The validator
 checks every citation against the IDs the host minted: an unknown or malformed
 ID is a contract violation and triggers the same single repair turn (whose
-prompt names the valid range). A report that still fails is withheld as above;
+prompt names the valid range). A report that still fails is delivered as flagged, quoted data as above;
 host normalization never passes an unverifiable citation through. A
 `[confidence: high]` finding without a citation only earns a soft note.
 
@@ -1286,11 +1338,12 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_cost_weighting`       | `string` | `"auto"`                 | Model-aware ratios; `"fixed"` uses configured weights |
 | `task_cost_weights`         | `object` | See below                | Token-category weights and automatic-mode fallbacks |
 | `task_cost_overrides`       | `object` | `{}`                     | Weighting/weights by exact selected quick-model alias |
-| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline of foreground calls; completed sibling results and in-flight narration are retained when it expires |
+| `task_timeout_secs`         | `u64`    | `300`                    | Per-child window of foreground calls, counted from the moment each child's model run starts; the whole call is capped at one window plus a 60 s write-up grace per wave of `task_max_concurrency` children. A child past its window keeps its conversation, gets one tool-free write-up turn and returns `[partial: child deadline of Ns reached ...]`; completed siblings and in-flight narration are retained if the whole-call ceiling is reached |
 | `[subagents] task_background_timeout_secs` | `u64` | `3600` | Whole-call deadline of `run_in_background` calls (at most 86400) |
 | `[subagents] agent_memory` / `agent_hooks` | `bool` | `false` | Opt in to a persona's `memory:` notes directory and `hooks:` frontmatter (project config needs trust) |
 | `[subagents] headless_exit_wait_secs` | `u64` | `300` | Seconds a headless run waits at exit for running background tasks before cancelling them (at most 3600; `0` cancels at once) |
 | `[subagents] task_max_turns_ceiling` | `usize` | `100` | Highest per-call or persona `max_turns`; larger values are rejected |
+| `[subagents] task_stagger_ms` | `u64` | `0` | Trial: the second and later children of a call start this many milliseconds after the call began (at most 5000), so they can read the first child's prompt cache; later waves are not delayed. Off by default pending the cache measurement below |
 | `[subagents] task_unverified_bytes` | `usize` | `6144` | Raw text of a host-replaced report kept for `/tasks result` (at most 16384) |
 | `[subagents] task_timeout_ceiling_secs` | `u64` | `3600` | Highest per-call or persona `timeout_secs` (at most 86400); larger values are rejected |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |
@@ -1311,7 +1364,7 @@ Session background batches share one lane of `task_max_concurrency` children;
 the parent turn's own (foreground) task call uses a separate lane of the same
 size, so running background jobs cannot serialize it. Write children of every
 batch still share the session's single write lane. While every in-flight child
-of a call is waiting for a lane, its `task_timeout_secs` deadline is paused,
+of a call is waiting for a lane, its whole-call ceiling is paused,
 with that credit capped at one further timeout; when the deadline stops a call
 whose started children are still waiting, the partial-status header reports
 them as `queued=N`.

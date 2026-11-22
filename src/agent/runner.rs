@@ -5389,6 +5389,10 @@ where
 
     #[cfg(feature = "subagents")]
     let subagent_event_tx = event_tx.clone();
+    // The parent conversation, for the experimental `inherit_context` spike
+    // (mini-agent-wevbz); cloned only when that experiment is on.
+    #[cfg(feature = "subagents")]
+    let parent_history = crate::extras::subagents::inherit::enabled().then(|| history.clone());
 
     // The turn state machine is several hundred KiB in an unoptimized build.
     // Build it on the heap inside `heap_future`'s short frame: held by value,
@@ -6358,6 +6362,15 @@ where
     #[cfg(feature = "subagents")]
     let agent_future =
         crate::extras::subagents::scope_subagent_event_tx(subagent_event_tx, agent_future);
+    #[cfg(feature = "subagents")]
+    let agent_future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        match parent_history {
+            Some(history) => Box::pin(crate::extras::subagents::inherit::scope_parent_history(
+                history,
+                agent_future,
+            )),
+            None => Box::pin(agent_future),
+        };
 
     let agent_future =
         crate::agent::tools::mutation_diff::scope_events(mutation_events, agent_future);
@@ -6480,6 +6493,9 @@ where
     // stacked below startup, provider, task-local and cancellation wrappers.
     // The actual startup consumer exercises the unchanged 1 MiB stack budget.
     let mutations = crate::print::HeadlessMutationEvents::new(output);
+    let history: Arc<[Message]> = history.into();
+    #[cfg(feature = "subagents")]
+    let parent_history = crate::extras::subagents::inherit::enabled().then(|| history.clone());
     let work = crate::startup::heap_future(|| async {
         let mut turn = crate::startup::heap_future(|| {
             run_print_with_stream_policy_and_verification(
@@ -6489,7 +6505,7 @@ where
                 Some(&mutations),
                 retry_config,
                 turn_token_budget,
-                history.into(),
+                history,
                 RunnerStreamPolicy::default(),
                 completion_verification,
                 native_capture,
@@ -6507,7 +6523,58 @@ where
         }
         turn
     });
-    crate::agent::tools::mutation_diff::scope_observer(mutations.observer(), work).await
+    let work = crate::agent::tools::mutation_diff::scope_observer(mutations.observer(), work);
+    // The experimental `inherit_context` spike sees the headless history too.
+    #[cfg(feature = "subagents")]
+    let work: std::pin::Pin<Box<dyn std::future::Future<Output = HeadlessTurn> + Send + '_>> =
+        match parent_history {
+            Some(history) => Box::pin(crate::extras::subagents::inherit::scope_parent_history(
+                history, work,
+            )),
+            None => Box::pin(work),
+        };
+    // Foreground subagents report their start and tool calls through the
+    // parent's event channel; headless runs had none (mini-agent-zdcj5). Only
+    // stream-json shows them, so other formats keep the old, channel-less path.
+    #[cfg(feature = "subagents")]
+    if output.format == crate::cli::OutputFormat::StreamJson {
+        return run_with_subagent_events(output, work).await;
+    }
+    work.await
+}
+
+/// Drive `work` while draining the subagent events its children send, emitting
+/// each as a stream-json record. Events still queued when `work` ends are
+/// flushed; a child clone of the sender cannot keep this waiting.
+#[cfg(feature = "subagents")]
+async fn run_with_subagent_events<F>(
+    output: crate::print::HeadlessOutputPolicy,
+    work: F,
+) -> F::Output
+where
+    F: std::future::Future,
+{
+    let (tx, mut rx) = mpsc::channel(256);
+    let scoped = crate::extras::subagents::scope_subagent_event_tx(tx, work);
+    tokio::pin!(scoped);
+    let mut open = true;
+    let result = loop {
+        tokio::select! {
+            biased;
+            event = rx.recv(), if open => match event {
+                Some(event) => {
+                    let _ = output.subagent_event(&event).await;
+                }
+                None => open = false,
+            },
+            result = &mut scoped => break result,
+        }
+    };
+    rx.close();
+    while let Ok(event) = rx.try_recv() {
+        let _ = output.subagent_event(&event).await;
+    }
+    result
 }
 
 // Mirrors `run_print`'s public parameter list plus the test-only stream policy;
@@ -7246,6 +7313,9 @@ pub(crate) struct SubagentRunOutput {
     /// The child's next request would exceed its context window
     /// ([`CHILD_CONTEXT_REFUSAL`]); `history` is the conversation so far.
     pub context_exhausted: bool,
+    /// The run was stopped by the child's own time window
+    /// (mini-agent-ss239); `history` is the conversation so far.
+    pub deadline_exceeded: bool,
     /// Conversations replaced by context compaction, oldest first. Their tool
     /// results are still evidence the child gathered.
     pub compacted_histories: Vec<Vec<Message>>,
@@ -7265,6 +7335,7 @@ impl SubagentRunOutput {
             turn_budget_exhausted: false,
             empty_final: false,
             context_exhausted: false,
+            deadline_exceeded: false,
             compacted_histories: Vec::new(),
         }
     }
@@ -7294,6 +7365,10 @@ pub(crate) const CHILD_CONTEXT_REFUSAL: &str = "task: child context estimate exc
 
 #[cfg(feature = "subagents")]
 const SUBAGENT_TURN_BUDGET_PARTIAL: &str = "[partial: turn budget exhausted]";
+
+/// Closes the narration of a child stopped by its own time window.
+#[cfg(feature = "subagents")]
+const SUBAGENT_DEADLINE_PARTIAL: &str = "[partial: child deadline reached]";
 
 #[cfg(feature = "subagents")]
 fn append_subagent_turn_budget_partial(response: &mut String) {
@@ -7479,6 +7554,9 @@ where
     // Rig call id -> row in `tool_log` (rows past the bound are not tracked).
     let mut logged: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut turn_budget_exhausted = false;
+    let mut deadline_exceeded = false;
+    // The child's own time window, when the scheduler gave it one.
+    let child_deadline = crate::extras::subagents::partial::child_deadline();
     // Mid-stream retry: what this stream produced so far, to resume from it.
     let mut bridge: Vec<Message> = Vec::new();
     // Messages before the current stream's own (original prompt + bridge) once resumed.
@@ -7495,11 +7573,35 @@ where
                 turn_budget_exhausted,
                 empty_final: false,
                 context_exhausted: false,
+                deadline_exceeded,
                 compacted_histories: Vec::new(),
             }
         };
     }
-    while let Some(item) = stream.next().await {
+    loop {
+        let next = match child_deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    biased;
+                    item = stream.next() => item,
+                    () = tokio::time::sleep_until(deadline) => {
+                        // Keep what the child did and ask the task tool for a
+                        // tool-free write-up instead of discarding it.
+                        deadline_exceeded = true;
+                        turn.tool_calls.finalize_unresolved(&mut turn.interactions);
+                        child_history =
+                            subagent_history_so_far(&history, prompt, &bridge, &turn.interactions);
+                        if !turn.response.is_empty() && !turn.response.ends_with('\n') {
+                            turn.response.push('\n');
+                        }
+                        turn.response.push_str(SUBAGENT_DEADLINE_PARTIAL);
+                        break;
+                    }
+                }
+            }
+            None => stream.next().await,
+        };
+        let Some(item) = next else { break };
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
                 turn.on_text(&text.text);
@@ -7719,6 +7821,37 @@ where
 mod tests {
     // mini-agent-sskdu.100: the envelope test needs no `Value` tree and keeps
     // the same verdicts.
+    // mini-agent-zdcj5: stream-json headless runs give foreground children an
+    // event channel, drained while the turn runs, and flush it when done.
+    #[cfg(feature = "subagents")]
+    #[tokio::test]
+    async fn stream_json_headless_runs_scope_a_subagent_event_channel() {
+        let output = crate::print::HeadlessOutputPolicy {
+            format: crate::cli::OutputFormat::StreamJson,
+            pure_stdout: false,
+            quiet: true,
+            legacy_stream: false,
+        };
+        assert!(crate::extras::subagents::clone_subagent_event_tx().is_none());
+        let seen = super::run_with_subagent_events(output, async {
+            let tx = crate::extras::subagents::clone_subagent_event_tx()
+                .expect("children can reach the channel");
+            for n in 0..400 {
+                // More than the channel holds: the drain keeps it moving.
+                tx.send(crate::event::AgentEvent::SubagentToolCall {
+                    name: "read".into(),
+                    args: serde_json::json!({"n": n}),
+                    outer: None,
+                })
+                .await
+                .unwrap();
+            }
+            "done"
+        })
+        .await;
+        assert_eq!(seen, "done");
+    }
+
     #[test]
     fn image_envelope_detection_matches_the_value_based_check() {
         use super::result_has_image_parts as has;

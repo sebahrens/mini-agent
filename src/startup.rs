@@ -4191,6 +4191,19 @@ impl Startup {
             if !child_rows.is_empty() {
                 rendered["subagent_usage"] = crate::print::subagent_usage_json(&child_rows);
             }
+            // Delegation telemetry: contract pass, repair, host replacement,
+            // turns, tokens, cost units and stop reason per child
+            // (mini-agent-964ao).
+            #[cfg(feature = "subagents")]
+            {
+                let (rows, finished) =
+                    crate::extras::subagents::telemetry::report(&self.session.id);
+                if let Some(json) =
+                    crate::extras::subagents::telemetry::delegation_json(&rows, finished)
+                {
+                    rendered["subagent_delegation"] = json;
+                }
+            }
             crate::print::emit_headless_result(
                 &rendered.to_string(),
                 output.format,

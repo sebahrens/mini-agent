@@ -72,3 +72,18 @@ retention does not clear five retained details before summarization, the next
 provider request includes all five paths, and summarizer plus turn usage is
 persisted exactly once. These are context-delivery regressions, rather than an
 assessment of real-model summary quality.
+
+## Delegated versus direct lane
+
+`scripts/delegation_eval.py` (mini-agent-964ao) is an operator-run lane, not a CI
+check: it needs a configured provider and costs money. It runs each task of
+`tests/harness_eval/delegation/tasks.json` twice with a real binary, once with the
+`task` tool enabled and once with `[subagents] task_enabled = false`, checks the
+expected files, and compares tokens and cost per task together with the
+`subagent_delegation` telemetry of the headless result (contract pass, repair
+used, host replacement, turns, cost units, stop reason). `--summarize FILE`
+compares records of an earlier run offline. A baseline run is still to be
+recorded next to the fixtures as `baseline.json`; the published delegation
+numbers are ten-task samples by the authors of a competing method, so this lane
+is how this harness gets its own. `scripts/tests/test_delegation_eval.py` checks
+the script offline.
