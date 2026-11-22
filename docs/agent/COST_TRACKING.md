@@ -57,6 +57,14 @@ unreported: the row carries `usage_reported: false` and `cost: null`, and future
 capped work is blocked. Explicit known free rates remain free; no paid zero-dollar
 observation or unreported token quantity is inferred.
 
+A stream that is interrupted after it opened is charged an estimate: the request's input plus
+the output implied by the bytes received (two bytes per token), never more than the request's
+`max_tokens` bound. Its ledger row carries `estimated: true` (absent otherwise), and the exit
+summary names those tokens ("estimated for interrupted requests") so its token counts and its
+cost describe the same requests. A capped run also refuses, before sending, a request whose
+prompt and tool list alone are certain to cost more than the remaining USD budget; it stops
+with exit code 4 and a stderr line naming the cost floor and the flag to raise.
+
 The financial account is monotonic across live clones, rewind and resume. A saved
 checkpoint is reconciled with matching-session ledger observations without
 charging an old receipt twice. Automatic session forks retain incomplete/unpriced

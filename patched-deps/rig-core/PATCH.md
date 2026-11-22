@@ -459,3 +459,11 @@ short-circuits a marked call with a corrective tool result.
 `usage.cost` (USD per response) is converted by `openrouter::client::cost_to_nano_usd`
 for both blocking and streamed responses; other providers leave it 0. `Add`/`AddAssign`
 sum it and `has_values` counts it.
+
+## Tool result prefix (mini-agent-6wtc2)
+
+`ToolExecutionResult::with_model_output_prefix` inserts text before the model
+output while keeping the outcome and extensions. The application uses it when a
+stream-json control driver rewrote a tool call's arguments, so the model sees
+which arguments actually ran. No dependency version, checksum or dispatch
+behaviour changes.

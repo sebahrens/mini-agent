@@ -8,6 +8,10 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Fixed
 
+- An interrupted stream's ledger row is flagged `estimated`, and the exit summary names the estimated tokens so its totals match the charged cost; a capped run refuses a request whose prompt alone exceeds the remaining budget before sending it, with exit code 4 (mini-agent-4zov7, mini-agent-qpci0).
+- A stream-json control `updatedInput` that fails the tool's schema now denies the call and emits an `input_error`; a valid rewrite prefixes the tool result with a note giving the effective arguments (mini-agent-6wtc2; adds `ToolExecutionResult::with_model_output_prefix` to the vendored rig-core).
+- `--stream-json-schema claude` assistant messages carry the response's reported `usage` (mini-agent-s940q).
+- Failed shell commands whose output shows a refused or cut connection (curl `Failed to connect`, LibreSSL `SSL_ERROR_SYSCALL`) are attributed to the sandbox's denied network, and the note names `--sandbox-network allow` (mini-agent-h8uk3).
 - A failed hashedit lets the re-read it asks for through the repeated-read guard, and restarted goal/loop rounds clear the guard because their earlier tool results are gone (mini-agent-5zdmu, mini-agent-hs2tc).
 - A compaction summary cut off at the output cap (reasoning tokens count toward it) is retried once with a four times larger cap before it is accepted, and an empty reasoning-only response now reports why (mini-agent-h3ay0).
 - Compaction on the OpenRouter route forks the conversation's own request so the provider prompt cache can serve the prefix, as Anthropic and OpenAI already did (mini-agent-csng7).

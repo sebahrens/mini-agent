@@ -2430,7 +2430,7 @@ const WINDOWS_NUL_MARKERS: [&str; 2] = ["could not open '/dev/null'", "\\.\\nul'
 /// Spellings of a denied network: resolver, curl, git, npm, cargo and pip
 /// failures when the shell has no network (or only a refusing proxy). These
 /// are attributed to the sandbox outright when the session's network is denied.
-const NETWORK_FAILURE_MARKERS: [&str; 11] = [
+const NETWORK_FAILURE_MARKERS: [&str; 14] = [
     "could not resolve host",
     "network is unreachable",
     "temporary failure in name resolution",
@@ -2442,6 +2442,11 @@ const NETWORK_FAILURE_MARKERS: [&str; 11] = [
     "connect tunnel failed",
     "tunnel connection failed",
     "no address associated with hostname",
+    // curl on macOS (LibreSSL) and Linux when the connection itself is refused
+    // or cut, rather than the name failing to resolve (mini-agent-h8uk3).
+    "couldn't connect to server",
+    "failed to connect to",
+    "ssl_error_syscall",
 ];
 
 /// Windows ERROR_NOT_ENOUGH_QUOTA text: the AppContainer Job's active-process
@@ -2544,7 +2549,7 @@ pub(crate) fn sandbox_failure_note(
     }
     if network_failure && shell_network_denied(sandbox) {
         note.push_str(
-            " The user can run /sandbox network allowlist (asks per host) or allow for this session.",
+            " Network is off in the sandbox: the user can run /sandbox network allowlist (asks per host) or allow for this session, or start with --sandbox-network allow (config key sandbox-network).",
         );
     }
     note.push_str(" See /sandbox");
@@ -3900,6 +3905,20 @@ mod tests {
         );
         assert_eq!(output.stdout.len(), limits.stdout_bytes);
         assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn curl_connection_failures_are_attributed_to_a_denied_network() {
+        let on = Sandbox::new(true, "bwrap");
+        for output in [
+            "curl: (7) Failed to connect to example.com port 443 after 3 ms: Couldn't connect to server",
+            "curl: (35) LibreSSL SSL_connect: SSL_ERROR_SYSCALL in connection to example.com:443",
+        ] {
+            let note = sandbox_failure_note(&on, false, true, output)
+                .unwrap_or_else(|| panic!("no note for {output}"));
+            assert!(note.contains("caused by the sandbox"), "{note}");
+            assert!(note.contains("--sandbox-network allow"), "{note}");
+        }
     }
 
     #[test]

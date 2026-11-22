@@ -2584,6 +2584,14 @@ pub(crate) fn exit_summary(session: &Session, no_session: bool) -> Option<String
         session.total_input_tokens,
         session.total_output_tokens
     );
+    // Interrupted streams are charged at an estimate; their tokens are in the
+    // cost but not in the session totals, so name them (mini-agent-4zov7).
+    let (estimated_in, estimated_out) = session.spend_account.estimated_tokens();
+    if estimated_in + estimated_out > 0 {
+        usage.push_str(&format!(
+            " (+{estimated_in} in / +{estimated_out} out estimated for interrupted requests)"
+        ));
+    }
     let cost = session.recorded_total_cost();
     if cost > 0.0 {
         let marker = if session.cost_is_incomplete() {
