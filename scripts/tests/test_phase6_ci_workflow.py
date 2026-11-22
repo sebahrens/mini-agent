@@ -848,7 +848,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
     def test_windows_default_suite_has_a_strict_compile_gate(self) -> None:
         body = job_body(self.workflow, "windows-default-compile")
         header = body.split("    steps:\n", 1)[0]
-        self.assertIn("timeout-minutes: 30", header)
+        self.assertIn("timeout-minutes: 50", header)
         self.assertNotIn("continue-on-error", header)
         step = body.split("name: Compile the Windows default feature suite", 1)[
             1

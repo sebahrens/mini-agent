@@ -4371,7 +4371,9 @@ impl<'a> App<'a> {
             let pressure = self.run.pending_compaction_pressure.take().ok_or_else(|| {
                 anyhow::anyhow!("runner reached an unrequested compaction boundary")
             })?;
-            if let Err(error) = self.mid_turn_compact(pressure, &interactions).await {
+            if let Err(error) =
+                crate::startup::heap_future(|| self.mid_turn_compact(pressure, &interactions)).await
+            {
                 return self.fail_context_relief(error).await;
             }
             self.run.awaiting_compaction_relief = !self.run.mid_turn_compaction_disabled;
@@ -7734,15 +7736,17 @@ impl<'a> App<'a> {
             // The restored prompt then continues on the compacted context
             // without /clear (mini-agent-tmysj).
             let reasoning_enabled = self.slash.reasoning_enabled;
-            let compacted = crate::ui::slash::handle_compress_with_force(
-                None,
-                true,
-                true,
-                &mut self.run,
-                &mut self.renderer,
-                &mut self.ui,
-                reasoning_enabled,
-            )
+            let compacted = crate::startup::heap_future(|| {
+                crate::ui::slash::handle_compress_with_force(
+                    None,
+                    true,
+                    true,
+                    &mut self.run,
+                    &mut self.renderer,
+                    &mut self.ui,
+                    reasoning_enabled,
+                )
+            })
             .await;
             let notice = match compacted {
                 Ok(()) => {
@@ -7757,14 +7761,16 @@ impl<'a> App<'a> {
             self.renderer.write_line(notice, C_ERROR)?;
             return Ok(());
         }
-        mid_turn_compact_and_respawn(
-            pressure,
-            interactions,
-            &mut self.renderer,
-            &mut self.run,
-            &mut self.ui,
-            &self.slash,
-        )
+        crate::startup::heap_future(|| {
+            mid_turn_compact_and_respawn(
+                pressure,
+                interactions,
+                &mut self.renderer,
+                &mut self.run,
+                &mut self.ui,
+                &self.slash,
+            )
+        })
         .await
     }
 

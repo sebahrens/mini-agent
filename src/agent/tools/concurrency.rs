@@ -406,7 +406,9 @@ impl ToolDyn for ConcurrencyBoundTool {
 
     fn call<'a>(&'a self, args: String) -> WasmBoxedFuture<'a, Result<String, ToolError>> {
         let spend = crate::spend::run::Run::current();
-        let future = async move {
+        // Boxed before the scope wrappers below: each generic wrapper's poll frame
+        // otherwise holds several by-value copies of this whole future (1 MiB stack pin).
+        let future = Box::pin(async move {
             let slot = self.lease(&args).await;
             LANE.scope(slot, async {
                 crate::spend::run::admit_current_effect()
@@ -428,7 +430,7 @@ impl ToolDyn for ConcurrencyBoundTool {
                 .await
             })
             .await
-        };
+        });
         let future = crate::spend::run::scope(spend, future);
         #[cfg(feature = "acp")]
         let future = crate::permission::ask::scope_tool_call(self.inner.name(), future);
@@ -444,7 +446,9 @@ impl ToolDyn for ConcurrencyBoundTool {
             .get::<crate::spend::run::Run>()
             .cloned()
             .or_else(crate::spend::run::Run::current);
-        let future = async move {
+        // Boxed before the scope wrappers below: each generic wrapper's poll frame
+        // otherwise holds several by-value copies of this whole future (1 MiB stack pin).
+        let future = Box::pin(async move {
             let slot = self.lease(&args).await;
             LANE.scope(slot, async {
                 crate::spend::run::admit_current_effect()
@@ -466,7 +470,7 @@ impl ToolDyn for ConcurrencyBoundTool {
                 .await
             })
             .await
-        };
+        });
         let future = crate::spend::run::scope(spend, future);
         let future = crate::question::scope_extensions(extensions, future);
         #[cfg(feature = "acp")]
@@ -485,7 +489,9 @@ impl ToolDyn for ConcurrencyBoundTool {
             .or_else(crate::spend::run::Run::current);
         // Claimed synchronously, right after the SDK announced this call.
         let call_id = crate::agent::tools::bash::claim_call_id(extensions, &self.name, &args);
-        let future = async move {
+        // Boxed before the scope wrappers below: each generic wrapper's poll frame
+        // otherwise holds several by-value copies of this whole future (1 MiB stack pin).
+        let future = Box::pin(async move {
             let slot = self.lease(&args).await;
             LANE.scope(slot, async {
                 if let Err(error) = crate::spend::run::admit_current_effect().await {
@@ -515,7 +521,7 @@ impl ToolDyn for ConcurrencyBoundTool {
                 .await
             })
             .await
-        };
+        });
         let future = if self.is_shell {
             futures::future::Either::Left(crate::agent::tools::bash::scope_shell_call_id(
                 call_id, future,
