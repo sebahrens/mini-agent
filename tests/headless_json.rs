@@ -2195,7 +2195,9 @@ fn main() {
             "type":"mcp_tool", "server":"audit", "tool":"probe",
             "input":{"session":"${session_id}","event":"${hook_event_name}"}, "timeout":5, "trust":"trusted"
         }]}]}}).to_string()).unwrap();
-        let mut command = root.provider_command("mcp__audit__probe");
+        // `--tools` names the registered MCP tool (`probe`); the `mcp__server__tool` form is
+        // only the hook matcher name (mini-agent-sskdu.75).
+        let mut command = root.provider_command("probe");
         command.args(["-p", "--output", "stream-json"]);
         let output = if stream {
             command
@@ -2206,12 +2208,18 @@ fn main() {
             command.arg("one prompt");
             bounded_output(command)
         };
-        let requests = server.join().unwrap().unwrap();
+        let served = server.join().unwrap();
         assert!(
             output.status.success(),
             "stream={stream}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        let requests = served.unwrap_or_else(|error| {
+            panic!(
+                "stream={stream}: provider {error}; stderr: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
         assert_eq!(requests.len(), if stream { 2 } else { 1 });
         let rows: Vec<serde_json::Value> = String::from_utf8(output.stdout)
             .unwrap()
@@ -4333,8 +4341,12 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
                             assert!(count > 0, "{mode}: output closed before final snapshot");
                             prefix.extend_from_slice(&bytes[..count as usize]);
                             assert!(
-                                prefix.len() - payload_start < 64 * 1024,
-                                "only bounded intermediate rows may drain before final snapshot"
+                                // The completed 2 MiB text now streams as full
+                                // `assistant_text` chunk records ahead of the
+                                // final snapshot (mini-agent-55yev), so the
+                                // bound is the text plus record framing.
+                                prefix.len() - payload_start < 2 * 1024 * 1024 + 256 * 1024,
+                                "{mode}: only bounded intermediate rows may drain before final snapshot"
                             );
                         }
                     } else {
@@ -4373,7 +4385,13 @@ fn stalled_open_stdout_has_bounded_signal_cleanup_and_preserves_accounting_witho
                     );
                     prefix.extend_from_slice(&bytes[..count as usize]);
                     assert!(
-                        prefix.len() - payload_start < 64 * 1024,
+                        prefix.len() - payload_start
+                            < if mode == "final-json" {
+                                // Full `assistant_text` chunk records precede the result.
+                                2 * 1024 * 1024 + 256 * 1024
+                            } else {
+                                64 * 1024
+                            },
                         "the fixture must stop draining at the start of the large payload"
                     );
                 }

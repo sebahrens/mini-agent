@@ -497,7 +497,7 @@ mod persistence_tests {
                     run,
                 )
                 .unwrap();
-            tokio::time::timeout(
+            let outcome = tokio::time::timeout(
                 std::time::Duration::from_secs(5),
                 crate::startup::with_headless_exit_wait_gate(
                     gate.clone(),
@@ -515,7 +515,12 @@ mod persistence_tests {
             )
             .await
             .expect("loop and exact task cleanup are bounded")
-            .unwrap();
+            .expect_err("the spent iteration cap leaves the goal unmet and exits 24");
+            assert_eq!(
+                outcome.to_string(),
+                "goal stopped: GoalBudgetLimited",
+                "a spent --loop-max stops the headless loop with the goal-budget exit (mini-agent-u0t2v)"
+            );
             server.await.unwrap();
             assert!(
                 gate.entered.load(std::sync::atomic::Ordering::SeqCst),

@@ -240,6 +240,7 @@ pub(crate) struct PersonaExecution {
     /// write personas only (mini-agent-irrra).
     pub(crate) git_status: Option<String>,
     /// Persona `architecture: false`: no architecture text for this child.
+    #[cfg_attr(not(feature = "archmd"), allow(dead_code))]
     pub(crate) omit_architecture: bool,
     /// Receives the fingerprint of this child's system prompt and tool names,
     /// so a call can confirm its siblings share a byte-identical cache prefix
