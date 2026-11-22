@@ -1234,7 +1234,6 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
     crate::agent::tools::set_edit_system(crate::config::types::EditSystem::Similarity);
     let mut outputs = Vec::new();
     let mut stale_results = Vec::new();
-    let mut rejected_edits = Vec::new();
     for relative in [false, true] {
         let name = format!("tool-{relative}.rs");
         let path = if relative {
@@ -1266,25 +1265,11 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
                 edits: None,
             })
             .await;
-        let checked_edit_unsupported = cfg!(windows) && relative;
-        if checked_edit_unsupported {
-            // Windows bound replacements deliberately refuse publication when
-            // no atomic expected-identity exchange is available. The refusal
-            // must leave both the file and its synchronized version unchanged.
-            rejected_edits.push((
-                edited,
-                fs::read_to_string(&source).unwrap(),
-                manager
-                    .diagnostics_block_since(&source, Duration::ZERO, None)
-                    .await,
-            ));
-        } else {
-            outputs.push((relative, "edit", 2, edited));
-        }
+        outputs.push((relative, "edit", 2, edited));
         outputs.push((
             relative,
             "query",
-            if checked_edit_unsupported { 2 } else { 3 },
+            3,
             query
                 .call(LspArgs {
                     path: Some(path.clone()),
@@ -1323,17 +1308,6 @@ async fn lsp_process_diagnostics_reach_real_write_edit_and_query_tools() {
             "stale diagnostics survived rewrite during permission wait"
         );
         assert!(aggregate.unwrap().starts_with("No diagnostics."),);
-    }
-    for (edited, content, diagnostic) in rejected_edits {
-        let error = edited.expect_err("Windows checked edit must refuse publication");
-        assert!(
-            error
-                .to_string()
-                .contains("atomic compare-and-replace is unsupported"),
-            "{error}"
-        );
-        assert_eq!(content, "before");
-        assert!(diagnostic.unwrap().contains("fixture diagnostic version 1"));
     }
     for (relative, operation, version, result) in outputs {
         let output =
