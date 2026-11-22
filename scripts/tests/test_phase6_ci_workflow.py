@@ -734,6 +734,33 @@ class Phase6CiWorkflowTests(unittest.TestCase):
             },
         )
 
+    def test_pull_requests_run_only_the_default_macos_test_row(self) -> None:
+        # The non-default macOS rows and the macOS parallel smoke are removed
+        # from the pull-request matrix (not skipped), so ci-success keeps
+        # seeing a plain success for `test` and `parallel-test-smoke`.
+        pr_os = (
+            "os: ${{ github.event_name == 'pull_request' "
+            "&& 'macos-latest' || 'not-excluded' }}"
+        )
+        header = job_body(self.workflow, "test").split("    steps:\n", 1)[0]
+        dynamic = re.findall(
+            r'- ' + re.escape(pr_os) + r'\n\s+features: "([^"]*)"', header
+        )
+        self.assertEqual(
+            set(dynamic),
+            {
+                "--no-default-features --features sandbox",
+                "--no-default-features --features js",
+                "--no-default-features --features js,sandbox",
+                "--no-default-features --features hooks,advisor,lsp,multimodal,pdf",
+                "--no-default-features --features hooks,js,subagents,skills,sandbox",
+            },
+        )
+        self.assertNotIn("", dynamic)
+        smoke = job_body(self.workflow, "parallel-test-smoke").split("    steps:\n", 1)[0]
+        self.assertIn("- " + pr_os + "\n", smoke)
+        self.assertNotIn("pull_request", job_body(self.workflow, "ci-success"))
+
     def test_matrix_isolates_process_global_worker_and_skill_tests(self) -> None:
         body = job_body(self.workflow, "test")
         full_path = (

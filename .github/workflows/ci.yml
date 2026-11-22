@@ -572,6 +572,22 @@ jobs:
             features: "--no-default-features --features js,skills"
           - os: macos-latest
             features: "--no-default-features --features mcp,js,sandbox,skills,memory"
+        # Pull requests run only the default macOS row; the five platform rows
+        # below run on pushes to main, tags and manual dispatch. They are
+        # absent from a pull-request matrix (not skipped jobs), so ci-success
+        # still sees a plain `success` for `test`. On any other event the
+        # expression yields a value no row has and excludes nothing
+        # (mini-agent-nvnkx.8).
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'not-excluded' }}
+            features: "--no-default-features --features sandbox"
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'not-excluded' }}
+            features: "--no-default-features --features js"
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'not-excluded' }}
+            features: "--no-default-features --features js,sandbox"
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'not-excluded' }}
+            features: "--no-default-features --features hooks,advisor,lsp,multimodal,pdf"
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'not-excluded' }}
+            features: "--no-default-features --features hooks,js,subagents,skills,sandbox"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
@@ -802,6 +818,11 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.test_os) }}
+        # The macOS run is a 37-minute serial-free rerun of the default suite;
+        # it runs on pushes, tags and the weekly drift schedule, not on pull
+        # requests (the Linux run and the macOS `test` default row stay).
+        exclude:
+          - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'not-excluded' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
