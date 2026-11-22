@@ -84,12 +84,22 @@ pub struct TaskCallOptions {
     /// `context: fork` skills. Raw model ids are rejected, and so is any
     /// override of a persona that pins its own `model:`.
     pub model: Option<String>,
+    /// `"report"` (host Findings/Unverified/Coverage contract) or `"plain"`
+    /// (free-form text, the persona `contract: none` path) for this call's
+    /// children, overriding the persona's `contract`.
+    pub contract: Option<String>,
+    /// Short (3-5 word) description of the call: the stored task label and
+    /// the first line of the permission prompt.
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct TaskBrief {
     pub objective: String,
+    /// Short (3-5 word) description of this brief's child (optional).
+    #[serde(default, deserialize_with = "optional_text")]
+    pub label: Option<String>,
     /// Why the task exists and the decisions that bear on it (optional).
     #[serde(default, deserialize_with = "optional_text")]
     pub context: Option<String>,
@@ -186,6 +196,8 @@ where
 #[serde(deny_unknown_fields)]
 struct RawTaskBrief {
     objective: String,
+    #[serde(default, deserialize_with = "optional_text")]
+    label: Option<String>,
     #[serde(default, deserialize_with = "optional_text")]
     context: Option<String>,
     #[serde(default, deserialize_with = "string_list")]
@@ -285,6 +297,10 @@ impl<'de> Deserialize<'de> for TaskArgs {
             base_ref: Option<String>,
             #[serde(default)]
             model: Option<String>,
+            #[serde(default)]
+            contract: Option<String>,
+            #[serde(default, deserialize_with = "optional_text")]
+            label: Option<String>,
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
@@ -295,6 +311,8 @@ impl<'de> Deserialize<'de> for TaskArgs {
             isolation: raw.isolation,
             base_ref: raw.base_ref,
             model: raw.model,
+            contract: raw.contract,
+            label: raw.label,
         };
         let mut raw_briefs = raw.briefs.map(|briefs| briefs.0);
         let mut agent_type = raw.agent_type;
@@ -324,6 +342,7 @@ impl<'de> Deserialize<'de> for TaskArgs {
                 .into_iter()
                 .map(|brief| TaskBrief {
                     objective: brief.objective,
+                    label: brief.label,
                     context: brief.context,
                     known: brief.known,
                     done_when: brief.done_when,
@@ -668,6 +687,13 @@ fn validate_call_options(
     }
     if let Some(base) = options.base_ref.as_deref() {
         super::isolation::validate_base_ref(base).map_err(ToolError::Msg)?;
+    }
+    if let Some(contract) = options.contract.as_deref()
+        && !matches!(contract, "report" | "plain")
+    {
+        return Err(ToolError::Msg(format!(
+            "task: contract must be \"report\" or \"plain\", got {contract:?}"
+        )));
     }
     // Reuses the ceiling checks with no persona, which only validates the
     // call's own values.
@@ -1358,22 +1384,80 @@ fn resolve_specialization(
     }))
 }
 
+/// The model-written label of a call, one clean line of at most
+/// `MAX_LABEL_BYTES`: the call's own, else the first brief's, with a count of
+/// the remaining briefs. `None` when nobody wrote one.
+fn call_label(args: &TaskArgs) -> Option<String> {
+    let clean = |text: &str| {
+        let one_line = text
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        (!one_line.is_empty())
+            .then(|| super::background::clip_bytes(&one_line, super::background::MAX_LABEL_BYTES))
+    };
+    if let Some(label) = args.options.label.as_deref().and_then(clean) {
+        return Some(label);
+    }
+    let briefs = args.briefs.as_deref()?;
+    let first = briefs
+        .iter()
+        .find_map(|brief| brief.label.as_deref().and_then(clean))?;
+    Some(match briefs.len() {
+        0 | 1 => first,
+        more => super::background::clip_bytes(
+            &format!("{first} (+{} more)", more - 1),
+            super::background::MAX_LABEL_BYTES,
+        ),
+    })
+}
+
+/// The stored label of a task: the model's, else the first brief's objective,
+/// else the start of the first prompt.
+fn task_label_for(args: &TaskArgs, prompts: &[String]) -> String {
+    if let Some(label) = call_label(args) {
+        return label;
+    }
+    let from_objective = args
+        .briefs
+        .as_deref()
+        .and_then(|briefs| briefs.first())
+        .map(|brief| brief.objective.as_str());
+    let source = from_objective.or(prompts.first().map(String::as_str));
+    source
+        .map(|text| {
+            let head: String = text.chars().take(200).collect();
+            head.split_whitespace().collect::<Vec<_>>().join(" ")
+        })
+        .unwrap_or_default()
+}
+
 fn permission_input(
     prompts: &[String],
     agent_type: Option<&str>,
     specialist_source: Option<&str>,
     execution_profile: Option<&str>,
+    label: Option<&str>,
 ) -> String {
     let prompts = prompts.join(" | ");
+    // Label, persona and mode come first; the full prompt text always stays
+    // visible because a label is only the model's own description.
+    let head = label
+        .map(|label| format!("label: {label}\n"))
+        .unwrap_or_default();
     match (agent_type, specialist_source) {
         (Some(agent_type), Some(source)) => {
             let profile = execution_profile
                 .map(|profile| format!("\nspecialist execution: {profile}"))
                 .unwrap_or_default();
             format!(
-                "agent_type: {agent_type}\nspecialist source: {source}{profile}\nprompts: {prompts}"
+                "{head}agent_type: {agent_type}\nspecialist source: {source}{profile}\nprompts: {prompts}"
             )
         }
+        _ if label.is_some() => format!("{head}mode: read-only\nprompts: {prompts}"),
         _ => prompts,
     }
 }
@@ -1758,6 +1842,7 @@ partial statuses are returned.")
                         "type": "object",
                         "additionalProperties": false,
                         "properties": {
+                            "label": { "type": "string", "description": "Optional 3-5 word description of this subagent." },
                             "objective": { "type": "string", "minLength": 1, "description": "The goal of the subagent and why it matters; describe the outcome, not the steps." },
                             "context": { "type": "string", "description": "Optional. Why the task exists and the decisions that bear on it. The subagent cannot see this conversation." },
                             "known": {
@@ -1798,6 +1883,15 @@ partial statuses are returned.")
                     "minimum": 1,
                     "maximum": timeout_ceiling,
                     "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs {default_timeout} in the foreground or task_background_timeout_secs {default_background_timeout} in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Optional 3-5 word description of this call, shown in permission prompts, /tasks and logs. The full prompt stays visible in the approval."
+                },
+                "contract": {
+                    "type": "string",
+                    "enum": ["report", "plain"],
+                    "description": "Optional response shape for this call's children. report (default) requires the host Findings, Unverified and Coverage sections and is validated; plain returns the child's free-form text, quoted and size-bounded but not section-checked, which suits a one-line answer or generated text. Overrides a persona's contract."
                 },
                 "model": {
                     "type": "string",
@@ -1899,11 +1993,13 @@ partial statuses are returned.")
             permission_source,
             resume_store,
         } = self.validate_call_args(&args, &config, limits)?;
+        let call_label = call_label(&args);
         let delegation_input = permission_input(
             &prompts,
             agent_type.as_deref(),
             permission_source.as_deref(),
             None,
+            call_label.as_deref(),
         );
         check_perm(
             &self.permission,
@@ -1917,6 +2013,15 @@ partial statuses are returned.")
         // not read them until the delegation itself has been authorized.
         let specialization =
             resolve_specialization(agent_type.as_deref(), self.workspace.as_deref())?;
+        // The response contract of this call: its own `contract` wins over
+        // the persona's (`plain` is the persona `contract: none` path).
+        let call_free_form = match args.options.contract.as_deref() {
+            Some("plain") => true,
+            Some(_) => false,
+            None => specialization
+                .as_ref()
+                .is_some_and(|persona| persona.run.free_form),
+        };
         // Tell each child which file hints exist (mini-agent-2jysx). Notes are
         // host text from the parent's own readable view of the workspace.
         if resumed.is_none()
@@ -1937,10 +2042,7 @@ partial statuses are returned.")
                     ToolError::Msg(format!("task: file hint check failed: {error}"))
                 })?;
                 args.briefs = Some(briefs);
-                let free_form = specialization
-                    .as_ref()
-                    .is_some_and(|persona| persona.run.free_form);
-                prompts = prepare_task_prompts_for(&args, limits, free_form)?;
+                prompts = prepare_task_prompts_for(&args, limits, call_free_form)?;
             } else {
                 args.briefs = Some(briefs);
             }
@@ -1961,11 +2063,7 @@ partial statuses are returned.")
             limits = limits.for_background(&config)?;
             prompts = prepare_task_prompts(&args, limits)?;
         }
-        if specialization
-            .as_ref()
-            .is_some_and(|persona| persona.run.free_form)
-            && args.briefs.is_some()
-        {
+        if call_free_form && args.briefs.is_some() {
             prompts = prepare_task_prompts_for(&args, limits, true)?;
         }
         let write_mode = specialization
@@ -2028,6 +2126,7 @@ partial statuses are returned.")
                 } else {
                     "write-capable child: eligible write/edit/shell tools; parent's permissions and sandbox; one child at a time"
                 }),
+                call_label.as_deref(),
             );
             check_perm(&self.permission, &self.ask_tx, Self::NAME, &input).await?;
             if uses_shared_write_lane(write_mode, isolated) {
@@ -2181,12 +2280,7 @@ partial statuses are returned.")
             None => run,
         });
         let (read_only_shell, web_tools) = self.child_extras(specialization.as_ref(), &config);
-        let report_policy = ReportPolicy::from_config(
-            &config,
-            specialization
-                .as_ref()
-                .is_some_and(|persona| persona.run.free_form),
-        );
+        let report_policy = ReportPolicy::from_config(&config, call_free_form);
         runtime.execution.tools =
             with_read_only_shell_tool(runtime.execution.tools.take(), read_only_shell);
         let specialization = specialization.map(|resolved| resolved.prompt);
@@ -2292,13 +2386,7 @@ partial statuses are returned.")
         let executor_budget = live_budget.clone();
         let details_sink = DetailsSink::default();
         let executor_sink = details_sink.clone();
-        let task_label = prompts
-            .first()
-            .map(|prompt| {
-                let head: String = prompt.chars().take(200).collect();
-                head.split_whitespace().collect::<Vec<_>>().join(" ")
-            })
-            .unwrap_or_default();
+        let task_label = task_label_for(&args, &prompts);
         let resume_history = resumed.map(|stored| Arc::new(stored.history));
         let job_inbox = admission.as_ref().map(super::background::Admission::inbox);
         let resume_agent_type = agent_type.clone();
@@ -6658,6 +6746,35 @@ fn main() {
     }
 
     #[test]
+    fn contract_option_decodes_validates_and_is_in_the_schema() {
+        let args: TaskArgs =
+            serde_json::from_value(serde_json::json!({"prompts": ["q"], "contract": "plain"}))
+                .unwrap();
+        assert_eq!(args.options.contract.as_deref(), Some("plain"));
+        let config = crate::config::Config::default();
+        assert!(validate_call_options(&args.options, &config).is_ok());
+        let bad: TaskArgs =
+            serde_json::from_value(serde_json::json!({"prompts": ["q"], "contract": "xml"}))
+                .unwrap();
+        let error = validate_call_options(&bad.options, &config)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("contract must be"), "{error}");
+        let schema = TaskTool::new(None, None, false).parameters();
+        assert_eq!(
+            schema["properties"]["contract"]["enum"],
+            serde_json::json!(["report", "plain"])
+        );
+        // A plain brief carries no host-section demand.
+        let brief = TaskBrief {
+            objective: "x".into(),
+            ..Default::default()
+        };
+        let plain = render_task_brief_for(0, &brief, true).unwrap();
+        assert!(!plain.contains("Findings"), "{plain}");
+    }
+
+    #[test]
     fn optional_brief_sections_render_as_data_and_only_when_given() {
         let plain = TaskBrief {
             objective: "Audit auth".into(),
@@ -6989,6 +7106,7 @@ fn main() {
             Some("rust-security-review"),
             Some("compiled-in default"),
             Some("provider=openrouter, model=test/reviewer, turn_budget=medium, tools=read,grep"),
+            None,
         );
 
         assert!(input.contains("agent_type: rust-security-review"));
@@ -6997,6 +7115,52 @@ fn main() {
         assert!(input.contains("turn_budget=medium, tools=read,grep"));
         assert!(input.contains("prompts: audit authentication"));
         assert!(!input.contains("You are a"));
+    }
+
+    #[test]
+    fn labels_take_precedence_and_lead_the_permission_prompt() {
+        let args = |value: serde_json::Value| serde_json::from_value::<TaskArgs>(value).unwrap();
+        // The call's own label wins, then the first brief's, then none.
+        let call = args(serde_json::json!({"prompts": ["q"], "label": "  Map\nauth  flow "}));
+        assert_eq!(call_label(&call).as_deref(), Some("Map auth flow"));
+        let briefs = args(serde_json::json!({"briefs": [
+            {"objective": "audit auth", "label": "Audit auth"},
+            {"objective": "audit db"}
+        ]}));
+        assert_eq!(call_label(&briefs).as_deref(), Some("Audit auth (+1 more)"));
+        let both = args(
+            serde_json::json!({"briefs": [{"objective": "x", "label": "inner"}], "label": "outer"}),
+        );
+        assert_eq!(call_label(&both).as_deref(), Some("outer"));
+        assert!(call_label(&args(serde_json::json!({"prompts": ["q"]}))).is_none());
+        // Without a label the stored label is the brief objective, not the
+        // rendered `Objective: "` text.
+        let plain = args(serde_json::json!({"briefs": [{"objective": "audit auth"}]}));
+        assert_eq!(
+            task_label_for(&plain, &["Objective: \"audit auth\"".into()]),
+            "audit auth"
+        );
+        assert_eq!(task_label_for(&call, &[]), "Map auth flow");
+        // Approval: label, mode and the full prompt; no label keeps the old text.
+        let shown = permission_input(&["find X".into()], None, None, None, Some("Find X"));
+        assert_eq!(shown, "label: Find X\nmode: read-only\nprompts: find X");
+        assert_eq!(
+            permission_input(&["find X".into()], None, None, None, None),
+            "find X"
+        );
+        let persona = permission_input(
+            &["p".into()],
+            Some("impl"),
+            Some("src"),
+            Some("write-capable child"),
+            Some("Fix it"),
+        );
+        assert!(
+            persona.starts_with("label: Fix it\nagent_type: impl"),
+            "{persona}"
+        );
+        assert!(persona.contains("write-capable child"));
+        assert!(persona.ends_with("prompts: p"));
     }
 
     #[test]

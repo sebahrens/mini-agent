@@ -384,6 +384,21 @@ fn format_task_summary(
     obj: &serde_json::Map<String, serde_json::Value>,
     show: &dyn Fn(&str) -> String,
 ) -> String {
+    // The model's own short label, else the first brief's label or objective.
+    let label = obj
+        .get("label")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            let first = obj.get("briefs")?.as_array()?.first()?;
+            first
+                .get("label")
+                .or_else(|| first.get("objective"))?
+                .as_str()
+        })
+        .filter(|text| !text.trim().is_empty());
+    if let Some(label) = label {
+        return format!("task {}", show(label));
+    }
     let prompts = match obj.get("prompts") {
         Some(serde_json::Value::Array(arr)) => arr,
         _ => return "task".to_string(),
@@ -444,6 +459,25 @@ fn descendant_pattern(path: &std::path::Path) -> String {
 
 #[cfg(test)]
 mod tests {
+    // mini-agent-ap45a: a task call shows its label, then a brief's objective.
+    #[test]
+    fn task_calls_show_their_label_or_first_brief() {
+        let shown = |args: serde_json::Value| format_tool_call_display("task", &args);
+        assert_eq!(
+            shown(serde_json::json!({"label": "Map auth", "prompts": ["long question"]})),
+            "task \"Map auth\""
+        );
+        assert_eq!(
+            shown(serde_json::json!({"briefs": [{"objective": "audit auth", "label": "Audit"}]})),
+            "task \"Audit\""
+        );
+        assert_eq!(
+            shown(serde_json::json!({"briefs": [{"objective": "audit auth"}]})),
+            "task \"audit auth\""
+        );
+        assert_eq!(shown(serde_json::json!({"prompts": ["q"]})), "task q");
+    }
+
     #[test]
     fn parse_color_rejects_multibyte_hex_without_panicking() {
         // mini-agent-f4hxq: 6 bytes, but not on char boundaries.
