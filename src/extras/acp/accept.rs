@@ -14,6 +14,76 @@ use std::io;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+/// Connections the busy responder accepted while the previous peer was still
+/// attached, kept for the next accept round (mini-agent-mt2f2). A peer that
+/// reconnects right after the first one closed can reach the responder before
+/// the server notices the close; the responder only declares such a connection
+/// "busy" after a grace period and only if no round took it first.
+#[derive(Default)]
+pub(super) struct Handoff {
+    queue: std::sync::Mutex<Vec<(u64, std::net::TcpStream)>>,
+    next_id: std::sync::atomic::AtomicU64,
+}
+
+impl Handoff {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(u64, std::net::TcpStream)>> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Queues a duplicate of `stream`; the id claims it back.
+    pub(super) fn hold(&self, stream: std::net::TcpStream) -> u64 {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.lock().push((id, stream));
+        id
+    }
+
+    /// Removes the entry; `false` when an accept round already took it.
+    pub(super) fn claim(&self, id: u64) -> bool {
+        let mut queue = self.lock();
+        let before = queue.len();
+        queue.retain(|(held, _)| *held != id);
+        queue.len() != before
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_empty(&self) -> bool {
+        self.lock().is_empty()
+    }
+
+    fn take_next(&self) -> Option<std::net::TcpStream> {
+        let mut queue = self.lock();
+        (!queue.is_empty()).then(|| queue.remove(0).1)
+    }
+}
+
+/// The listener of one accept round: connections the previous round's busy
+/// responder held come first, then the listener itself.
+pub(super) struct HandoffListener {
+    pub(super) handoff: std::sync::Arc<Handoff>,
+    pub(super) listener: tokio::net::TcpListener,
+}
+
+impl AcceptSource for HandoffListener {
+    async fn accept(&mut self) -> io::Result<(tokio::net::TcpStream, SocketAddr)> {
+        while let Some(held) = self.handoff.take_next() {
+            let Ok(address) = held.peer_addr() else {
+                continue;
+            };
+            if held.set_nonblocking(true).is_err() {
+                continue;
+            }
+            if let Ok(stream) = tokio::net::TcpStream::from_std(held) {
+                return Ok((stream, address));
+            }
+        }
+        self.listener.accept().await
+    }
+}
+
 /// Pause before accepting again after the process ran out of descriptors,
 /// buffers or memory.
 pub(super) const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);

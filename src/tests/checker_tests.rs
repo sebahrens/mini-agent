@@ -2513,27 +2513,42 @@ fn generated_literal_path_scope_survives_session_reload_without_widening() {
 
 // --- check_perm non-interactive Ask denial (guards headless dispatch) ---
 
-#[tokio::test]
-async fn check_perm_denies_non_interactively_when_ask_tx_is_none_and_verdict_is_ask() {
+async fn non_interactive_ask_denial(headless: bool) -> String {
     // Guarded mode with no matching rule asks for non-read tools (see
     // guarded_asks_for_write_and_bash above), so this checker's verdict for
-    // "write" is CheckResult::Ask.
+    // "write" is CheckResult::Ask. The surface is pinned per thread: the
+    // process-global headless flag is left set by other tests.
+    let _surface = crate::print::HeadlessSurfaceForTest::pin(headless);
     let checker = make_checker(SecurityMode::Guarded);
     let perm: Option<crate::permission::checker::PermCheck> =
         Some(std::sync::Arc::new(std::sync::Mutex::new(checker)));
     let ask_tx: Option<crate::permission::ask::AskSender> = None;
 
-    let result = crate::agent::tools::check_perm(&perm, &ask_tx, "write", "/etc/passwd").await;
-
-    match result {
-        Err(crate::agent::tools::ToolError::Msg(msg)) => {
-            assert_eq!(
-                msg,
-                "Permission denied (non-interactive mode); effective mode: guarded; selected mode: guarded; cause: mode policy"
-            );
-        }
+    match crate::agent::tools::check_perm(&perm, &ask_tx, "write", "/etc/passwd").await {
+        Err(crate::agent::tools::ToolError::Msg(msg)) => msg,
         other => panic!("expected non-interactive Ask denial error, got {:?}", other),
     }
+}
+
+const NON_INTERACTIVE_DENIAL: &str = "Permission denied (non-interactive mode); effective mode: guarded; selected mode: guarded; cause: mode policy";
+
+#[tokio::test]
+async fn check_perm_denies_non_interactively_when_ask_tx_is_none_and_verdict_is_ask() {
+    assert_eq!(
+        non_interactive_ask_denial(false).await,
+        NON_INTERACTIVE_DENIAL
+    );
+}
+
+#[tokio::test]
+async fn check_perm_headless_non_interactive_denial_names_the_remedy() {
+    let msg = non_interactive_ask_denial(true).await;
+    assert_eq!(
+        msg,
+        format!(
+            "{NON_INTERACTIVE_DENIAL}. Nobody can approve this in -p mode; rerun with --yolo (all but destructive shell), --allow 'TOOL:PATTERN', or --stream-json-control so a driver can answer"
+        )
+    );
 }
 
 #[cfg(windows)]

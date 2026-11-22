@@ -1319,6 +1319,8 @@ struct TcpTransport {
     /// Set once a peer authenticated, to tell "the peer ended" from "nobody
     /// ever connected".
     connected: Arc<std::sync::atomic::AtomicBool>,
+    /// Connections the previous round's busy responder holds for this round.
+    handoff: Arc<accept::Handoff>,
 }
 
 /// Default seconds to wait for the first authenticated ACP TCP peer.
@@ -1350,7 +1352,13 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
         self,
         client: impl ConnectTo<Counterpart::Counterpart>,
     ) -> Result<(), agent_client_protocol::Error> {
-        let listener = self.listener;
+        let listener = accept::tokio_listener(self.listener).map_err(|e| {
+            agent_client_protocol::util::internal_error(format!("TCP accept: {}", e))
+        })?;
+        let listener = accept::HandoffListener {
+            handoff: self.handoff,
+            listener,
+        };
         if let Some(tls) = self.tls {
             let (stream, peer_addr) = within_accept_deadline(
                 self.accept_timeout,
@@ -1384,7 +1392,6 @@ impl<Counterpart: Role> ConnectTo<Counterpart> for TcpTransport {
 
         let accept_error =
             |e| agent_client_protocol::util::internal_error(format!("TCP accept: {}", e));
-        let listener = accept::tokio_listener(listener).map_err(accept_error)?;
         let (stream, peer_addr) = within_accept_deadline(
             self.accept_timeout,
             accept_authenticated_peer_with_idle(
@@ -1857,6 +1864,7 @@ async fn serve_tcp_peers(
     settings: TcpServerSettings,
 ) -> anyhow::Result<()> {
     let mut first = true;
+    let handoff = Arc::new(accept::Handoff::default());
     loop {
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let transport = TcpTransport {
@@ -1869,12 +1877,14 @@ async fn serve_tcp_peers(
             // Later rounds wait as long as the idle timeout allows.
             accept_timeout: if first { settings.accept_timeout } else { None },
             connected: connected.clone(),
+            handoff: handoff.clone(),
         };
         let busy = refuse_extra_peers(
             listener
                 .try_clone()
                 .map_err(|e| anyhow::anyhow!("ACP TCP server error: TCP clone: {e}"))?,
             connected.clone(),
+            handoff.clone(),
         );
         let result = tokio::select! {
             result = connect_agent(state.clone(), transport) => result,
@@ -1902,10 +1912,24 @@ async fn serve_tcp_peers(
 const BUSY_LINE: &[u8] =
     b"mini-agent ACP: busy, another client is connected; retry after it disconnects\n";
 
+/// How long a connection that arrived while a peer was attached is held
+/// before it is told "busy". A client that reconnects right after the first
+/// one closed reaches this responder before the server notices the close;
+/// within the grace the next accept round takes it from the [`accept::Handoff`]
+/// and serves it instead.
+const BUSY_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Once a peer has authenticated, answers every further connection with
 /// [`BUSY_LINE`] and closes it, so a second client learns why it is not served.
-/// Runs until dropped. Writes are bounded in time and in number in flight.
-async fn refuse_extra_peers(listener: TcpListener, connected: Arc<std::sync::atomic::AtomicBool>) {
+/// Each connection is parked in `handoff` for [`BUSY_GRACE`] first: if the
+/// attached peer ended in the meantime, the next round serves it and no busy
+/// line is written. Runs until dropped; the per-connection tasks outlive it.
+/// Writes are bounded in time and in number in flight.
+async fn refuse_extra_peers(
+    listener: TcpListener,
+    connected: Arc<std::sync::atomic::AtomicBool>,
+    handoff: Arc<accept::Handoff>,
+) {
     use tokio::io::AsyncWriteExt as _;
     while !connected.load(Ordering::Acquire) {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1916,12 +1940,29 @@ async fn refuse_extra_peers(listener: TcpListener, connected: Arc<std::sync::ato
     let in_flight = Arc::new(tokio::sync::Semaphore::new(8));
     loop {
         match accept::AcceptSource::accept(&mut listener).await {
-            Ok((mut stream, _)) => {
+            Ok((stream, _)) => {
                 let Ok(permit) = in_flight.clone().try_acquire_owned() else {
                     continue;
                 };
+                // A duplicate descriptor is parked for the next round; this
+                // task keeps the original to answer "busy" if nobody claims it.
+                let Ok(std_stream) = stream.into_std() else {
+                    continue;
+                };
+                let Ok(parked) = std_stream.try_clone() else {
+                    continue;
+                };
+                let Ok(mut stream) = tokio::net::TcpStream::from_std(std_stream) else {
+                    continue;
+                };
+                let id = handoff.hold(parked);
+                let handoff = handoff.clone();
                 tokio::spawn(async move {
                     let _permit = permit;
+                    tokio::time::sleep(BUSY_GRACE).await;
+                    if !handoff.claim(id) {
+                        return;
+                    }
                     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                         stream.write_all(BUSY_LINE).await?;
                         stream.shutdown().await
@@ -18186,6 +18227,52 @@ brainstorm = "no-such-quick-model"
     }
 
     #[tokio::test]
+    async fn a_peer_parked_by_the_busy_responder_is_served_by_the_next_round_not_refused() {
+        use tokio::io::AsyncReadExt as _;
+        // The first peer closed, but the server had not noticed yet: the
+        // responder accepts the reconnecting peer. Nothing may be written to
+        // it, and the next round must take it over.
+        let listener = TcpListener::bind((DEFAULT_TCP_HOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let handoff = Arc::new(accept::Handoff::default());
+        let busy = tokio::spawn(refuse_extra_peers(
+            listener.try_clone().unwrap(),
+            connected,
+            handoff.clone(),
+        ));
+        let mut peer = tokio::net::TcpStream::connect(address).await.unwrap();
+        let mut next_round = accept::HandoffListener {
+            handoff: handoff.clone(),
+            listener: accept::tokio_listener(listener.try_clone().unwrap()).unwrap(),
+        };
+        // The responder's accept races this; wait until it parked the peer.
+        for _ in 0..200 {
+            if !handoff.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let (taken, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept::AcceptSource::accept(&mut next_round),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        busy.abort();
+        // Past the grace the responder's task finds the entry claimed.
+        tokio::time::sleep(BUSY_GRACE + Duration::from_millis(300)).await;
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_millis(200), peer.read(&mut byte)).await;
+        assert!(
+            read.is_err(),
+            "no busy line may reach a served peer: {read:?}"
+        );
+        drop(taken);
+    }
+
+    #[tokio::test]
     async fn a_second_tcp_peer_reads_a_busy_line_while_the_first_is_attached() {
         // mini-agent-mt2f2
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
@@ -18196,7 +18283,11 @@ brainstorm = "no-such-quick-model"
         let listener = TcpListener::bind((DEFAULT_TCP_HOST, 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let busy = tokio::spawn(refuse_extra_peers(listener, connected.clone()));
+        let busy = tokio::spawn(refuse_extra_peers(
+            listener,
+            connected.clone(),
+            Arc::new(accept::Handoff::default()),
+        ));
         // Nothing is refused before a peer is attached.
         connected.store(true, Ordering::Release);
         let mut second = tokio::time::timeout(

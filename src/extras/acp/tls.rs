@@ -134,21 +134,14 @@ pub(super) async fn accept_tls_peer(
     .await
 }
 
-pub(super) async fn accept_tls_peer_with_idle(
-    listener: std::net::TcpListener,
+pub(super) async fn accept_tls_peer_with_idle<S: AcceptSource>(
+    source: S,
     api_key: String,
     tls: Arc<AcpTlsConfig>,
     max_pending: usize,
     idle: Arc<super::idle::Idle>,
 ) -> std::io::Result<(TlsStream, SocketAddr)> {
-    accept_tls_peer_from_with_idle(
-        super::accept::tokio_listener(listener)?,
-        api_key,
-        tls,
-        max_pending,
-        idle,
-    )
-    .await
+    accept_tls_peer_from_with_idle(source, api_key, tls, max_pending, idle).await
 }
 
 /// [`accept_tls_peer_with_idle`] over any [`AcceptSource`]. A failed accept of one
