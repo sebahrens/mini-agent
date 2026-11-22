@@ -2333,7 +2333,10 @@ fn discovered_toolchain_roots() -> &'static [PathBuf] {
     static ROOTS: OnceLock<Vec<PathBuf>> = OnceLock::new();
     ROOTS.get_or_init(|| {
         windows_toolchains::DiscoveryEnvironment::from_process()
-            .map(|environment| windows_toolchains::discover(&environment))
+            .map(|mut environment| {
+                environment.already_readable = Some(all_packages_read_tree);
+                windows_toolchains::discover(&environment)
+            })
             .unwrap_or_default()
     })
 }
@@ -3330,9 +3333,16 @@ fn run_helper() -> Result<i32, String> {
     let all_packages = sid_from_string("S-1-15-2-1")?;
     let mut traverse_roots = Vec::new();
     for root in requested_traverse_roots {
-        if effective_path_rights(&root, all_packages.0)? & ANCESTOR_NAME_ACCESS
-            != ANCESTOR_NAME_ACCESS
-        {
+        // The package check matches only the profile SID and `ALL APPLICATION PACKAGES`, so an
+        // `Everyone` or `Users` ACE does not count (`effective_path_rights` would fold it in).
+        let (own, _) = exact_sid_rights(&root, all_packages.0).unwrap_or((0, 0));
+        if own & ANCESTOR_NAME_ACCESS == ANCESTOR_NAME_ACCESS {
+            continue;
+        }
+        // Resolving the working directory by name is a convenience, not a containment
+        // property: an ancestor this user cannot change (`C:\Users` for a standard user) is left
+        // as it is instead of refusing the launch.
+        if read_root_dacl_is_changeable(&root) {
             traverse_roots.push(root);
         }
     }
@@ -3954,6 +3964,92 @@ fn sid_from_string(value: &str) -> Result<Local, String> {
         return Err(last_error("convert well-known SID"));
     }
     Ok(Local(sid))
+}
+
+/// Rights that ACEs naming exactly `sid` give, ignoring group membership: the AppContainer
+/// package check matches only the profile SID, `ALL APPLICATION PACKAGES` and capability SIDs,
+/// never `Everyone` or `Users`, so [`effective_path_rights`] (which folds `Everyone` in) can
+/// report access the container does not have. Returns the rights on the object itself and the
+/// rights inherited by both files and subdirectories; a missing DACL grants everything.
+fn exact_sid_rights(path: &Path, sid: PSID) -> Result<(u32, u32), String> {
+    let wide = wide_null(path.as_os_str())?;
+    let mut dacl = null_mut();
+    let mut descriptor = null_mut();
+    let result = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            null_mut(),
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if result != 0 || descriptor.is_null() {
+        if !descriptor.is_null() {
+            unsafe { LocalFree(descriptor) };
+        }
+        return Err(format!(
+            "sandbox: read DACL for exact-SID rights: code {result}"
+        ));
+    }
+    let _descriptor = Local(descriptor);
+    if dacl.is_null() {
+        return Ok((u32::MAX, u32::MAX));
+    }
+    let inherited_by_both = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8;
+    let (mut allowed, mut denied, mut child_allowed, mut child_denied) = (0u32, 0u32, 0u32, 0u32);
+    let count = unsafe { (*dacl).AceCount };
+    for index in 0..u32::from(count) {
+        let mut ace = null_mut();
+        if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+            return Err("sandbox: unreadable ACE while computing exact-SID rights".into());
+        }
+        let header = unsafe { *ace.cast::<ACE_HEADER>() };
+        let is_allow = u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE;
+        let is_deny = u32::from(header.AceType) == ACCESS_DENIED_ACE_TYPE;
+        if !is_allow && !is_deny {
+            continue;
+        }
+        if usize::from(header.AceSize) < std::mem::size_of::<ACCESS_ALLOWED_ACE>() {
+            return Err("sandbox: truncated ACE while computing exact-SID rights".into());
+        }
+        // Allowed and denied ACEs share one layout: header, mask, then the inline SID.
+        let ace_sid: PSID =
+            unsafe { (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast() };
+        if unsafe { IsValidSid(ace_sid) } == 0 || unsafe { EqualSid(ace_sid, sid) } == 0 {
+            continue;
+        }
+        let mask = map_file_access_mask(unsafe { (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask });
+        if header.AceFlags & INHERIT_ONLY_ACE as u8 == 0 {
+            if is_allow {
+                allowed |= mask;
+            } else {
+                denied |= mask;
+            }
+        }
+        if header.AceFlags & inherited_by_both == inherited_by_both {
+            if is_allow {
+                child_allowed |= mask;
+            } else {
+                child_denied |= mask;
+            }
+        }
+    }
+    Ok((allowed & !denied, child_allowed & !child_denied))
+}
+
+/// Whether `ALL APPLICATION PACKAGES` already reads and executes the whole tree under `path`
+/// (an explicit inheritable ACE), so no grant is needed there.
+fn all_packages_read_tree(path: &Path) -> bool {
+    let Ok(all_packages) = sid_from_string("S-1-15-2-1") else {
+        return false;
+    };
+    let required = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+    exact_sid_rights(path, all_packages.0)
+        .is_ok_and(|(own, children)| own & required == required && children & required == required)
 }
 
 fn effective_path_rights(path: &Path, sid: PSID) -> Result<u32, String> {

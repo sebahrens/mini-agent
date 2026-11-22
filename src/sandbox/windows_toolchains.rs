@@ -14,8 +14,9 @@
 //!
 //! * only read and execute is ever granted, never write, and never to a root that overlaps the
 //!   workspace, the application cache, the private control root or a configured writable root;
-//! * `PATH` entries under the Windows directory or `Program Files` are skipped (they are already
-//!   readable, and their DACLs are not ours to rewrite);
+//! * `PATH` entries under the Windows directory, and trees an inheritable
+//!   `ALL APPLICATION PACKAGES` ACE already makes readable (most of `Program Files`), are skipped;
+//!   an administrator-owned directory whose DACL the user cannot change is skipped at grant time;
 //! * the drive root, the user profile and its ancestors, directories that directly hold
 //!   credential folders (`.ssh`, `.aws`, ...), and trees larger than
 //!   [`MAX_DISCOVERED_ROOT_ENTRIES`] (or that overrun [`MAX_DISCOVERED_TOTAL_ENTRIES`] in all) are skipped, so an unusual `PATH` entry cannot expose a home
@@ -87,8 +88,11 @@ pub(crate) struct DiscoveryEnvironment {
     pub(crate) extensions: Vec<String>,
     /// The user profile directory.
     pub(crate) home: Option<PathBuf>,
-    /// Trees already readable to every application package (Windows, Program Files).
+    /// Trees never proposed (the Windows directory: always readable, never ours to change).
     pub(crate) protected_roots: Vec<PathBuf>,
+    /// Whether every application package already reads and executes the tree under a directory
+    /// (an inheritable `ALL APPLICATION PACKAGES` ACE), so no grant is needed.
+    pub(crate) already_readable: Option<fn(&Path) -> bool>,
 }
 
 impl DiscoveryEnvironment {
@@ -126,6 +130,7 @@ impl DiscoveryEnvironment {
             extensions,
             home,
             protected_roots,
+            already_readable: None,
         })
     }
 }
@@ -237,6 +242,9 @@ fn judge(
         .protected_roots
         .iter()
         .any(|protected| same_or_inside(directory, protected))
+        || environment
+            .already_readable
+            .is_some_and(|readable| readable(directory))
     {
         return Err(Rejection::AlreadyReadable);
     }
@@ -381,6 +389,7 @@ mod tests {
                 extensions: Vec::new(),
                 home: Some(self.canonical().join("home").join("me")),
                 protected_roots: Vec::new(),
+                already_readable: None,
             }
         }
     }
@@ -432,11 +441,15 @@ mod tests {
     }
 
     #[test]
-    fn already_readable_trees_are_not_proposed() {
+    fn protected_and_already_readable_trees_are_not_proposed() {
         let fixture = Fixture::new();
+        let windows = fixture.tool("Windows/tools", "perl");
         let node = fixture.tool("Program Files/nodejs", "node");
-        let mut environment = fixture.environment(&[node]);
-        environment.protected_roots = vec![fixture.canonical().join("Program Files")];
+        let mut environment = fixture.environment(&[windows, node.clone()]);
+        environment.protected_roots = vec![fixture.canonical().join("Windows")];
+        // An explicit all-packages ACE keeps the readable tree out; without one it is proposed.
+        assert_eq!(discover(&environment), vec![node.clone()]);
+        environment.already_readable = Some(|path| path.ends_with("nodejs"));
         assert!(discover(&environment).is_empty());
     }
 
