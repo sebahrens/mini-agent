@@ -2026,8 +2026,9 @@ pub(crate) fn build_git_direct_helper(
     cache: &Path,
     configured_read_roots: &[PathBuf],
     configured_write_roots: &[PathBuf],
+    extra_env: &[(String, String)],
 ) -> Result<tokio::process::Command, String> {
-    build_helper_with_ready_and_roots(
+    build_helper_with_ready_roots_and_env(
         program.to_path_buf(),
         arguments.to_vec(),
         cwd,
@@ -2037,6 +2038,7 @@ pub(crate) fn build_git_direct_helper(
         configured_write_roots,
         Some(workspace),
         None,
+        extra_env,
     )
 }
 
@@ -2057,6 +2059,7 @@ pub(crate) fn verify_git_direct_command(
         cache,
         configured_read_roots,
         configured_write_roots,
+        &[],
     )?;
     // Git's own stderr is the only closed diagnostic kept: it is bounded, sanitized, and read
     // from a parent-owned file that is removed again; the child never receives a path to it.

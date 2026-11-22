@@ -360,13 +360,30 @@
  	if (GetFileAttributesW(cwd) == INVALID_FILE_ATTRIBUTES) {
 --- a/setup.c
 +++ b/setup.c
-@@ -2201,7 +2201,23 @@
+@@ -2201,7 +2201,40 @@
  /* if any standard file descriptor is missing open it to /dev/null */
  void sanitize_stdfds(void)
  {
 -	int fd = xopen("/dev/null", O_RDWR);
 +	int fd;
 +#ifdef GIT_WINDOWS_NATIVE
++	/*
++	 * mini-agent: an AppContainer launcher cannot hand the child a pipe,
++	 * so it names a file holding the standard input. Consume the variable
++	 * once so subprocesses never inherit it.
++	 */
++	{
++		const char *stdin_file = getenv("MINI_AGENT_STDIN_FILE");
++		if (stdin_file && *stdin_file) {
++			int input = open(stdin_file, O_RDONLY | O_BINARY);
++			if (input < 0)
++				die_errno("cannot open standard input file");
++			if (dup2(input, 0) < 0)
++				die_errno("cannot redirect standard input");
++			close(input);
++		}
++		unsetenv("MINI_AGENT_STDIN_FILE");
++	}
 +	/* mini-agent: the launcher supplies valid standard handles; the
 +	 * NUL device may not be openable by name inside an AppContainer. */
 +	{

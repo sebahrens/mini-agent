@@ -52,7 +52,7 @@ SPDX_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+-]*")
 SPDX_OPERATORS = frozenset({"AND", "OR", "WITH"})
 MAX_LICENSE_FILE_BYTES = 1024 * 1024
 GIT_SOURCE_SHA256 = "26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3"
-GIT_POLICY_SHA256 = "7d5aca67a1fef2efa815d469b68ec3e7896eb2ed064c7806cad351998fbc6e77"
+GIT_POLICY_SHA256 = "17f17abf9199e0ef794532a9d8f6dafeefd3a58e36ecbec9dab3439aeab16eff"
 NATIVE_FORMAT = "mini-agent-native-components/1"
 NATIVE_LINE = re.compile(r"^Native-Component: (?P<name>\S+) (?P<version>\S+)$")
 

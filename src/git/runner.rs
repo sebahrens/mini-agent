@@ -1489,11 +1489,32 @@ impl GitRunner {
         } else {
             Vec::new()
         };
-        let command = self.contained_command_with_env(workspace, sandbox, args, &extra_env)?;
-        sandbox
-            .output_built_command_with_input_and_limits(command, input, limits)
-            .await
-            .map_err(|error| spawn_error(operation, &error))
+        #[cfg(target_os = "windows")]
+        {
+            let mut extra_env = extra_env;
+            let stdin_file = sandbox
+                .write_git_stdin_file(&input)
+                .map_err(|error| spawn_error(operation, &std::io::Error::other(error)))?;
+            extra_env.push((
+                OsString::from("MINI_AGENT_STDIN_FILE"),
+                stdin_file.path().as_os_str().to_owned(),
+            ));
+            let command = self.contained_command_with_env(workspace, sandbox, args, &extra_env)?;
+            let output = sandbox
+                .output_built_command_with_limits(command, limits)
+                .await
+                .map_err(|error| spawn_error(operation, &error));
+            drop(stdin_file);
+            return output;
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let command = self.contained_command_with_env(workspace, sandbox, args, &extra_env)?;
+            sandbox
+                .output_built_command_with_input_and_limits(command, input, limits)
+                .await
+                .map_err(|error| spawn_error(operation, &error))
+        }
     }
 }
 
