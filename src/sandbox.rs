@@ -776,6 +776,13 @@ pub(crate) const POWERSHELL_WORKSPACE_DRIVE: &str = "ws";
 /// A failure is ignored: the command then runs where PowerShell started.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn powershell_workspace_drive_prelude(root: &str) -> String {
+    // A root with a trailing separator is required: with a bare directory root, Remove-Item and
+    // Move-Item on drive-qualified paths fail in the container ("Access ... 'C:\\' is denied").
+    let root = if root.ends_with('\\') {
+        root.to_string()
+    } else {
+        format!("{root}\\")
+    };
     format!(
         "try {{ New-PSDrive -Name {POWERSHELL_WORKSPACE_DRIVE} -PSProvider FileSystem -Root '{}' -Scope Global -ErrorAction Stop | Out-Null; Set-Location -LiteralPath '{POWERSHELL_WORKSPACE_DRIVE}:\\' -ErrorAction Stop }} catch {{}}; ",
         root.replace('\'', "''")
@@ -4460,16 +4467,27 @@ impl Sandbox {
                     let cache_dir = self.get_cached_cache_dir().map_err(|_| {
                         "application cache is unavailable for bound shell validation".to_string()
                     })?;
+                    // PowerShell must also be able to load a core cmdlet: Windows PowerShell 5.1
+                    // starts in the container but recognises none of them.
+                    let probe = if capability.dialect() == ShellDialect::PowerShell {
+                        "Get-Location -ErrorAction Stop | Out-Null; exit 0"
+                    } else {
+                        "exit 0"
+                    };
                     windows::verify_direct_command(
                         capability.executable(),
-                        &capability.invocation_args("exit 0"),
+                        &capability.invocation_args(probe),
                         workspace.root(),
                         &cache_dir,
                         &self.windows_appcontainer_read_roots,
                         &self.windows_appcontainer_write_roots,
                     )
                     .map_err(|error| {
-                        if capability.dialect() == ShellDialect::Posix {
+                        if capability.dialect() == ShellDialect::PowerShell {
+                            format!(
+                                "{error}; this PowerShell cannot run its core cmdlets inside the Windows AppContainer (Windows PowerShell 5.1 cannot): use PowerShell 7 (pwsh.exe) or --shell cmd.exe, or --no-sandbox"
+                            )
+                        } else if capability.dialect() == ShellDialect::Posix {
                             format!(
                                 "{error}; a POSIX shell (Git Bash, MSYS) cannot initialise inside the Windows AppContainer (its runtime needs named kernel objects the container may not create): use --shell pwsh or --shell cmd with the sandbox, or --no-sandbox to run bash unsandboxed"
                             )
@@ -12728,9 +12746,14 @@ echo COMMITTED"#;
     #[test]
     fn powershell_workspace_drive_prelude_quotes_the_root_and_never_fails_the_command() {
         let prelude = powershell_workspace_drive_prelude(r"C:\Users\o'brien\ws");
+        assert_eq!(
+            prelude,
+            powershell_workspace_drive_prelude(r"C:\Users\o'brien\ws\"),
+            "the root always ends with a separator"
+        );
         assert!(prelude.starts_with("try { New-PSDrive -Name ws -PSProvider FileSystem -Root "));
         assert!(
-            prelude.contains(r"-Root 'C:\Users\o''brien\ws' "),
+            prelude.contains(r"-Root 'C:\Users\o''brien\ws\' "),
             "{prelude}"
         );
         assert!(

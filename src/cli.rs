@@ -6,15 +6,25 @@ use crate::config::types::EditSystem;
 
 /// The Windows default shell: `pwsh.exe`, then Windows PowerShell, with
 /// cmd.exe only when neither is on `PATH`. Models are far more fluent in
-/// PowerShell, and cmd.exe cannot run format-after-edit or `/pr`.
+/// PowerShell, and cmd.exe cannot run format-after-edit or `/pr`. With the
+/// sandbox on, Windows PowerShell 5.1 is skipped: inside the AppContainer it
+/// cannot load its core cmdlets (`Get-Location`, `Get-ChildItem`, ... are not
+/// recognised), so cmd.exe is the better fallback there.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn default_windows_shell(
     path_dirs: impl IntoIterator<Item = std::path::PathBuf>,
     is_file: impl Fn(&std::path::Path) -> bool,
+    contained: bool,
 ) -> String {
     let dirs: Vec<_> = path_dirs.into_iter().collect();
-    ["pwsh.exe", "powershell.exe"]
-        .into_iter()
+    let candidates: &[&str] = if contained {
+        &["pwsh.exe"]
+    } else {
+        &["pwsh.exe", "powershell.exe"]
+    };
+    candidates
+        .iter()
+        .copied()
         .find(|name| dirs.iter().any(|dir| is_file(&dir.join(name))))
         .unwrap_or("cmd.exe")
         .to_string()
@@ -1219,7 +1229,7 @@ pub struct Cli {
 
     #[arg(
         long = "shell",
-        help = "Executable for the shell tool: bash/sh, or on Windows PowerShell/pwsh, cmd.exe or Git Bash (Windows default: pwsh.exe, else powershell.exe, else cmd.exe)"
+        help = "Executable for the shell tool: bash/sh, or on Windows PowerShell/pwsh, cmd.exe or Git Bash (Windows default: pwsh.exe, else powershell.exe, else cmd.exe; with the sandbox on powershell.exe is skipped because Windows PowerShell 5.1 cannot load its cmdlets inside the AppContainer)"
     )]
     pub shell: Option<String>,
 
@@ -2234,9 +2244,11 @@ impl Cli {
             .unwrap_or_else(|| {
                 if cfg!(target_os = "windows") {
                     let path = std::env::var_os("PATH").unwrap_or_default();
-                    default_windows_shell(std::env::split_paths(&path), |candidate| {
-                        candidate.is_file()
-                    })
+                    default_windows_shell(
+                        std::env::split_paths(&path),
+                        |candidate| candidate.is_file(),
+                        self.resolve_sandbox(cfg),
+                    )
                 } else {
                     "bash".to_string()
                 }
@@ -2346,14 +2358,26 @@ mod tests {
             move |path: &Path| present.iter().any(|name| path == Path::new(name))
         };
         assert_eq!(
-            super::default_windows_shell(dirs(), only(&["b/pwsh.exe", "a/powershell.exe"])),
+            super::default_windows_shell(dirs(), only(&["b/pwsh.exe", "a/powershell.exe"]), false),
             "pwsh.exe"
         );
         assert_eq!(
-            super::default_windows_shell(dirs(), only(&["a/powershell.exe"])),
+            super::default_windows_shell(dirs(), only(&["a/powershell.exe"]), false),
             "powershell.exe"
         );
-        assert_eq!(super::default_windows_shell(dirs(), only(&[])), "cmd.exe");
+        assert_eq!(
+            super::default_windows_shell(dirs(), only(&[]), false),
+            "cmd.exe"
+        );
+        // Contained: Windows PowerShell 5.1 does not work in the AppContainer.
+        assert_eq!(
+            super::default_windows_shell(dirs(), only(&["a/powershell.exe"]), true),
+            "cmd.exe"
+        );
+        assert_eq!(
+            super::default_windows_shell(dirs(), only(&["b/pwsh.exe", "a/powershell.exe"]), true),
+            "pwsh.exe"
+        );
     }
 
     #[test]

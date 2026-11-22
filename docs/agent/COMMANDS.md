@@ -762,7 +762,7 @@ provider request, with the error naming the valid personas on stderr (and in the
 
 At startup, mini-agent resolves the configured shell once against the canonical
 workspace and captured `PATH`. Supported Windows contracts are Command Prompt
-(`cmd.exe`; the default is `pwsh.exe`, then `powershell.exe`, then `cmd.exe`), PowerShell/pwsh with `-Command` and Bash/sh with `-c`; Unix uses Bash/sh with `-c`. The resolved
+(`cmd.exe`; the default is `pwsh.exe`, then `powershell.exe`, then `cmd.exe`; `powershell.exe` is skipped while the sandbox is on), PowerShell/pwsh with `-Command` and Bash/sh with `-c`; Unix uses Bash/sh with `-c`. The resolved
 executable identity and argument contract are retained across agent rebuilds.
 If the executable is missing or unsupported, the model-visible compatibility
 tool named `shell` and its prompt guidance are omitted, and shell execution fails
