@@ -2553,32 +2553,6 @@ fn quoted_after_unclosed<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
         .map(|end| &rest[..end])
 }
 
-/// First match of `name` in the directories of `path_var`, trying each
-/// `PATHEXT` suffix (empty on non-Windows hosts).
-fn resolve_on_path(
-    name: &str,
-    path_var: &std::ffi::OsStr,
-    extensions: &[String],
-) -> Option<std::path::PathBuf> {
-    for directory in std::env::split_paths(path_var) {
-        if directory.as_os_str().is_empty() {
-            continue;
-        }
-        let bare = directory.join(name);
-        let candidates = std::iter::once(bare.clone()).chain(extensions.iter().map(|extension| {
-            let mut spelled = bare.clone().into_os_string();
-            spelled.push(extension);
-            std::path::PathBuf::from(spelled)
-        }));
-        for candidate in candidates {
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
-}
-
 fn host_path_extensions() -> Vec<String> {
     if !cfg!(windows) {
         return Vec::new();
@@ -2615,7 +2589,8 @@ fn host_command_unrunnable_hint(sandbox: &Sandbox, output: &str) -> Option<Strin
     for command in missing {
         let resolved = match command {
             MissingCommand::Name(name) => {
-                resolve_on_path(&name, &path_var, &extensions).map(|path| (name, path))
+                crate::sandbox::windows_toolchains::resolve_on_path(&name, &path_var, &extensions)
+                    .map(|path| (name, path))
             }
             MissingCommand::Path(path) => {
                 let path = std::path::PathBuf::from(path);
@@ -3855,14 +3830,21 @@ mod tests {
             "hintcmd"
         };
         std::fs::write(root.join(tool), b"x").unwrap();
-        let found = resolve_on_path(
+        let found = crate::sandbox::windows_toolchains::resolve_on_path(
             "hintcmd",
             std::env::join_paths([&root]).unwrap().as_os_str(),
             &host_path_extensions(),
         )
         .expect("resolved on the temporary PATH");
         assert_eq!(found, root.join(tool));
-        assert_eq!(resolve_on_path("nothing-here", root.as_os_str(), &[]), None);
+        assert_eq!(
+            crate::sandbox::windows_toolchains::resolve_on_path(
+                "nothing-here",
+                root.as_os_str(),
+                &[]
+            ),
+            None
+        );
         let _ = std::fs::remove_dir_all(&root);
         assert_eq!(
             toolchain_roots_setting("appcontainer"),

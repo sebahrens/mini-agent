@@ -54,7 +54,7 @@ mod profile_journal;
 /// currently needs it, so it is gated the same way.
 #[cfg(all(feature = "js", target_os = "linux"))]
 pub(crate) mod spawner;
-#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) mod windows_toolchains;
 #[cfg(feature = "js")]
 pub(crate) mod worker;
