@@ -196,18 +196,6 @@ pub(crate) fn appcontainer_extras_line(sandbox: &crate::sandbox::Sandbox) -> Str
         },
         crate::sandbox::contained_shell_git_note(),
     );
-    if !sandbox.windows_toolchain_discovery() {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        let extensions: Vec<String> = std::env::var("PATHEXT")
-            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
-            .split(';')
-            .filter(|extension| extension.starts_with('.'))
-            .map(str::to_string)
-            .collect();
-        if let Some(recipe) = interpreter_grant_recipe(&path, &extensions) {
-            line.push_str(&format!("; python is not runnable by default: {recipe}"));
-        }
-    }
     if sandbox.windows_toolchain_discovery() {
         let roots = crate::sandbox::discovered_toolchain_root_count();
         line.push_str(&format!(" ({roots} toolchain root(s) resolved)"));
@@ -238,6 +226,15 @@ pub(crate) fn interpreter_grant_recipe(
     Some(format!(
         "set `windows-appcontainer-read-roots = ['{directory}']` (global config, restart required) or `windows-appcontainer-toolchain-discovery = true`"
     ))
+}
+
+fn host_path_extensions() -> Vec<String> {
+    std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|extension| extension.starts_with('.'))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Command names the sandboxed Python probe tries, in order. Windows has no
@@ -407,10 +404,24 @@ pub(crate) async fn run_all(
             "sandboxed git",
             tool_in_sandbox(&sandbox, "git").await,
         ));
-        checks.push(Check::of(
-            python_check_name(),
-            first_tool_in_sandbox(&sandbox, python_probe_names()).await,
-        ));
+        let python = first_tool_in_sandbox(&sandbox, python_probe_names()).await;
+        let python_failed = matches!(python, Outcome::Warn(_));
+        checks.push(Check::of(python_check_name(), python));
+        if python_failed
+            && backend == "appcontainer"
+            && !sandbox.windows_toolchain_discovery()
+            && let Some(recipe) = interpreter_grant_recipe(
+                &std::env::var_os("PATH").unwrap_or_default(),
+                &host_path_extensions(),
+            )
+        {
+            checks.push(Check::of(
+                "python grant",
+                Outcome::Warn(format!(
+                    "python is not runnable by default (decision: no automatic grant); {recipe}"
+                )),
+            ));
+        }
     }
     #[cfg(feature = "js")]
     if cli.tool_is_eligible(cfg, "js") {
