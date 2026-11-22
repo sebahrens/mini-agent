@@ -2380,7 +2380,8 @@ impl LaunchRequest {
     /// application cache or its private control root, so the closed explicit-root policy is
     /// re-validated over the merged set and any conflict stays a hard error.
     fn add_toolchain_read_roots(&mut self, command: &str) -> Result<(), String> {
-        let proposed = windows_toolchains::mentioned_roots(discovered_toolchain_roots(), command);
+        let proposed =
+            windows_toolchains::mentioned_roots(resolved_toolchains_for_launch(), command);
         if proposed.is_empty() {
             return Ok(());
         }
@@ -2454,6 +2455,20 @@ pub(crate) fn start_toolchain_discovery() {
                 let _ = DISCOVERED_TOOLCHAINS.set(toolchains);
             });
     });
+}
+
+/// How long a launch waits for the background discovery thread (never for a walk of its own).
+const TOOLCHAIN_DISCOVERY_LAUNCH_WAIT: Duration = Duration::from_secs(5);
+
+/// The toolchains resolved so far, waiting a bounded time for the background thread on the
+/// first launches of a session; empty when it has not finished (the launch then runs without
+/// toolchain grants and the failure note names the key).
+fn resolved_toolchains_for_launch() -> &'static [windows_toolchains::Toolchain] {
+    let deadline = Instant::now() + TOOLCHAIN_DISCOVERY_LAUNCH_WAIT;
+    while DISCOVERED_TOOLCHAINS.get().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    discovered_toolchain_roots()
 }
 
 /// The toolchains resolved so far; empty until the background thread finishes.

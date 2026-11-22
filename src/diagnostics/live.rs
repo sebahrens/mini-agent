@@ -131,8 +131,8 @@ pub(crate) fn sandbox_status(status: &str, reason: Option<&str>, enabled: bool) 
 }
 
 fn first_output_line(bytes: &[u8]) -> Option<String> {
-    String::from_utf8_lossy(bytes)
-        .lines()
+    let text = crate::ui::events::sanitize_output(&String::from_utf8_lossy(bytes)).to_string();
+    text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty())
         .map(str::to_string)
