@@ -13,6 +13,7 @@ pub(crate) mod cost;
 pub(crate) mod evidence;
 pub(crate) mod image_cost;
 pub(crate) mod inbox;
+pub(crate) mod inherit;
 pub(crate) mod inline_images;
 pub(crate) mod isolation;
 pub(crate) mod partial;

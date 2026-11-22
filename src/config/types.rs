@@ -24,6 +24,11 @@ pub struct SubagentPolicy {
     /// (default 3600, at most 86400). Foreground calls keep `task_timeout_secs`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task_background_timeout_secs: Option<u64>,
+    /// Experimental, off by default (mini-agent-wevbz): lets a `task` call
+    /// pass `inherit_context: true`, which appends a bounded, quoted, text-only
+    /// transcript of the parent conversation to one read-only child's brief.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub experimental_inherit_context: bool,
     /// Trial (mini-agent-i8emv): milliseconds the second and later children of
     /// one call wait after the first starts, so they can read the first
     /// child's prompt cache (default 0 = off, at most 5000). A start-time

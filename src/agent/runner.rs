@@ -5389,6 +5389,10 @@ where
 
     #[cfg(feature = "subagents")]
     let subagent_event_tx = event_tx.clone();
+    // The parent conversation, for the experimental `inherit_context` spike
+    // (mini-agent-wevbz); cloned only when that experiment is on.
+    #[cfg(feature = "subagents")]
+    let parent_history = crate::extras::subagents::inherit::enabled().then(|| history.clone());
 
     // The turn state machine is several hundred KiB in an unoptimized build.
     // Build it on the heap inside `heap_future`'s short frame: held by value,
@@ -6358,6 +6362,15 @@ where
     #[cfg(feature = "subagents")]
     let agent_future =
         crate::extras::subagents::scope_subagent_event_tx(subagent_event_tx, agent_future);
+    #[cfg(feature = "subagents")]
+    let agent_future: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+        match parent_history {
+            Some(history) => Box::pin(crate::extras::subagents::inherit::scope_parent_history(
+                history,
+                agent_future,
+            )),
+            None => Box::pin(agent_future),
+        };
 
     let agent_future =
         crate::agent::tools::mutation_diff::scope_events(mutation_events, agent_future);
@@ -6480,6 +6493,9 @@ where
     // stacked below startup, provider, task-local and cancellation wrappers.
     // The actual startup consumer exercises the unchanged 1 MiB stack budget.
     let mutations = crate::print::HeadlessMutationEvents::new(output);
+    let history: Arc<[Message]> = history.into();
+    #[cfg(feature = "subagents")]
+    let parent_history = crate::extras::subagents::inherit::enabled().then(|| history.clone());
     let work = crate::startup::heap_future(|| async {
         let mut turn = crate::startup::heap_future(|| {
             run_print_with_stream_policy_and_verification(
@@ -6508,6 +6524,15 @@ where
         turn
     });
     let work = crate::agent::tools::mutation_diff::scope_observer(mutations.observer(), work);
+    // The experimental `inherit_context` spike sees the headless history too.
+    #[cfg(feature = "subagents")]
+    let work: std::pin::Pin<Box<dyn std::future::Future<Output = HeadlessTurn> + Send + '_>> =
+        match parent_history {
+            Some(history) => Box::pin(crate::extras::subagents::inherit::scope_parent_history(
+                history, work,
+            )),
+            None => Box::pin(work),
+        };
     // Foreground subagents report their start and tool calls through the
     // parent's event channel; headless runs had none (mini-agent-zdcj5). Only
     // stream-json shows them, so other formats keep the old, channel-less path.

@@ -15,6 +15,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Added
 
+- `task` takes a per-call `contract` (`report` | `plain`) and an optional `label` (call and brief) shown first in approvals, `/tasks` and the TUI line (mini-agent-dzg3n, mini-agent-ap45a).
+- `[subagents] task_timeout_secs` is now each child's own window from its start, with a larger whole-call ceiling; a child past its window gets a tool-free write-up turn marked `[partial: child deadline ...]` (mini-agent-ss239).
+- A child that failed after doing work is resumable and its failure line carries the resume id (mini-agent-uw0xl).
+- Stream-json output carries `subagent_started` and `subagent_tool_call` records tagged with `parent_tool_use_id` for foreground children (mini-agent-zdcj5).
+- Headless results add `subagent_delegation` telemetry (contract pass, repair, host replacement, stop reason, turns, tokens, cost units, cache-prefix check) and `scripts/delegation_eval.py` runs a delegated-versus-direct lane (mini-agent-964ao, mini-agent-i8emv).
+- Trials, off by default: `[subagents] task_stagger_ms` (mini-agent-i8emv) and `experimental_inherit_context` with `inherit_context: true` (mini-agent-wevbz).
+- A write child's environment block carries its branch and a short `git status` (mini-agent-irrra).
 - Esc interrupts a running turn when no picker, prompt, selection or Vim editor owns it, and the status line shows `esc to interrupt` (`ctrl+c to interrupt` in Vim mode) (mini-agent-z8nnm).
 - Task briefs take optional `context`, `known` and `done_when`; file hints are annotated with `exists, N lines` or `not found`; parallel children are told what their siblings are doing; worktree children are told their base commit and whether the parent checkout was dirty; every child gets an environment block (mini-agent-2u1w0, 2jysx, qp3od, kzzul, irrra).
 - Persona frontmatter `instructions: false` / `architecture: false` omits the instruction overlay or architecture text from that persona's children (mini-agent-l4lqw).
@@ -153,6 +160,7 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ### Changed
 
+- A child answer that fails the response contract twice is delivered as quoted, flagged data under `[partial: unstructured response; not contract-checked]` instead of being withheld, reversing the 2026-11-06 withholding invariant (mini-agent-zc1gc).
 - One delegation rule is embedded in every mode prompt (delegate for unknown and large search spaces or several independent questions; never to double-check your own work) (mini-agent-0a0xz).
 - Built-in wildcard `rm` and `dd` hard denies loosened: only `rm` targeting `/*`, `~/*` or `$HOME/*` and `dd` writing to `/dev/**` stay denied; other wildcard `rm` and `dd` now ask in every mode including yolo, and the old `^rm\s+.*\*` regex no longer over-matches other commands in the script (mini-agent-nvnkx.65)
 

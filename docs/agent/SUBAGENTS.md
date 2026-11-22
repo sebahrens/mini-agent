@@ -832,6 +832,23 @@ children differ by working directory). The cached input tokens per child are in
 the same rows. A live four-child call with and without `task_stagger_ms` still
 has to compare the cached-token ratios.
 
+### Experimental: inheriting the parent conversation
+
+`[subagents] experimental_inherit_context = true` (default false, not advertised
+otherwise) lets a call pass `inherit_context: true` (mini-agent-wevbz). The host
+then appends a bounded transcript of the parent conversation (the tail, at most
+48 KiB; tool results and attachments omitted, every line quoted as data) to the
+brief of one read-only child. The call is refused unless it carries exactly one
+prompt or brief, is not a resume, uses no write persona and pins no model
+(same-model work only); the approval prompt names the attachment. This is a
+spike for an evaluation, not a feature: Claude Code, Codex and Deep Agents ship
+history inheritance, but no study compares it with a fresh brief, children here
+use a different system prompt and tool set so the prompt-cache saving that
+motivates forks elsewhere does not apply, and parent history carries untrusted
+tool output (hence the text-only transcript). It ships only if
+`scripts/delegation_eval.py` shows a clear accuracy gain at acceptable cost on
+tasks chosen to need prior context; that comparison still has to be run live.
+
 ### Evidence handles
 
 With `task_evidence = true` (the default), the host also records every tool

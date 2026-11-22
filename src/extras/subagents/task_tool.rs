@@ -91,6 +91,10 @@ pub struct TaskCallOptions {
     /// Short (3-5 word) description of the call: the stored task label and
     /// the first line of the permission prompt.
     pub label: Option<String>,
+    /// Experimental (mini-agent-wevbz): append a bounded transcript of the
+    /// parent conversation to the single read-only child's brief. Rejected
+    /// unless `[subagents] experimental_inherit_context` is on.
+    pub inherit_context: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -301,6 +305,8 @@ impl<'de> Deserialize<'de> for TaskArgs {
             contract: Option<String>,
             #[serde(default, deserialize_with = "optional_text")]
             label: Option<String>,
+            #[serde(default)]
+            inherit_context: bool,
         }
 
         let raw = RawTaskArgs::deserialize(deserializer)?;
@@ -313,6 +319,7 @@ impl<'de> Deserialize<'de> for TaskArgs {
             model: raw.model,
             contract: raw.contract,
             label: raw.label,
+            inherit_context: raw.inherit_context,
         };
         let mut raw_briefs = raw.briefs.map(|briefs| briefs.0);
         let mut agent_type = raw.agent_type;
@@ -1009,6 +1016,33 @@ fn render_task_brief_for(
         )));
     }
     Ok(rendered)
+}
+
+/// Why an `inherit_context` call is refused, or `Ok` when the experiment's
+/// preconditions hold: enabled, one read-only child, same model, no resume.
+fn inherit_refusal(
+    enabled: bool,
+    children: usize,
+    resuming: bool,
+    write_mode: bool,
+    pinned_model: bool,
+) -> Result<(), ToolError> {
+    let reason = if !enabled {
+        "it is experimental and off ([subagents] experimental_inherit_context = true enables it)"
+    } else if children != 1 {
+        "it needs exactly one prompt or brief"
+    } else if resuming {
+        "it cannot be combined with resume"
+    } else if write_mode {
+        "it applies to read-only children only"
+    } else if pinned_model {
+        "it is for same-model work: drop the model override, persona model and subagent_model"
+    } else {
+        return Ok(());
+    };
+    Err(ToolError::Msg(format!(
+        "task: inherit_context refused: {reason}"
+    )))
 }
 
 /// Hold children after the first until `stagger` past the call's start.
@@ -1964,6 +1998,23 @@ partial statuses are returned.")
                 }),
             );
         }
+        // Experimental and off by default: not even advertised unless enabled.
+        let inherit = with_config(|cfg| {
+            cfg.config
+                .subagents
+                .as_ref()
+                .is_some_and(|policy| policy.experimental_inherit_context)
+        })
+        .unwrap_or(false);
+        if inherit && let Some(properties) = schema["properties"].as_object_mut() {
+            properties.insert(
+                "inherit_context".into(),
+                serde_json::json!({
+                    "type": "boolean",
+                    "description": "Experimental. Append a bounded, quoted transcript of this conversation (tool results omitted) to the single read-only child's brief. One child, no resume, no model override."
+                }),
+            );
+        }
         schema
     }
 
@@ -2020,6 +2071,11 @@ partial statuses are returned.")
             resume_store,
         } = self.validate_call_args(&args, &config, limits)?;
         let call_label = call_label(&args);
+        let inherit_note = if args.options.inherit_context {
+            "inherit_context: a transcript of this conversation is attached\n"
+        } else {
+            ""
+        };
         let delegation_input = permission_input(
             &prompts,
             agent_type.as_deref(),
@@ -2027,6 +2083,7 @@ partial statuses are returned.")
             None,
             call_label.as_deref(),
         );
+        let delegation_input = format!("{inherit_note}{delegation_input}");
         check_perm(
             &self.permission,
             &self.ask_tx,
@@ -2095,6 +2152,32 @@ partial statuses are returned.")
         let write_mode = specialization
             .as_ref()
             .is_some_and(|persona| persona.write_mode);
+        // Experimental parent-context spike (mini-agent-wevbz).
+        if args.options.inherit_context {
+            let pinned_model = specialization
+                .as_ref()
+                .is_some_and(|persona| persona.model.is_some())
+                || args.options.model.is_some()
+                || config.subagent_model.is_some();
+            inherit_refusal(
+                config
+                    .subagents
+                    .as_ref()
+                    .is_some_and(|policy| policy.experimental_inherit_context),
+                prompts.len(),
+                resumed.is_some(),
+                write_mode,
+                pinned_model,
+            )?;
+            let history = super::inherit::parent_history().ok_or_else(|| {
+                ToolError::Msg(
+                    "task: inherit_context has no parent conversation in this run".into(),
+                )
+            })?;
+            let transcript =
+                super::inherit::transcript(&history, super::inherit::MAX_TRANSCRIPT_BYTES);
+            prompts[0] = format!("{}\n\n{transcript}", prompts[0]);
+        }
         // Per-call isolation only ever adds the worktree boundary to a write
         // persona; it never turns a read child into a write child.
         let call_isolation = match args.options.isolation.as_deref() {
@@ -7090,6 +7173,30 @@ fn main() {
         assert_eq!(before.elapsed(), Duration::ZERO);
         // Off by default.
         stagger_start(3, Duration::ZERO, Instant::now()).await;
+    }
+
+    #[test]
+    fn inherit_context_is_refused_unless_every_precondition_holds() {
+        assert!(inherit_refusal(true, 1, false, false, false).is_ok());
+        for (args, needle) in [
+            ((false, 1, false, false, false), "off"),
+            ((true, 2, false, false, false), "exactly one"),
+            ((true, 1, true, false, false), "resume"),
+            ((true, 1, false, true, false), "read-only"),
+            ((true, 1, false, false, true), "same-model"),
+        ] {
+            let error = inherit_refusal(args.0, args.1, args.2, args.3, args.4)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(needle), "{error}");
+        }
+        // Not part of the schema while the experiment is off.
+        let schema = TaskTool::new(None, None, false).parameters();
+        assert!(schema["properties"].get("inherit_context").is_none());
+        let args: TaskArgs =
+            serde_json::from_value(serde_json::json!({"prompts": ["q"], "inherit_context": true}))
+                .unwrap();
+        assert!(args.options.inherit_context);
     }
 
     #[test]
