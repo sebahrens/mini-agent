@@ -1354,11 +1354,9 @@ async fn settle_check_inner(
                         crate::headless_control::Reply::AllowWith(args) => Err(ToolError::Msg(
                             crate::headless_control::rewrite_error(&args),
                         )),
-                        crate::headless_control::Reply::Deny(reason) => {
-                            Err(ToolError::Msg(format!(
-                                "Permission denied by the stream-json control channel: {reason}"
-                            )))
-                        }
+                        crate::headless_control::Reply::Deny(reason) => Err(ToolError::Msg(
+                            format!("Permission denied by the client: {reason}"),
+                        )),
                     };
                 }
                 // Headless: an opted-in PermissionRequest hook may still
@@ -1521,7 +1519,7 @@ pub(crate) async fn request_sandbox_escalation_approval(
                 | crate::headless_control::Reply::AllowWith(_)
                 | crate::headless_control::Reply::AllowForRun => Ok(()),
                 crate::headless_control::Reply::Deny(reason) => Err(ToolError::Msg(format!(
-                    "Sandbox escalation denied by the stream-json control channel: {reason}; the command was not run"
+                    "Sandbox escalation denied by the client: {reason}; the command was not run"
                 ))),
             };
         }
