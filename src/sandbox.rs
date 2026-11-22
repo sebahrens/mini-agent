@@ -4736,6 +4736,8 @@ impl Sandbox {
                 .collect::<Vec<_>>(),
         )?;
         let ancestors = seatbelt_namespace_denies(&sources)?;
+        let mut reads = reads;
+        reads.push_str(&homebrew_git_config_reads(&sources)?);
         Ok((reads, ancestors))
     }
 
@@ -9325,6 +9327,33 @@ pub(crate) fn seatbelt_private_read_denies(paths: &[(&Path, &str)]) -> Result<St
         .collect())
 }
 
+/// A Homebrew-installed git reads its system configuration from
+/// `<prefix>/etc/gitconfig` (and attributes from `<prefix>/etc/gitattributes`)
+/// and aborts when that file exists but is unreadable. For every granted
+/// Homebrew prefix (the parent of a granted `Cellar` root) this renders a
+/// read of exactly those two literals. `<prefix>/etc` itself stays
+/// unreadable: it can hold service credentials. Rendered like
+/// [`seatbelt_private_read_denies`] output, to follow it inside the grant.
+fn homebrew_git_config_reads(sources: &[PathBuf]) -> Result<String, String> {
+    let mut out = String::new();
+    for source in sources {
+        if source.file_name().is_none_or(|name| name != "Cellar") {
+            continue;
+        }
+        let Some(prefix) = source.parent().filter(|prefix| prefix.parent().is_some()) else {
+            continue;
+        };
+        for name in ["gitconfig", "gitattributes"] {
+            let literal = seatbelt_string_literal(&prefix.join("etc").join(name), "git config")?;
+            let rule = format!("\n    (literal \"{literal}\")");
+            if !out.contains(&rule) {
+                out.push_str(&rule);
+            }
+        }
+    }
+    Ok(out)
+}
+
 pub(crate) fn seatbelt_string_literal(path: &Path, label: &str) -> Result<String, String> {
     let value = path.to_str().ok_or_else(|| {
         format!(
@@ -12528,8 +12557,12 @@ echo COMMITTED"#;
         };
         let ssl = run("head -c 1 /private/etc/ssl/openssl.cnf >/dev/null && echo SSL_OK").await;
         assert!(ssl.contains("SSL_OK"), "{ssl}");
-        let git = run("git status --short 2>&1; echo END").await;
-        assert!(!git.contains("unable to access"), "{git}");
+        if host_tool_available("git") {
+            let git = run("git status --short 2>&1; echo END").await;
+            assert!(!git.contains("unable to access"), "{git}");
+        } else {
+            eprintln!("skipping git probe: git is not installed on this host");
+        }
         if Path::new("/opt/homebrew/bin").is_dir() {
             let listed = run("ls /opt/homebrew/bin >/dev/null && echo BREW_OK").await;
             assert!(listed.contains("BREW_OK"), "{listed}");
@@ -12551,6 +12584,28 @@ echo COMMITTED"#;
                 write.contains("not permitted") || write.contains("denied"),
                 "{write}"
             );
+        }
+        // A Homebrew git aborts when its system config exists but is unreadable.
+        for prefix in ["/opt/homebrew", "/usr/local"] {
+            let config = Path::new(prefix).join("etc/gitconfig");
+            if !config.is_file() {
+                eprintln!("skipping {}: not present on this host", config.display());
+                continue;
+            }
+            let read = run(Box::leak(
+                format!(
+                    "head -c 1 {} >/dev/null && echo CONFIG_OK",
+                    config.display()
+                )
+                .into_boxed_str(),
+            ))
+            .await;
+            assert!(read.contains("CONFIG_OK"), "{read}");
+            let listing = run(Box::leak(
+                format!("ls {prefix}/etc 2>&1; echo END").into_boxed_str(),
+            ))
+            .await;
+            assert!(listing.contains("not permitted"), "{listing}");
         }
         let secret =
             run("cat \"$HOME/.ssh/id_rsa\" \"$HOME/.aws/credentials\" \"$HOME/.cargo/credentials.toml\" 2>&1; echo END")
@@ -12719,6 +12774,17 @@ echo COMMITTED"#;
         assert_eq!(strip_verbatim_prefix("/tmp/ws"), "/tmp/ws");
     }
 
+    /// Whether `tool` (a path or a bare name looked up on `PATH`) exists on
+    /// the host; hosted runners differ in what they install.
+    #[cfg(target_os = "macos")]
+    fn host_tool_available(tool: &str) -> bool {
+        if tool.contains('/') {
+            return Path::new(tool).exists();
+        }
+        std::env::var_os("PATH")
+            .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(tool).exists()))
+    }
+
     #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn seatbelt_workspace_developer_tools_run_and_negative_controls_hold() {
@@ -12741,6 +12807,11 @@ echo COMMITTED"#;
             ("make -n", "built"),
             ("make -v", "GNU Make"),
         ] {
+            let tool = command.split_whitespace().next().unwrap_or_default();
+            if !host_tool_available(tool) {
+                eprintln!("skipping {command}: {tool} is not installed on this host");
+                continue;
+            }
             let output = sandbox
                 .output_command_with_limits(command, DEFAULT_COMMAND_LIMITS)
                 .await
@@ -14373,6 +14444,29 @@ echo PRIVATE_TEMP_PASS"#,
     }
 
     #[cfg(unix)]
+    #[test]
+    fn homebrew_git_config_reads_are_two_literals_per_prefix_and_nothing_broader() {
+        let rendered = homebrew_git_config_reads(&[
+            PathBuf::from("/opt/homebrew/bin"),
+            PathBuf::from("/opt/homebrew/Cellar"),
+            PathBuf::from("/usr/local/Cellar"),
+            PathBuf::from("/home/user/Cellar-not"),
+        ])
+        .unwrap();
+        for prefix in ["/opt/homebrew", "/usr/local"] {
+            for name in ["gitconfig", "gitattributes"] {
+                assert!(
+                    rendered.contains(&format!("(literal \"{prefix}/etc/{name}\")")),
+                    "{rendered}"
+                );
+            }
+        }
+        assert_eq!(rendered.matches("(literal").count(), 4, "{rendered}");
+        assert!(!rendered.contains("subpath"), "{rendered}");
+        assert!(!rendered.contains("/home/user"), "{rendered}");
+        assert_eq!(homebrew_git_config_reads(&[]).unwrap(), "");
+    }
+
     #[test]
     fn seatbelt_namespace_denies_extension_matches_one_ordered_pass() {
         let scratch = TempDir::new("sandbox");

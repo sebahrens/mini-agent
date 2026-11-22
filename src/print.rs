@@ -480,7 +480,36 @@ fn truncate_utf8(text: &str, max: usize) -> String {
 /// Whether this process is a configured headless run (`-p`, `--loop`): the
 /// surface where slash commands do not exist and flags are the remedy.
 pub(crate) fn headless_surface() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = HEADLESS_SURFACE_OVERRIDE.with(std::cell::Cell::get) {
+        return forced;
+    }
     RECORD_PERMISSION_DENIALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    static HEADLESS_SURFACE_OVERRIDE: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Test guard: pins `headless_surface()` for the current thread so a test
+/// does not depend on the process-global flag other tests leave set.
+#[cfg(test)]
+pub(crate) struct HeadlessSurfaceForTest(Option<bool>);
+
+#[cfg(test)]
+impl HeadlessSurfaceForTest {
+    pub(crate) fn pin(value: bool) -> Self {
+        Self(HEADLESS_SURFACE_OVERRIDE.with(|cell| cell.replace(Some(value))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for HeadlessSurfaceForTest {
+    fn drop(&mut self) {
+        HEADLESS_SURFACE_OVERRIDE.with(|cell| cell.set(self.0));
+    }
 }
 
 /// Record a refused tool call (bounded: a count plus the first entries).
