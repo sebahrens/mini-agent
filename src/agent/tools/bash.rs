@@ -2699,12 +2699,14 @@ fn toolchain_advice(sandbox: &Sandbox) -> Option<String> {
 
 /// Run a short filesystem lookup without stalling an async executor thread.
 fn off_executor<T>(work: impl FnOnce() -> T) -> T {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(work)
-        }
-        _ => work(),
+    // `block_in_place` exists only with the multi-threaded runtime compiled in.
+    #[cfg(feature = "multithread")]
+    if tokio::runtime::Handle::try_current()
+        .is_ok_and(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+    {
+        return tokio::task::block_in_place(work);
     }
+    work()
 }
 
 /// When the failed command's output says a program could not be found or started and the host
