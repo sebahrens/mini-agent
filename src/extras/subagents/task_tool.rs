@@ -3140,11 +3140,8 @@ impl ChildPlan {
 
             // The conversation a later `resume` continues (an isolated
             // child's worktree does not outlive it, so it is not kept).
-            let conversation = if !isolated && run.response.is_ok() {
-                run.history.clone()
-            } else {
-                Vec::new()
-            };
+            let conversation =
+                resumable_history(isolated, run.response.is_ok(), run.turns, &run.history);
             // Budget write-up and report repair are tool-free continuations
             // of this child's own conversation (tool results included).
             let continuation_agent = agent.clone();
@@ -3267,7 +3264,7 @@ impl ChildPlan {
                 _ => None,
             };
             let resume_limits = super::resume::ResumeLimits::from_config(&config);
-            let (resume_id, resume_note) = if output.is_ok() {
+            let (resume_id, resume_note) = if output.is_ok() || !conversation.is_empty() {
                 let outcome = resume_store
                     .insert_off_executor(resume_limits, resume_agent_type, conversation)
                     .await;
@@ -3767,6 +3764,24 @@ fn merge_forced_continuation_run(
     kept.tool_calls = tool_calls;
     kept.tool_log = tool_log;
     kept
+}
+
+/// The conversation a later `resume` continues. A child that ended partial,
+/// timed out or was cut off by its turn budget already reports success, so it
+/// is kept; a child that FAILED after doing work (at least one model turn and a
+/// conversation) is kept too, so it can be corrected instead of re-delegated
+/// (mini-agent-uw0xl). A worktree-isolated child is never kept: its worktree
+/// does not outlive it.
+fn resumable_history(
+    isolated: bool,
+    succeeded: bool,
+    turns: u32,
+    history: &[Message],
+) -> Vec<Message> {
+    if isolated || history.is_empty() || (!succeeded && turns == 0) {
+        return Vec::new();
+    }
+    history.to_vec()
 }
 
 /// Whether a child takes the session's single shared write lane (and so caps
@@ -4635,9 +4650,9 @@ async fn execute_tasks_with_budget_cancellable(
         // of the remaining budget to the child's own report; when dropped,
         // the resume line stays (the conversation is already stored) with a
         // note that the rest was omitted.
+        // A failed child carries only the host's resume line (mini-agent-uw0xl).
         let suffix = child
             .host_suffix
-            .filter(|_| child.output.is_ok())
             .and_then(|suffix| fit_host_suffix(suffix, remaining_output / 2));
         let suffix_len = suffix.as_ref().map_or(0, String::len);
         let (outcome, child_failed, output_exhausted) = match child.output {
@@ -6867,6 +6882,40 @@ fn main() {
         };
         let plain = render_task_brief_for(0, &brief, true).unwrap();
         assert!(!plain.contains("Findings"), "{plain}");
+    }
+
+    #[test]
+    fn failed_children_with_work_are_resumable_and_their_line_renders() {
+        let history = vec![Message::user("investigate")];
+        // Success, partial and timed-out children (all Ok) are kept as before.
+        assert_eq!(resumable_history(false, true, 3, &history).len(), 1);
+        // A failure after at least one model turn is kept too.
+        assert_eq!(resumable_history(false, false, 2, &history).len(), 1);
+        // No turn, no history, or an isolated worktree: nothing to resume.
+        assert!(resumable_history(false, false, 0, &history).is_empty());
+        assert!(resumable_history(false, false, 2, &[]).is_empty());
+        assert!(resumable_history(true, false, 2, &history).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_childs_resume_line_follows_its_failure_in_the_report() {
+        let executor: TaskExecutor = Arc::new(|_, _| ScheduledChild {
+            future: Box::pin(async {
+                ChildExecution {
+                    output: Err("subagent error: stream ended".into()),
+                    cost_units: 1,
+                    host_suffix: Some(crate::extras::subagents::resume::resume_line("abc123")),
+                }
+            }),
+            cancellation_cost: Arc::new(|| 1),
+        });
+        let report = execute_tasks(prompts(1), limits(), executor, None).await;
+        let rendered = report.render();
+        assert!(
+            rendered.contains("[failed: subagent error: stream ended]"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("[child id: abc123;"), "{rendered}");
     }
 
     #[test]

@@ -834,6 +834,13 @@ The limits are configurable in `[subagents]` (each clamped to 1..ceiling):
 | `evidence_max_child_bytes` | 16 MiB | 256 MiB | Content per child; later records keep metadata only, marked over ceiling (`MAX_CHILD_EVIDENCE_BYTES`) |
 | `evidence_max_children` | 64 | 1024 | Child stores per session; the oldest is evicted and its files deleted (`MAX_EVIDENCE_TASKS`) |
 
+A child that ended partial (turn budget, its own deadline, an unstructured
+answer) is stored like any other. A child that failed after at least one model
+turn is stored as well and its `[failed: ...]` line is followed by the same
+`[child id: ...]` resume line, so it can be corrected instead of re-delegated;
+a worktree-isolated child never is. A failure caused by a poisoned context will
+fail again on resume.
+
 Resumable child conversations (`task {"resume": id}`) have two more `[subagents]`
 limits: `task_resume_max_children` (default 16, ceiling 256) and
 `task_resume_max_bytes` (default 8 MiB serialized, ceiling 256 MiB). A child
