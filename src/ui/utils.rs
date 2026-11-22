@@ -475,7 +475,7 @@ mod tests {
             shown(serde_json::json!({"briefs": [{"objective": "audit auth"}]})),
             "task \"audit auth\""
         );
-        assert_eq!(shown(serde_json::json!({"prompts": ["q"]})), "task q");
+        assert_eq!(shown(serde_json::json!({"prompts": ["q"]})), "task \"q\"");
     }
 
     #[test]
