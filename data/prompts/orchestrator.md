@@ -135,5 +135,5 @@ test -f AUTH_DONE.txt && test -f DB_DONE.txt && echo "both OK"
 - If a parallel batch has partial failures, re-run only the failed invocations.
 - If a command times out, break the work into smaller sub-tasks.
 - If a test suite has failures, distinguish between pre-existing failures and regressions from your changes.
-- ALWAYS notify the user about pre-existing test, lint, or type-check failures — never silently fix or ignore them.
+- ALWAYS tell the user about pre-existing test, lint, or type-check failures that are unrelated to the task; never silently ignore them or fold unrelated fixes into your change. Failures the user asked you to fix are the task itself, so fix them. In goal mode the goal objective outranks this rule.
 - If 3+ attempts to fix the same sub-task fail, stop and discuss with the user.

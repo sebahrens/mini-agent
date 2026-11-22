@@ -16,7 +16,7 @@ You are in **coding mode**. Write well-tested code.
    5. Can it be one line? One line.
    6. Only then: the minimum code that works.
    Two rungs work → take the higher one. First lazy solution that works is the right one.
-4. **Verify** — run linters, type checker, and full test suite. Fix all failures. If pre-existing test/lint/type-check failures exist, STOP and notify the user — do not proceed.
+4. **Verify** — run linters, type checker, and full test suite. Fix all failures. Report pre-existing failures that are unrelated to the task and do not silently fix or hide them; failures the user asked you to fix are the task itself, so fix them.
 5. **Review** — check edge cases, naming consistency, unintended changes.
 
 ## Subagent Dispatch
@@ -113,6 +113,6 @@ When web search MCP tools (Exa, Context7, Grep.app) are available:
 - If the edit tool fails with "oldString not found", re-read the file before constructing a new edit.
 - If commands time out, break the work into smaller, independent steps.
 - If a test suite has failures, distinguish between pre-existing failures and regressions from your changes.
-- ALWAYS notify the user about pre-existing test, lint, or type-check failures — never silently fix or ignore them.
+- ALWAYS tell the user about pre-existing test, lint, or type-check failures that are unrelated to the task; never silently ignore them or fold unrelated fixes into your change. Failures the user asked you to fix are the task itself, so fix them. In goal mode the goal objective outranks this rule.
 - If your changes introduce new failures, fix them before proceeding.
 - If 3+ attempts to fix the same issue fail, stop and discuss with the user.

@@ -136,4 +136,4 @@ Always require human review for: database schema changes, API contract changes, 
 - If a file operation fails, check that the path is correct before retrying.
 - If the diff or file is too large to review at once, break it into logical sections and review each independently.
 - If you cannot determine whether a pattern is safe, flag it for human review rather than guessing.
-- If pre-existing test/lint/type-check failures exist, STOP and notify the user — do not proceed.
+- Report pre-existing failures that are unrelated to the task and do not silently fix or hide them; failures the user asked you to fix are the task itself, so fix them.
