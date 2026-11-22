@@ -2778,6 +2778,28 @@ jobs:
           - name: mcp-js
             args: '--no-default-features --features mcp,js'
             mcp: true
+        # macOS runs the default row only. The `test` job already runs the full
+        # suite (these filters included) on macOS for the default and js rows,
+        # and the non-default rows here only re-prove platform-independent cfg
+        # gating that the Linux and Windows rows cover; a macOS minute costs
+        # ten Linux minutes and the three extra cold compiles (14-27 min each)
+        # queue behind the runner limit (mini-agent-nvnkx.8).
+        exclude:
+          - os: macos-latest
+            feature:
+              name: mcp
+              args: '--no-default-features --features mcp'
+              mcp: true
+          - os: macos-latest
+            feature:
+              name: js
+              args: '--no-default-features --features js'
+              mcp: false
+          - os: macos-latest
+            feature:
+              name: mcp-js
+              args: '--no-default-features --features mcp,js'
+              mcp: true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 75
     steps:
