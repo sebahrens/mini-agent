@@ -689,19 +689,20 @@ pub(crate) fn build_dispatcher_from_paths_with_backend(
         project.problems.append(&mut native_project.problems);
         merge_into(&mut project.hooks, native_project.hooks);
     }
-    let mut managed = if managed_path == managed_settings_path() {
-        // Managed hooks run unprompted in every session, so the file must be
-        // administrator-owned (mini-agent-nvnkx.221). A failing check loads no
-        // hook and fails closed like any unloadable guard file.
-        match crate::config::managed::check_administrator_authority(managed_path) {
-            Err(error) if managed_path.exists() => {
-                unloadable(empty_source_config(), managed_path, error)
+    let mut managed =
+        if managed_path == managed_settings_path() && managed_path.symlink_metadata().is_ok() {
+            // Managed hooks run unprompted in every session, so the file must be
+            // administrator-owned (mini-agent-nvnkx.221). A failing check loads no
+            // hook and fails closed like any unloadable guard file.
+            match crate::config::managed::check_administrator_authority(managed_path) {
+                Err(error) if managed_path.exists() => {
+                    unloadable(empty_source_config(), managed_path, error)
+                }
+                _ => load_settings_file(managed_path),
             }
-            _ => load_settings_file(managed_path),
-        }
-    } else {
-        load_settings_file(managed_path)
-    };
+        } else {
+            load_settings_file(managed_path)
+        };
 
     // A repository-controlled `disableAllHooks` value must not disable
     // user-global guard hooks. Project hooks are individually trust-gated

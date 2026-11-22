@@ -832,19 +832,13 @@ impl GitRunner {
             InternalProfile::Local,
             &hardened_config(InternalProfile::Local, false),
         );
-        // The work-tree query is independent of the first one's answer; run
-        // both concurrently and discard it for bare or unborn repositories.
-        let toplevel = self.build_internal_command(
-            repo_path,
-            ["rev-parse", "--path-format=absolute", "--show-toplevel"],
-            InternalProfile::Local,
-            &hardened_config(InternalProfile::Local, false),
-        );
-        let (first, second) = (Sandbox::new(false, "git"), Sandbox::new(false, "git"));
-        let (output, toplevel) = tokio::join!(
-            first.output_built_command_with_limits(command, QUERY_LIMITS),
-            second.output_built_command_with_limits(toplevel, QUERY_LIMITS),
-        );
+        // The work-tree query runs after the first one and only for non-bare repositories. The two
+        // were once concurrent, but each launch takes the process-creation lock under its own
+        // 10 s query deadline, so two launches racing one slow holder failed the whole mutation;
+        // sequential launches each get a full deadline and a bare repository saves a spawn.
+        let output = Sandbox::new(false, "git")
+            .output_built_command_with_limits(command, QUERY_LIMITS)
+            .await;
         let output = output.map_err(|error| spawn_error(operation, &error))?;
         let unborn = initializing
             && output.status == CommandStatus::Completed
@@ -881,7 +875,16 @@ impl GitRunner {
             })
             .collect::<Result<Vec<_>, _>>()?;
         if !bare {
-            let output = toplevel.map_err(|error| spawn_error(operation, &error))?;
+            let toplevel = self.build_internal_command(
+                repo_path,
+                ["rev-parse", "--path-format=absolute", "--show-toplevel"],
+                InternalProfile::Local,
+                &hardened_config(InternalProfile::Local, false),
+            );
+            let output = Sandbox::new(false, "git")
+                .output_built_command_with_limits(toplevel, QUERY_LIMITS)
+                .await
+                .map_err(|error| spawn_error(operation, &error))?;
             let output = command_result(operation, QUERY_LIMITS, output)?;
             let top = output.stdout.strip_suffix(b"\n").ok_or_else(|| {
                 format!("refusing git {operation}: Git repository roots are malformed")
