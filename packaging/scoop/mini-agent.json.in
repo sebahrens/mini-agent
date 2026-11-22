@@ -7,6 +7,10 @@
     "64bit": {
       "url": "https://github.com/sebahrens/mini-agent/releases/download/v@VERSION@/mini-agent-x86_64-pc-windows-msvc.tar.gz",
       "hash": "@ARCHIVE_SHA256@"
+    },
+    "arm64": {
+      "url": "https://github.com/sebahrens/mini-agent/releases/download/v@VERSION@/mini-agent-aarch64-pc-windows-msvc.tar.gz",
+      "hash": "@ARCHIVE_ARM64_SHA256@"
     }
   },
   "bin": "mini-agent.exe",
@@ -17,6 +21,9 @@
     "architecture": {
       "64bit": {
         "url": "https://github.com/sebahrens/mini-agent/releases/download/v$version/mini-agent-x86_64-pc-windows-msvc.tar.gz"
+      },
+      "arm64": {
+        "url": "https://github.com/sebahrens/mini-agent/releases/download/v$version/mini-agent-aarch64-pc-windows-msvc.tar.gz"
       }
     },
     "hash": {

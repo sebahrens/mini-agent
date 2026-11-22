@@ -360,13 +360,13 @@ class CiSuccessScopeTests(unittest.TestCase):
     def test_platform_flag_requires_that_platform(self) -> None:
         windows = ci_success.evaluate(self.needs(windows="true"), "push", "refs/heads/main")
         self.assertEqual(
-            {"windows-default-compile", "windows-hooks-compile", "windows-worker-launcher-unit"},
+            {"windows-default-compile", "windows-hooks-compile", "windows-arm64-compile", "windows-worker-launcher-unit"},
             {e.split(" ")[0] for e in windows},
         )
         macos = ci_success.evaluate(self.needs(macos="true"), "pull_request", "refs/pull/1/merge")
         self.assertEqual(["macos-gym-ownership finished with 'skipped'"], macos)
         ran = self.needs(windows="true", macos="true")
-        for job in ("windows-default-compile", "windows-hooks-compile", "windows-worker-launcher-unit", "macos-gym-ownership"):
+        for job in ("windows-default-compile", "windows-hooks-compile", "windows-arm64-compile", "windows-worker-launcher-unit", "macos-gym-ownership"):
             ran[job]["result"] = "success"
         self.assertEqual([], ci_success.evaluate(ran, "push", "refs/heads/main"))
 

@@ -74,6 +74,7 @@ TESTS_SCOPE_SKIPPABLE: dict[str, str | None] = {
     "dependency-policy": None,
     "windows-default-compile": "windows",
     "windows-hooks-compile": "windows",
+    "windows-arm64-compile": "windows",
     "windows-worker-launcher-unit": "windows",
     "macos-gym-ownership": "macos",
 }
