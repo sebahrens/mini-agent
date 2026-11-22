@@ -588,7 +588,7 @@ impl ListPicker {
         if !self.active {
             return Ok(());
         }
-        if self.len() == 0 || floor_row < 2 {
+        if self.is_empty() || floor_row < 2 {
             return self.draw(out, cols, None, floor_row);
         }
         draw_picker_rows(

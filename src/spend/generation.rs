@@ -133,8 +133,8 @@ async fn fetch(pending: &Pending, timeout: Duration) -> Option<UsageDelta> {
     let mut request = pending
         .target
         .client
-        .get(&pending.target.endpoint)
-        .query(&[("id", pending.id.as_str())])
+        // The id is validated to `[A-Za-z0-9_-]`, so it needs no escaping.
+        .get(format!("{}?id={}", pending.target.endpoint, pending.id))
         .timeout(timeout);
     if let Some(authorization) = &pending.target.authorization {
         request = request.header(http::header::AUTHORIZATION, authorization.clone());
