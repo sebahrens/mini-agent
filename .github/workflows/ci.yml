@@ -499,6 +499,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           # Save the compiled dependencies even when a later test step fails:
           # a red row must not leave the next run to recompile from cold.
           cache-on-failure: true
@@ -633,6 +634,11 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-shared-key: ${{ steps.cache-key.outputs.key }}
+          # Only runs on main save caches; pull requests restore main's warm
+          # caches (cache scopes let a PR read the base branch) and never
+          # write their own, which would evict them from the repository's
+          # 10 GB cache quota (mini-agent-nvnkx.8).
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           # Save the compiled dependencies even when a later test step fails:
           # a red row must not leave the next run to recompile from cold.
           cache-on-failure: true
@@ -768,6 +774,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           # Save the compiled dependencies even when a later test step fails:
           # a red row must not leave the next run to recompile from cold.
           cache-on-failure: true
@@ -927,6 +934,7 @@ jobs:
         with:
           rustflags: ''
           cache-shared-key: ${{ steps.cache-key.outputs.key }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           # Save the compiled dependencies even when a later test step fails:
           # a red row must not leave the next run to recompile from cold.
           cache-on-failure: true
@@ -1140,6 +1148,7 @@ jobs:
         with:
           rustflags: ''
           cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           # Save the compiled dependencies even when a later test step fails:
           # a red row must not leave the next run to recompile from cold.
           cache-on-failure: true
@@ -2870,7 +2879,7 @@ jobs:
           # Rows that `test` (Linux, macOS) or windows-default-compile (Windows default)
           # already compile with the same features restore their cache and do not
           # save; only rows without such a saver save (mini-agent-nvnkx.8).
-          cache-save-if: ${{ matrix.feature.name == 'mcp-js' || (matrix.os == 'windows-latest' && matrix.feature.name != 'default') }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' && (matrix.feature.name == 'mcp-js' || (matrix.os == 'windows-latest' && matrix.feature.name != 'default')) }}
           cache-on-failure: true
 
       - name: Test deterministic and real platform path acceptance
@@ -3267,6 +3276,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           # Save the compiled dependencies even when a later test step fails:
           # a red row must not leave the next run to recompile from cold.
           cache-on-failure: true
@@ -3333,6 +3343,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
           # Save the compiled dependencies even when a later test step fails:
           # a red row must not leave the next run to recompile from cold.
           cache-on-failure: true
