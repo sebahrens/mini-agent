@@ -2032,6 +2032,19 @@ fn guarded_runtime_dir_of(program: &Path) -> Option<PathBuf> {
         .find(|protected| protected == dir)
 }
 
+/// `configured` with the guarded runtime directory appended once.
+#[cfg(any(test, feature = "git-worktree"))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn with_runtime_read_root(configured: &[PathBuf], runtime: Option<PathBuf>) -> Vec<PathBuf> {
+    let mut roots = configured.to_vec();
+    if let Some(runtime) = runtime
+        && !roots.contains(&runtime)
+    {
+        roots.push(runtime);
+    }
+    roots
+}
+
 /// The workspace Git metadata binds for a bubblewrap launch rooted at the
 /// canonical `workspace_root`; unsupported descriptor binding denies launch.
 fn bwrap_git_metadata_binds(
@@ -5330,6 +5343,20 @@ impl Sandbox {
         Ok(cmd)
     }
 
+    /// Configured AppContainer read roots plus, when `program` lives in the
+    /// guarded Git runtime, that runtime directory. The payload is flat: git.exe
+    /// loads its DLL closure and helpers from beside itself, and the container
+    /// is otherwise granted only the executable file, so a launch without the
+    /// directory fails with STATUS_DLL_NOT_FOUND (0xC0000135).
+    #[cfg(any(test, feature = "git-worktree"))]
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    fn git_service_read_roots(&self, program: &Path) -> Vec<PathBuf> {
+        with_runtime_read_root(
+            &self.windows_appcontainer_read_roots,
+            guarded_runtime_dir_of(program),
+        )
+    }
+
     #[cfg(any(test, feature = "git-worktree"))]
     pub(crate) fn wrap_git_workspace_service(
         &self,
@@ -5349,13 +5376,14 @@ impl Sandbox {
             let cwd = canonical_non_root(workspace.root(), "workspace-service working directory")?;
             let cache_dir = self.get_cached_cache_dir()?;
             self.retain_canonical_git_write_roots(&cwd)?;
+            let read_roots = self.git_service_read_roots(program);
             return windows::build_git_direct_helper(
                 program,
                 args,
                 &cwd,
                 &cwd,
                 &cache_dir,
-                &self.windows_appcontainer_read_roots,
+                &read_roots,
                 &self.windows_appcontainer_write_roots,
             )
             .map(ExecutionCommand::appcontainer_helper)
@@ -5421,13 +5449,14 @@ impl Sandbox {
             let cache_dir = self
                 .get_cached_cache_dir()
                 .map_err(|_| "application cache is unavailable".to_string())?;
+            let read_roots = self.git_service_read_roots(program);
             return windows::verify_git_direct_command(
                 program,
                 args,
                 workspace.root(),
                 workspace.root(),
                 &cache_dir,
-                &self.windows_appcontainer_read_roots,
+                &read_roots,
                 &self.windows_appcontainer_write_roots,
             );
         }
@@ -11598,6 +11627,19 @@ mod sandbox_tests {
             )
             .unwrap();
         assert_git_metadata_bound_after_workspace(&command_argv(&command), &workspace, &workspace);
+    }
+
+    #[test]
+    fn git_service_read_roots_add_runtime_directory_once() {
+        let configured = vec![PathBuf::from("configured")];
+        assert_eq!(
+            with_runtime_read_root(&configured, None),
+            vec![PathBuf::from("configured")]
+        );
+        let runtime = PathBuf::from("runtime");
+        let roots = with_runtime_read_root(&configured, Some(runtime.clone()));
+        assert_eq!(roots, vec![PathBuf::from("configured"), runtime.clone()]);
+        assert_eq!(with_runtime_read_root(&roots, Some(runtime)), roots);
     }
 
     #[cfg(unix)]

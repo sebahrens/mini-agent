@@ -129,6 +129,22 @@ start; the reason names the missing containment (bubblewrap on Linux, a validate
 LPAC gate on Windows). The rest of the agent works. Run `mini-agent --js-runtime-check` to see the
 same check on its own.
 
+On Windows the LPAC gate accepts only supported install locations: under `%USERPROFILE%` or
+`%LOCALAPPDATA%` (the per-user MSI), `%CARGO_HOME%\bin` (default `%USERPROFILE%\.cargo\bin`), a cargo
+`target\debug` or `target\release` directory, `%TEMP%`/`%TMP%`, and Program Files, ProgramData or
+the Windows directory. An executable anywhere else (for example `cargo install --root` on another
+drive) reports `<path> is not a supported install location for the JavaScript tool`; copy
+`mini-agent.exe` to a supported location. See [WINDOWS_INSTALL.md](WINDOWS_INSTALL.md).
+
+### Git tool unavailable on Windows
+
+The structured `git` tool needs the AppContainer sandbox: with `--no-sandbox` it is not offered
+(`Windows structured Git requires AppContainer`) and git runs only through the shell tool.
+`mini-agent --git-runtime-check` runs the bundled Git inside the container. The runtime directory
+(`<local data>\git-runtime\<id>`) holds `git.exe` and its DLL closure; it is granted to the container
+as a read/execute root. Exit code `-1073741515` (0xC0000135, DLL not found) from that probe means the
+container could not read a DLL beside `git.exe`.
+
 ### [sandbox network: blocked host:port (reason)]
 
 A contained command reached a host that `sandbox-network = "allowlist"` does not permit. Add the host

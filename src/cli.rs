@@ -1219,7 +1219,7 @@ pub struct Cli {
 
     #[arg(
         long = "shell",
-        help = "Executable for the shell tool: bash/sh, or on Windows cmd.exe (default), PowerShell/pwsh or Git Bash"
+        help = "Executable for the shell tool: bash/sh, or on Windows PowerShell/pwsh, cmd.exe or Git Bash (Windows default: pwsh.exe, else powershell.exe, else cmd.exe)"
     )]
     pub shell: Option<String>,
 
@@ -2354,6 +2354,22 @@ mod tests {
             "powershell.exe"
         );
         assert_eq!(super::default_windows_shell(dirs(), only(&[])), "cmd.exe");
+    }
+
+    #[test]
+    fn shell_help_names_the_real_windows_default_order() {
+        let help = <super::Cli as clap::CommandFactory>::command()
+            .get_arguments()
+            .find(|arg| arg.get_id() == "shell")
+            .and_then(|arg| arg.get_help().map(ToString::to_string))
+            .expect("--shell help");
+        assert!(!help.contains("cmd.exe (default)"));
+        let (pwsh, power, cmd) = (
+            help.find("pwsh.exe, else").unwrap(),
+            help.find("powershell.exe, else").unwrap(),
+            help.find("else cmd.exe").unwrap(),
+        );
+        assert!(pwsh < power && power < cmd);
     }
 
     #[test]
