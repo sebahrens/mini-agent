@@ -38,6 +38,14 @@ msiexec /i .\mini-agent-windows-x64.msi ALLUSERS=1 /quiet /norestart
 A service-account install does not modify another user's VS Code profile. Install the VSIX for each
 intended VS Code user as described below.
 
+## Windows on ARM
+
+The MSI and the VS Code extension are x64 builds. On Windows on ARM download
+`mini-agent-aarch64-pc-windows-msvc.tar.gz` and `SHA256SUMS` from the same release, verify the digest as above,
+extract the archive with `tar -xzf`, and put `mini-agent.exe` on `PATH`; Scoop selects the same archive
+through its `arm64` architecture entry. Do not run the x64 build under emulation: the guarded Git and
+JavaScript tools need the native build. There is no ARM64 MSI or VSIX yet.
+
 ## Install only the VS Code extension
 
 Download the `mini-agent-<version>-win32-x64.vsix` asset and `VSIX_SHA256SUMS` from the same release.
