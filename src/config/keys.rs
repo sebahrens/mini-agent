@@ -318,7 +318,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         "windows-appcontainer-ancestor-listing",
         &["windows_appcontainer_ancestor_listing"],
     )
-    .described("Global-only: let the Windows AppContainer shell list the names, sizes and timestamps in each parent directory of the workspace (PowerShell Set-Location, cmd dir and Git need it); system-owned parents such as C:\\Users and the drive root need an elevated launcher. Default false.")
+    .described("Global-only: let the Windows AppContainer shell list the names, sizes and timestamps in each parent directory of the workspace (cmd dir and tools that resolve the working directory by name need it; PowerShell 7 starts in the workspace without it); system-owned parents such as C:\\Users and the drive root need an elevated launcher. Default false.")
     .shaped(ConfigShape::Bool),
     aliased(
         "windows-appcontainer-null-device",

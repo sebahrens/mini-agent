@@ -159,15 +159,24 @@ The bundled Git needs no ACL change on the NUL device or on the drive root: wher
 open `/dev/null` by name, the patched runtime keeps the launcher's standard handles (startup) and
 substitutes a private delete-on-close temporary file for sub-command redirections.
 
-### Windows shell: PowerShell starts in `C:\`, `dir` or `git` say "Access is denied" / "Unable to read current working directory", `python` or `node` is not recognized, `/dev/null` cannot be opened
+### Windows shell in the default sandbox: what works and what needs a key
 
-The Windows AppContainer shell reads only the workspace, the cache and what `ALL APPLICATION PACKAGES` already reads. Three opt-in global-config keys (all default `false`) widen it; the `[sandbox: ...]` note on the failing command names the one that matches:
+The Windows AppContainer shell reads only the workspace, the cache and what `ALL APPLICATION PACKAGES` already reads. With the three opt-in keys below at their default (`false`) it is still usable:
 
-- `windows-appcontainer-ancestor-listing = true`: lets the container list the entries (names, sizes, timestamps) inside each parent of the workspace, which PowerShell, `cmd dir` and Git need to resolve the working directory. System-owned parents (`C:\Users`, the drive root) need mini-agent started from an elevated launcher.
-- `windows-appcontainer-null-device = true`: with an elevated launcher, lets the container open the NUL device (Git, `>nul`, Python/Node `DEVNULL`). Otherwise use the `git` tool.
+- **PowerShell 7 (`pwsh.exe`, the default)** starts in the workspace as the PowerShell drive `ws:\` (a drive rooted at the workspace; `Get-Location` prints `ws:\`). PowerShell normalises provider paths by listing every parent directory, which the container may not do, so without the drive `Set-Location` and relative paths fail and the shell falls back to `C:\`. Relative paths, `Set-Location`, `Get-ChildItem`, `Get-Content`, `Set-Content`, redirections, `Remove-Item`, `Move-Item` and the `workdir` argument work; native programs receive the real directory. Use the `.ProviderPath` of a location (or `[IO.File]` methods) when a program needs a plain path.
+- **`git` in PowerShell** runs the bundled, guarded Git (its directory is first on `PATH` and `git` is bound by alias): the host Git cannot open `/dev/null` in the container. `git ... > $null` and `| Out-Null` work. `cmd.exe` as the shell resolves `git` from `PATH` and may still reach the host Git; use the `git` tool or PowerShell there. Local-path remotes (fetch, push and ls-remote against a directory) fail inside the container.
+- **`cmd.exe`** (`--shell cmd.exe`): `cd`, `type`, `copy`, `ren`, `move`, `mkdir`, `rmdir` and `for %f in (*) do` work; `dir` (every form), `del` and `>NUL` print "Access is denied". Use `for %f in (*) do @echo %f` for listings, or PowerShell.
+- **Windows PowerShell 5.1 (`--shell powershell.exe`) and Git Bash (`--shell bash`)** do not run inside the AppContainer (5.1 cannot load its core cmdlets; the MSYS runtime cannot initialise). The shell tool is then disabled with a startup warning that names the alternative; the default shell skips `powershell.exe` while the sandbox is on. Use PowerShell 7, `cmd.exe`, or `--no-sandbox`.
+- **`--sandbox-profile host-read` and `host-full`** do not exist on Windows: startup fails with a message naming `windows-appcontainer-read-roots`, `windows-appcontainer-write-roots` and `--no-sandbox`.
+- **Python, Node and other tools installed outside Program Files** cannot be started: `py` runs but the interpreter it launches is unreadable ("Unable to create process ... Access is denied"). The `[sandbox: ...]` note names the fix below.
+
+Three opt-in global-config keys (all default `false`; none is needed for the list above) widen the container; the `[sandbox: ...]` note on a failing command names the one that matches:
+
+- `windows-appcontainer-ancestor-listing = true`: lets the container list the entries (names, sizes, timestamps) inside each parent of the workspace, so `cmd dir` and other tools that resolve the working directory by name work. System-owned parents (`C:\Users`, the drive root) need mini-agent started from an elevated launcher.
+- `windows-appcontainer-null-device = true`: with an elevated launcher, lets the container open the NUL device (`>nul`, Python/Node `DEVNULL`, the host Git).
 - `windows-appcontainer-toolchain-discovery = true`: read and execute on the install directory of `python`, `node`, ... when the command names them. An administrator-owned install needs an elevated launcher; or add the directory to `windows-appcontainer-read-roots`.
 
-`mini-agent --doctor` shows the effective state of the three keys, and a warning when an earlier elevated session left grants that an unelevated launch could not remove (start mini-agent elevated once to clear them). Settings are global-only and a managed policy can force each off. See `docs/agent/CONFIG.md`.
+`mini-agent --doctor` shows the effective state of the three keys, whether the launcher is elevated, which `git` the contained shell resolves first, and a warning when an earlier elevated session left grants that an unelevated launch could not remove (start mini-agent elevated once to clear them). Settings are global-only and a managed policy can force each off. See `docs/agent/CONFIG.md`.
 
 ### [sandbox network: blocked host:port (reason)]
 

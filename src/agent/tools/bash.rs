@@ -421,6 +421,27 @@ impl Tool for ShellTool {
              policy in either mode.",
             self.foreground_timeout.as_secs()
         );
+        match self
+            .sandbox
+            .shell_capability()
+            .map(|capability| capability.dialect())
+        {
+            Some(crate::sandbox::ShellDialect::PowerShell) => {
+                description.push_str(
+                    " PowerShell syntax: chain with ';' (a single '&' is not a separator), redirect to $null (not /dev/null), and use Get-ChildItem (cmd switches such as 'dir /b' do not apply).",
+                );
+                if self.sandbox.uses_powershell_workspace_drive() {
+                    description.push_str(&format!(
+                        " The command starts in the PowerShell drive {}:\\ (the workspace root); Get-Location prints that drive, relative paths work (except that Remove-Item and Move-Item need the item piped, `Get-Item name | Remove-Item`, or its full path), and native programs get the real directory.",
+                        crate::sandbox::POWERSHELL_WORKSPACE_DRIVE
+                    ));
+                }
+            }
+            Some(crate::sandbox::ShellDialect::Cmd) => description.push_str(
+                " cmd.exe syntax: chain with '&' or '&&', redirect to NUL, and use %VAR% for environment variables.",
+            ),
+            _ => {}
+        }
         if let Some(alias) = self.sandbox.shell_cwd_alias() {
             description.push_str(&format!(
                 " Sandboxed shell commands see this workspace at {}; file tools keep the working-directory path stated in the system prompt.",
@@ -2541,6 +2562,23 @@ pub(crate) fn sandbox_failure_note(
     {
         note.push_str(
             " Windows tools resolve the working directory by listing each parent directory, which the container may not do by default; setting `windows-appcontainer-ancestor-listing = true` (global config) lets it list the names, sizes and timestamps in each parent of the workspace, and system-owned parents such as `C:\\Users` and the drive root need an elevated launcher (restart required).",
+        );
+    }
+    if sandbox.backend_name() == "appcontainer"
+        && !sandbox.windows_ancestor_listing()
+        && sandbox.shell_capability().map(|shell| shell.dialect())
+            == Some(crate::sandbox::ShellDialect::Cmd)
+        && lowered.contains("access is denied")
+    {
+        note.push_str(
+            " In cmd.exe `dir` cannot enumerate directories here; `for %f in (*) do @echo %f` (files) and `for /d %d in (*) do @echo %d` (directories) work, as does PowerShell Get-ChildItem.",
+        );
+    }
+    if sandbox.uses_powershell_workspace_drive()
+        && lowered.contains("access to the path 'c:\\' is denied")
+    {
+        note.push_str(
+            " PowerShell Remove-Item and Move-Item cannot resolve a relative path here; pipe the item (`Get-Item name | Remove-Item`) or pass its full path (`Join-Path (Get-Location).ProviderPath name`).",
         );
     }
     if let Some(hint) = &toolchain_hint {

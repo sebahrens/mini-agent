@@ -376,7 +376,7 @@ If you want to use mini-agent from scripts or other programs, these CLI flags ar
 | `--sandbox` | Explicitly require the platform general-process sandbox; fail if unavailable |
 | `--no-sandbox` | Disable the default-on general-process sandbox. The structured `git` tool runs only inside the sandbox, so it is withheld too; the model is told to run git through the shell. |
 | `--sandbox-profile workspace\|host-read\|host-full` | Select ordinary command filesystem reach; does not change permission mode or network policy. Unix host-full is explicit and warns; Windows uses workspace plus AppContainer root keys. |
-| `--shell <path>` | Select Bash/sh; Windows also accepts Command Prompt (`cmd.exe`), PowerShell/pwsh, and native Git Bash. Without a value the default is `pwsh.exe`, then `powershell.exe`, then `cmd.exe` (first found on `PATH`). |
+| `--shell <path>` | Select Bash/sh; Windows also accepts Command Prompt (`cmd.exe`), PowerShell/pwsh, and native Git Bash. Without a value the default is `pwsh.exe`, then `powershell.exe`, then `cmd.exe` (first found on `PATH`); with the sandbox on, `powershell.exe` is skipped (Windows PowerShell 5.1 cannot load its cmdlets inside the AppContainer) and an explicit `--shell` of Git Bash or Windows PowerShell leaves the shell tool disabled, with a startup warning naming the alternative. |
 | `--no-color` | Disable colored TUI output. |
 | `--tutor` | Print the getting-started guide through the pager and exit. |
 | `--loop`, `--loop-prompt`, `--loop-plan`, `--loop-max`, `--loop-run` | Configure the bounded headless iterative loop and optional validation command. |
