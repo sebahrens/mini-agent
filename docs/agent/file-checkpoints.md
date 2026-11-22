@@ -66,7 +66,7 @@ moves instead (`paths::exchange_relative`, `paths::retire_relative_expecting`,
 writers excluded, verified by identity and content on that handle, moved aside by the same
 handle, and the replacement is published create-only (a failure puts the old file back
 create-only; retirement deletes the verified object). The target name is briefly absent. File
-rewind therefore works on Windows; whole-workspace snapshots stay Unix-only.
+rewind therefore works on Windows, and so do whole-workspace snapshots (below).
 
 `/rewind` also offers **Restore unchanged files only**: every selected file whose
 current bytes still match the recorded postimage is restored, files changed since
@@ -100,6 +100,19 @@ files, recreates deleted ones and removes files created since the snapshot, all 
 the same checked primitives as file rewind (identity and content are re-verified for
 every publication; a damaged snapshot blob changes nothing). It restores the state before
 the first shell command at or after the chosen turn, so native edits made earlier in that
-same turn are part of the restored state; it is a separate mode from the per-file restore
-and is refused on Windows. Snapshots follow the conversation: a conversation rewind
+same turn are part of the restored state; it is a separate mode from the per-file restore. Snapshots follow the conversation: a conversation rewind
 discards the snapshots of the removed turns and compaction renumbers the kept ones.
+
+### Windows specifics
+
+Snapshots use the same checked primitives on Windows as on Unix. The walk never descends
+into a symbolic link or junction (their targets are not part of the workspace), manifest
+paths use `/` separators on every platform, and a path that now sits behind a link or
+junction is refused. Before the first write the restore probes every file it would replace
+or delete; one held open for writing (or without delete sharing) by another program, or
+behind a link, refuses the whole restore with nothing changed. Windows names are
+case-insensitive, so a case-only rename since the snapshot is refused rather than risk
+deleting the restored file. A file that becomes locked between the probe and its own
+publication still stops the restore part-way, with the completed count reported, as on
+Unix. File attributes (such as read-only) are not recorded; a restored file keeps the
+current file's attributes.

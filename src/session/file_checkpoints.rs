@@ -70,9 +70,9 @@ impl Limits {
 /// `paths::exchange_relative` and `paths::retire_relative_expecting`).
 pub(crate) const FILE_RESTORE_SUPPORTED: bool =
     cfg!(any(target_os = "linux", target_os = "macos", windows));
-/// Whole-workspace snapshots around shell commands remain Unix-only.
-pub(crate) const WORKSPACE_RESTORE_SUPPORTED: bool =
-    cfg!(any(target_os = "linux", target_os = "macos"));
+/// Whole-workspace snapshots around shell commands use the same checked
+/// primitives, so they are available wherever file rewind is.
+pub(crate) const WORKSPACE_RESTORE_SUPPORTED: bool = FILE_RESTORE_SUPPORTED;
 static LIMITS: std::sync::RwLock<Limits> = std::sync::RwLock::new(Limits::DEFAULT);
 /// Installs the process-wide checkpoint limits (agent construction).
 #[cfg_attr(test, allow(dead_code))]
@@ -2851,5 +2851,51 @@ mod journal_delta_tests {
                 .len(),
             1
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_workspace_restore_tests {
+    use super::*;
+
+    #[test]
+    fn rb4w2_workspace_restore_is_enabled_and_round_trips_through_the_store() {
+        assert!(WORKSPACE_RESTORE_SUPPORTED);
+        let root = crate::tests::OwnedTestDirectory::new("rb4w2-turn");
+        let store_dir = crate::tests::OwnedTestDirectory::new("rb4w2-turn-store");
+        let dir = store_dir.path().join("snapshots");
+        let ws = root.path();
+        std::fs::write(ws.join("edited.txt"), "before\n").unwrap();
+        std::fs::write(ws.join("deleted.txt"), "doomed\n").unwrap();
+        let binding = crate::paths::WorkspaceBinding::capture(ws).unwrap();
+        let checkpoints = FileCheckpoints::default();
+        let caps = super::super::workspace_snapshots::Caps::DEFAULT;
+        assert!(
+            checkpoints
+                .capture_workspace_with(5, ws, &dir, caps)
+                .is_none()
+        );
+        std::fs::write(ws.join("edited.txt"), "shell\n").unwrap();
+        std::fs::remove_file(ws.join("deleted.txt")).unwrap();
+        std::fs::write(ws.join("created.txt"), "codegen\n").unwrap();
+        let report = checkpoints
+            .restore_workspace_with(5, &binding, &dir)
+            .unwrap();
+        assert_eq!(
+            report,
+            WorkspaceReport {
+                changed: 3,
+                snapshot_turn: 5
+            }
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("edited.txt")).unwrap(),
+            "before\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("deleted.txt")).unwrap(),
+            "doomed\n"
+        );
+        assert!(!ws.join("created.txt").exists());
     }
 }
