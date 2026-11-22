@@ -1556,7 +1556,7 @@ impl CommitIdentity {
 
 #[cfg(any(test, feature = "git-worktree"))]
 pub(crate) const COMMIT_IDENTITY_UNRESOLVED: &str = "git commit requires an author identity: \
-the contained git process has no HOME or global config, so set user.name and user.email in \
+no user.name / user.email is configured: set them in \
 this repository (`git config user.name ...` / `git config user.email ...`) or export \
 GIT_AUTHOR_NAME/GIT_AUTHOR_EMAIL (and GIT_COMMITTER_NAME/GIT_COMMITTER_EMAIL) before starting (identity settings are read once at startup: restart mini-agent after changing them)";
 
@@ -1736,6 +1736,12 @@ fn hardened_config(profile: InternalProfile, repository_execution: bool) -> Vec<
         ("fetch.recurseSubmodules", "false"),
         ("status.submoduleSummary", "false"),
         ("protocol.ext.allow", "never"),
+        // Auto-maintenance after a commit re-invokes `git maintenance run
+        // --detach`, resolved on the host PATH; an older host git rejects the
+        // flag and every commit prints a usage error. No background
+        // housekeeping is wanted in a contained run either.
+        ("gc.auto", "0"),
+        ("maintenance.auto", "false"),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_string(), value.to_string()))
