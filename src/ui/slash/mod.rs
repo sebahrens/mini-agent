@@ -1176,17 +1176,30 @@ async fn cache_fork_input(
     input_token_budget: u64,
     reasoning_enabled: bool,
 ) -> Option<(crate::provider::AnyAgent, Vec<rig::completion::Message>)> {
-    let history = crate::agent::runner::cache_fork_history(
+    let history = match crate::agent::runner::cache_fork_history_checked(
         ui.session,
         cut_idx,
         keep_recent_tool_results,
         input_token_budget,
-    )?;
+    ) {
+        Ok(history) => history,
+        Err(reason) => {
+            tracing::debug!("compaction cache fork skipped: {reason}");
+            return None;
+        }
+    };
     let agent = ui
         .agent_build_ctx()
         .rebuild_agent(&ui.session.model, reasoning_enabled)
         .await;
-    agent.supports_cache_fork().then_some((agent, history))
+    if let Some(reason) =
+        crate::agent::runner::cache_fork_route_skip(true, false, agent.supports_cache_fork())
+    {
+        tracing::debug!("compaction cache fork skipped: {reason}");
+        return None;
+    }
+    tracing::debug!("compaction cache fork taken");
+    Some((agent, history))
 }
 
 /// As [`compact_session_with`], re-attaching the newest file windows read in

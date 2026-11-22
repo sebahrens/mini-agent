@@ -1,6 +1,6 @@
 //! Explicit per-run accounting profile and effect admission. The profile is
 //! copied into SDK extensions; task-local scope is never assumed to cross spawn.
-use super::{Account, BudgetRefusal, Ledger, PriceSnapshot, Receipt, RequestKind};
+use super::{Account, BudgetRefusal, Ledger, PriceSnapshot, Receipt, RequestKind, generation};
 use crate::{config::Config, event::UsageDelta, session::Session};
 use rig::agent::{AgentHook, Flow, HookContext, StepEvent};
 use rig::completion::CompletionModel;
@@ -29,6 +29,11 @@ pub(crate) struct Run {
     reasoning_exclusive: bool,
     cache_ttl: crate::config::PromptCacheTtl,
     cap_required: bool,
+    /// Whether the HTTP layer refuses a request whose prompt alone exceeds
+    /// the remaining USD budget. On by default; micro-dollar fixtures that pin
+    /// response-based accounting turn it off with [`Self::without_preflight`].
+    /// `MINI_AGENT_BUDGET_PREFLIGHT=0` disables it for a process.
+    preflight_refusal: bool,
     refused: Arc<std::sync::atomic::AtomicBool>,
     /// Why the last ledger flush failed, so a capped run that stops because
     /// spend cannot be recorded says so instead of claiming the budget ran out.
@@ -42,6 +47,21 @@ pub(crate) struct Run {
 }
 
 tokio::task_local! { static CURRENT: Option<Run>; }
+
+/// Whether runs built from `cfg` refuse an unaffordable request before
+/// sending it: always in production, and in tests unless a micro-dollar
+/// fixture opts out (mini-agent-bnynh).
+fn preflight_enabled(cfg: &Config) -> bool {
+    #[cfg(test)]
+    {
+        !cfg.budget_preflight_off
+    }
+    #[cfg(not(test))]
+    {
+        let _ = cfg;
+        true
+    }
+}
 
 impl Run {
     #[cfg(test)]
@@ -65,6 +85,7 @@ impl Run {
             reasoning_exclusive: false,
             cache_ttl: Default::default(),
             cap_required,
+            preflight_refusal: true,
             refused: Default::default(),
             tracking_detail: Default::default(),
             sdk_request: Default::default(),
@@ -74,6 +95,14 @@ impl Run {
             #[cfg(feature = "subagents")]
             background_pool: Default::default(),
         }
+    }
+
+    /// Test fixtures with micro-dollar caps pin response-based accounting
+    /// contracts that a pre-send refusal would hide.
+    #[cfg(test)]
+    pub(crate) fn without_preflight(mut self) -> Self {
+        self.preflight_refusal = false;
+        self
     }
 
     #[cfg(feature = "subagents")]
@@ -177,6 +206,7 @@ impl Run {
             kind,
             setup_error: initialization_error.or(setup_error),
             cap_required: cfg.max_budget_usd.is_some(),
+            preflight_refusal: preflight_enabled(cfg),
             refused: Default::default(),
             tracking_detail: Default::default(),
             sdk_request: Default::default(),
@@ -227,6 +257,7 @@ impl Run {
             kind: RequestKind::Turn,
             setup_error,
             cap_required: cfg.max_budget_usd.is_some(),
+            preflight_refusal: preflight_enabled(cfg),
             refused: Default::default(),
             tracking_detail: Default::default(),
             sdk_request: Default::default(),
@@ -495,9 +526,30 @@ impl Run {
     pub(crate) fn observe(&self, usage: UsageDelta) {
         self.observe_receipt(&self.receipt(usage));
     }
-    /// Charges an interrupted stream's estimate, flagged as such in the ledger.
-    pub(crate) fn observe_estimate(&self, usage: UsageDelta) {
-        self.observe_receipt(&self.receipt(usage).into_estimate());
+    /// Charges an interrupted stream's estimate, flagged as such in the
+    /// ledger, then (for an OpenRouter stream that named
+    /// its generation) one short lookup that replaces the estimate with the
+    /// provider's own counts if it answers in time. The estimate is charged
+    /// first, so the cap stays conservative while the lookup runs; `flush`
+    /// waits for it (at most [`generation::TIMEOUT`]) before writing the row.
+    pub(crate) fn observe_estimate_with_lookup(
+        &self,
+        usage: UsageDelta,
+        lookup: Option<generation::Pending>,
+    ) {
+        let estimate = self.receipt(usage).into_estimate();
+        self.observe_receipt(&estimate);
+        let Some(lookup) = lookup else {
+            return;
+        };
+        let run = self.clone();
+        generation::run_in_background(&self.session_id, async move {
+            let Some(reported) = generation::lookup(&lookup, generation::TIMEOUT).await else {
+                return;
+            };
+            let corrected = run.receipt(reported).replacing(&estimate);
+            run.account.amend_estimate(&estimate, &corrected);
+        });
     }
     fn receipt(&self, mut usage: UsageDelta) -> Receipt {
         if self.reasoning_exclusive {
@@ -527,6 +579,7 @@ impl Run {
     /// File scans, serialization locks and fsync run only in a scoped blocking
     /// child. The account retains its charge and pending row before this await.
     pub(crate) async fn flush(&self) {
+        generation::settle(&self.session_id).await;
         if !self.account.has_pending() {
             return;
         }
@@ -679,12 +732,9 @@ impl Run {
     /// cheaper of the input and cache-read rates), so it never refuses a
     /// request that could have fit. Returns true when refused.
     pub(crate) fn refuse_unaffordable(&self, body_bytes: usize) -> bool {
-        // For providers billed far below their list price. The unit-test
-        // binary never refuses here: its fixtures use micro-dollar caps and
-        // absurd prices to pin the response-based accounting contracts, which
-        // a pre-send refusal would hide. The refusal itself is pinned by
-        // `refuse_unaffordable_checked` tests.
-        if cfg!(test)
+        // The env switch is for providers billed far below their list price.
+        // Fixtures with micro-dollar caps and absurd prices opt out per run.
+        if !self.preflight_refusal
             || std::env::var_os("MINI_AGENT_BUDGET_PREFLIGHT").is_some_and(|value| value == "0")
         {
             return false;
@@ -947,6 +997,9 @@ pub(crate) struct StreamGuard {
     /// what actually arrived, never more than the request's upper bound
     /// (mini-agent-4zov7).
     streamed_bytes: std::sync::atomic::AtomicU64,
+    /// OpenRouter only: where to ask for the real counts, and the generation
+    /// id the stream announced (mini-agent-qqknv).
+    generation: std::sync::Mutex<(Option<generation::Target>, Option<String>)>,
 }
 
 /// Conservative output tokens for `bytes` of streamed response: SSE framing
@@ -964,7 +1017,20 @@ impl StreamGuard {
             finished: Default::default(),
             estimate: Default::default(),
             streamed_bytes: Default::default(),
+            generation: Default::default(),
         })
+    }
+    /// Records the generation lookup target of an OpenRouter request.
+    pub(crate) fn set_generation_target(&self, target: generation::Target) {
+        self.generation.lock().unwrap_or_else(|e| e.into_inner()).0 = Some(target);
+    }
+    /// Records the generation id the stream announced (the first one wins).
+    pub(crate) fn note_generation_id(&self, id: String) {
+        self.generation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .get_or_insert(id);
     }
     /// Counts response bytes received from the provider.
     pub(crate) fn add_streamed(&self, bytes: usize) {
@@ -1006,7 +1072,15 @@ impl Drop for StreamGuard {
                         .load(std::sync::atomic::Ordering::Relaxed);
                     bound.output_tokens = bound.output_tokens.min(streamed_output_tokens(streamed));
                     bound.total_tokens = bound.input_tokens.saturating_add(bound.output_tokens);
-                    run.observe_estimate(bound)
+                    let lookup = {
+                        let (target, id) =
+                            &*self.generation.lock().unwrap_or_else(|e| e.into_inner());
+                        target.clone().zip(id.clone())
+                    };
+                    run.observe_estimate_with_lookup(
+                        bound,
+                        lookup.map(|(target, id)| generation::Pending { target, id }),
+                    )
                 }
                 None => run.account.tracking_failed(),
             }
@@ -1109,6 +1183,75 @@ mod first_item_tests {
         // 8 MB of body is at least 1M input tokens, $1 at $1 per million.
         assert!(run.refuse_unaffordable_checked(8_000_000));
         assert!(run.was_refused());
+    }
+
+    // mini-agent-qqknv: an interrupted OpenRouter stream's estimate is replaced
+    // by the generation endpoint's counts, and kept when the lookup fails.
+    #[tokio::test]
+    async fn generation_lookup_replaces_the_interrupted_streams_estimate() {
+        let root = crate::tests::OwnedTestDirectory::new("generation-lookup");
+        let account = Account::new("generation-lookup", Some(10.0), 0.0).unwrap();
+        let run = Run::fixture(
+            account.clone(),
+            Arc::new(Ledger::new(root.path())),
+            "generation-lookup",
+            PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false),
+        );
+        let (base, server) = generation::stub_server(
+            200,
+            r#"{"data":{"native_tokens_prompt":100,"native_tokens_completion":20}}"#,
+            std::time::Duration::ZERO,
+        )
+        .await;
+        let pending = generation::stub_pending(&base);
+        let guard = StreamGuard::new(Some(run.clone()));
+        guard.set_estimate(UsageDelta {
+            input_tokens: 1_000,
+            output_tokens: 500,
+            total_tokens: 1_500,
+            ..Default::default()
+        });
+        guard.set_generation_target(pending.target.clone());
+        guard.note_generation_id(pending.id.clone());
+        guard.note_generation_id("gen-ignored".into());
+        guard.add_streamed(10_000);
+        guard.opened();
+        drop(guard);
+        assert_eq!(
+            account.estimated_tokens().0,
+            1_000,
+            "estimate charged first"
+        );
+        run.flush().await;
+        assert_eq!(account.estimated_tokens(), (0, 0), "estimate replaced");
+        assert!(
+            !account.has_pending(),
+            "the corrected row reached the ledger"
+        );
+        let expected = (100.0 * 1.0 + 20.0 * 2.0) / 1_000_000.0;
+        assert!((account.snapshot().observed_cost - expected).abs() < 1e-12);
+        assert!(server.await.unwrap().contains("id=gen-test-1"));
+
+        // A failed lookup leaves the estimate in place.
+        let account = Account::new("generation-miss", Some(10.0), 0.0).unwrap();
+        let run = Run::fixture(
+            account.clone(),
+            Arc::new(Ledger::new(root.path())),
+            "generation-miss",
+            PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false),
+        );
+        let (base, _) = generation::stub_server(404, "{}", std::time::Duration::ZERO).await;
+        run.observe_estimate_with_lookup(
+            UsageDelta {
+                input_tokens: 1_000,
+                output_tokens: 500,
+                total_tokens: 1_500,
+                ..Default::default()
+            },
+            Some(generation::stub_pending(&base)),
+        );
+        run.flush().await;
+        assert_eq!(account.estimated_tokens(), (1_000, 500));
     }
 
     #[tokio::test]

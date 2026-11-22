@@ -52,6 +52,7 @@ pub(crate) use report::long_context_label;
 pub(crate) use report::{
     configured_service_tier, cost_lines, service_tier_ceiling_warning, service_tier_note,
 };
+pub(crate) mod generation;
 pub(crate) mod run;
 pub(crate) use ledger::{Ledger, LedgerSummary};
 const MAX_PENDING_RECEIPTS: usize = 1024;
@@ -579,6 +580,23 @@ impl Receipt {
         row.estimated = true;
         Self {
             row: Arc::new(row),
+            ..self
+        }
+    }
+    /// This receipt, standing in for the estimated `old` one: same row id and
+    /// time, no longer flagged as an estimate (mini-agent-qqknv).
+    #[allow(
+        clippy::needless_update,
+        reason = "`observation` exists only with subagents"
+    )]
+    pub(crate) fn replacing(self, old: &Receipt) -> Self {
+        let mut row = (*self.row).clone();
+        row.id = old.row.id;
+        row.ts = old.row.ts;
+        row.estimated = false;
+        Self {
+            row: Arc::new(row),
+            charged: old.charged.clone(),
             ..self
         }
     }
@@ -1186,6 +1204,57 @@ impl Account {
         }
         state.pending.insert(row.id, row.clone());
         Ok(true)
+    }
+    /// Replaces the still-unflushed estimated row of `old` with the provider's
+    /// later report `corrected` (same id), moving the totals accordingly.
+    /// False when the estimate already reached the ledger, was never priced,
+    /// or the corrected row cannot be priced: the estimate then stands.
+    pub(crate) fn amend_estimate(&self, old: &Receipt, corrected: &Receipt) -> bool {
+        let mut state = self.edit();
+        let (before, after) = (&old.row, &corrected.row);
+        if before.id != after.id || after.estimated || corrected.row.validate().is_err() {
+            return false;
+        }
+        let Some(current) = state.pending.get(&before.id).cloned() else {
+            return false;
+        };
+        let (Some(old_cost), Some(new_cost)) = (current.cost, after.cost) else {
+            return false;
+        };
+        if !current.estimated || state.tracking_error {
+            return false;
+        }
+        let input = |row: &Row| {
+            crate::session::Session::real_input_tokens(
+                row.prices.anthropic_native,
+                row.usage.input_tokens,
+                row.usage.total_tokens,
+                row.usage.output_tokens,
+                row.usage.cached_input_tokens,
+                row.usage.cache_creation_input_tokens,
+            )
+        };
+        let (old_input, new_input) = (input(&current), input(after));
+        let sum = state.observed_cost - old_cost + new_cost;
+        if !sum.is_finite() {
+            return false;
+        }
+        state.observed_cost = sum.max(0.0);
+        state.observed_input_tokens = state
+            .observed_input_tokens
+            .saturating_sub(old_input)
+            .saturating_add(new_input);
+        state.observed_output_tokens = state
+            .observed_output_tokens
+            .saturating_sub(current.usage.output_tokens)
+            .saturating_add(after.usage.output_tokens);
+        state.estimated_input_tokens = state.estimated_input_tokens.saturating_sub(old_input);
+        state.estimated_output_tokens = state
+            .estimated_output_tokens
+            .saturating_sub(current.usage.output_tokens);
+        state.observation_revision = state.observation_revision.saturating_add(1);
+        state.pending.insert(before.id, after.clone());
+        true
     }
     #[cfg(test)]
     fn pending(&self) -> Vec<Arc<Row>> {

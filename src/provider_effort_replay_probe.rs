@@ -623,7 +623,8 @@ async fn effort46_owned_capture_precedes_canonical_budget_stop_without_second_ch
         ledger.clone(),
         "capture-budget",
         prices,
-    );
+    )
+    .without_preflight();
     let profile = profile.with_captured_profile(
         "anthropic",
         "claude-opus-5-5",

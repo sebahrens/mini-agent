@@ -3789,6 +3789,16 @@ sets it explicitly (same bounds). A file that does not fit in what remains is
 truncated with a visible notice (`[context file truncated: ...]`) rather than loaded
 whole, and files after the budget is spent are skipped.
 
+Framing by trust: project instruction files (workspace and repository-ancestor
+`AGENTS.md`, `CLAUDE.md`, `.claude/` rules) are presented as the repository's standing
+instructions only when the user has trusted the workspace's project config (`mini-agent trust`,
+or `--trust-project-config` for one run). There is no separate trusted-workspace-root list: trust
+is the project config binding, so a repository with no `.mini-agent/config.toml` is untrusted. For
+an untrusted workspace the same text is still loaded but framed as quoted, reference-only data that
+cannot override system or user instructions. The user's own global `AGENTS.md` stays authoritative
+either way. To make a repository's instruction files authoritative, run `mini-agent trust` in it
+(add a minimal `.mini-agent/config.toml` first if it has none).
+
 Claude Code's modular project layout is read too. The root also loads `.claude/CLAUDE.md`
 (after `CLAUDE.md`) and every `.md` file under `.claude/rules/` (recursively, at most 64
 files, 4 levels and 1024 scanned directory entries, visited in sorted name order so the

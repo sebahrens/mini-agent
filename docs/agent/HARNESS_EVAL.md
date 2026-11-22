@@ -98,25 +98,20 @@ task or of a few cents is not evidence. Costs are the provider-reported cost and
 move with prompt-cache warmth, which differed between runs. The second model
 (`z-ai/glm-5.3`) was not run: the budget went to sonnet repeats.
 
-Findings about the tooling (not patched here):
+Findings about the tooling (since fixed in `scripts/delegation_eval.py` and `tasks.json`: the
+config key is written at top level and a rejected config aborts the run, scratch directories
+resolve through `os.path.realpath`, records keep the whole `subagent_delegation` aggregate, and
+the `independent_questions` prompt now asks for the `docs: <count>` / `src: <count>` lines its
+oracle expects):
 
-- `scripts/delegation_eval.py` writes `[subagents]\ntask_enabled = ...`, but
-  `task_enabled` is a top-level key; the binary refuses the file (`config is not
-  valid TOML ... unknown field`), so every record is an all-zero failure. The
-  runs below used a local copy that writes `task_enabled = ...` at top level.
-- The script creates its scratch directories with `tempfile`, which is under
-  `/var/folders` on macOS; the binary rejects it (`private paths reject symlinked
-  path components: /var`). Setting `TMPDIR` to a directory without symlinks
-  works around it.
-- The record keeps `contract_pass`, `repair_used` and `host_replaced` but drops
-  `contract_repaired`, `contract_unstructured` and `contract_normalized`, so
-  validated, repaired and unstructured cannot be told apart from its output; the
-  local copy also stored the whole `subagent_delegation` aggregate.
-- `tasks.json` has three tasks; `independent_questions` fails in both arms
-  because its expected text `docs: 2` / `src: 1` is not what the prompt asks for.
-  Two tasks were added for the runs (`find_definition_module`,
-  `count_test_functions`).
-- No run emitted a debug line naming a cache fork (see compaction below).
+- `scripts/delegation_eval.py` wrote `[subagents]\ntask_enabled = ...`, but
+  `task_enabled` is a top-level key; the binary refused the file, so every record was an
+  all-zero failure.
+- Its scratch directories were under `/var/folders` on macOS, which the binary rejects.
+- Its record dropped `contract_repaired`, `contract_unstructured` and `contract_normalized`.
+- `independent_questions` failed in both arms because its expected text was not what the prompt
+  asked for. Two tasks were added for the runs (`find_definition_module`, `count_test_functions`).
+- No run emitted a debug line naming a cache fork; compactions now log "cache fork taken / skipped: reason" at debug level (see [COST_TRACKING.md](COST_TRACKING.md#compaction-and-the-prompt-cache) for why reuse is low).
 
 **Delegation lane** (5 tasks, both arms, one repetition each unless noted).
 

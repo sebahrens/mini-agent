@@ -61,7 +61,10 @@ A stream that is interrupted after it opened is charged an estimate: the request
 the output implied by the bytes received (two bytes per token), never more than the request's
 `max_tokens` bound. Its ledger row carries `estimated: true` (absent otherwise), and the exit
 summary names those tokens ("estimated for interrupted requests") so its token counts and its
-cost describe the same requests. A capped run also refuses, before sending, a request whose
+cost describe the same requests. For an OpenRouter stream that announced its generation id, one lookup
+of OpenRouter's generation endpoint (at most 3 seconds, failure-tolerant, never blocking shutdown longer)
+replaces that estimate with the provider's own token counts and cost, and the row's `estimated` flag is
+cleared; if the lookup fails or times out the estimate stands. Other providers are never queried. A capped run also refuses, before sending, a request whose
 prompt and tool list alone are certain to cost more than the remaining USD budget; it stops
 with exit code 4 and a stderr line naming the cost floor and the flag to raise.
 
@@ -291,3 +294,26 @@ uncertainty is restored conservatively as a lower bound. Existing
 ledger reconciliation supplies a lower bound from reported rows, and a new
 logical-session key retains the historical count and its completeness marker.
 Neither rendering nor resizing opens the ledger or performs provider work.
+
+## Compaction and the prompt cache
+
+A compaction on a native prompt-cache route (Anthropic, OpenAI, OpenRouter) normally summarizes
+through the conversation's own request, so the system prompt, tools and message prefix are read
+from the cache ("cache fork"). Three cases cannot reuse more than the system prompt, and
+that is inherent rather than a fault:
+
+- A compaction cuts the history before its newest messages, so the forked request ends at an
+  earlier point than any earlier request did. Provider caches match a prefix only up to a
+  breakpoint an earlier request wrote; a cut in the middle of the history has no such breakpoint,
+  so later compactions in one turn read the system-prompt prefix and little more.
+- The compacted history is a new prefix: the next request after a compaction starts from the
+  summary, which no cache holds yet.
+- A between-turn (pre-turn) compaction runs before the turn's agent exists, and a cache entry
+  lives only for the provider's TTL (five minutes by default), so a resumed session usually
+  reads nothing. Native Anthropic sessions always use the text summarizer because a cache fork
+  cannot replay their thinking chain.
+
+Run with `RUST_LOG=mini_agent=debug` to see one line per compaction: "compaction cache fork
+taken" or "compaction cache fork skipped: <reason>" (no agent yet, a separate `compaction_model`,
+a route without a native cache, images in the prefix, a prefix over the summarizer budget, or a
+native history that cannot be cut).

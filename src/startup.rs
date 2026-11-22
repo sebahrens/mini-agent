@@ -1178,6 +1178,13 @@ pub(crate) async fn compact_headless_session(
     // request instead of re-serializing it (mini-agent-o2nut).
     // `PreCompact` fires once per compaction, from the shared driver, before
     // the first summarizer request of either path (mini-agent-sskdu.239).
+    if let Some(reason) = crate::agent::runner::cache_fork_route_skip(
+        agent.is_some(),
+        compaction_model.is_some(),
+        agent.is_some_and(provider::AnyAgent::supports_cache_fork),
+    ) {
+        tracing::debug!("compaction cache fork skipped: {reason}");
+    }
     let fork: Option<HeadlessFork<'_>> = agent
         .filter(|agent| compaction_model.is_none() && agent.supports_cache_fork())
         .map(|agent| {
@@ -1426,7 +1433,10 @@ where
                 )
                 .await
                 {
-                    Ok(forked) => return Ok(forked),
+                    Ok(forked) => {
+                        tracing::debug!("compaction cache fork taken");
+                        return Ok(forked);
+                    }
                     Err(error) => tracing::warn!(
                         "cache-reusing compaction failed, using the text summarizer: {error}"
                     ),
@@ -3438,14 +3448,10 @@ impl Startup {
                         })
                     {
                         persistence_failure = Some(error);
-                    } else if let Err(e) = session::chat_history::append_entry(
-                        &session::chat_history::ChatHistoryEntry {
-                            content: msg,
-                            timestamp: session.updated_at.clone(),
-                        },
-                    ) {
-                        eprintln!("warning: failed to append chat history entry: {}", e);
                     }
+                    // Scripted and CI commands stay out of the TUI's Up-arrow
+                    // and Ctrl+R input history, like headless prompts
+                    // (mini-agent-ukk9a, mini-agent-x4a6f).
                 }
                 if let Some((files_changed, pricing)) = json_context {
                     let stop_reason = if run.succeeded() && persistence_failure.is_none() {
@@ -4236,6 +4242,19 @@ impl Startup {
             {
                 return Err(crate::print::HeadlessGoalExit(reason).into());
             }
+        }
+        #[cfg(feature = "goal")]
+        if failure
+            .as_ref()
+            .is_some_and(crate::agent::runner::is_headless_interrupt)
+            && finished_goal
+                .as_ref()
+                .is_some_and(|goal| goal.status == crate::extras::goal::GoalStatus::Active)
+        {
+            crate::print::headless_stderr(format_args!(
+                "{}\n",
+                crate::extras::goal::interrupt_notice(true)
+            ));
         }
         // The turn's own failure wins: a partial persistence failure is
         // reported too, but neither is ever presented as success.
@@ -7699,6 +7718,27 @@ mod tests {
         let (session, _) = fork_test_session();
         assert!(crate::agent::runner::cache_fork_history(&session, 2, 0, 9_000).is_some());
         assert!(crate::agent::runner::cache_fork_history(&session, 2, 0, 1_000).is_none());
+    }
+
+    // The route-level fork decision names its reason; an OpenRouter agent is a
+    // native-cache route (mini-agent-csng7), so only the missing agent, a
+    // separate compaction model or an uncached route skip it.
+    #[test]
+    fn cache_fork_route_decision_names_why_it_is_skipped() {
+        use crate::agent::runner::cache_fork_route_skip as skip;
+        assert_eq!(skip(true, false, true), None);
+        assert!(skip(false, false, true).unwrap().contains("pre-turn"));
+        assert!(skip(true, true, true).unwrap().contains("compaction_model"));
+        assert!(
+            skip(true, false, false)
+                .unwrap()
+                .contains("native prompt cache")
+        );
+        let (session, _) = fork_test_session();
+        let reason = crate::agent::runner::cache_fork_history_checked(&session, 2, 0, 1_000)
+            .err()
+            .unwrap();
+        assert!(reason.contains("summarizer input budget"), "{reason}");
     }
 
     // mini-agent-i6q98: the summarizer's requests are charged to the session

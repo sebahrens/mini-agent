@@ -177,6 +177,16 @@ impl InstructionRoot {
             .with_identity(identity)
     }
 
+    #[cfg(test)]
+    pub(crate) fn global_for_test(binding: Arc<WorkspaceBinding>, path: &str, text: &str) -> Self {
+        Self::global(binding, PathBuf::from(path), text)
+    }
+
+    /// The captured text of the user's own global `AGENTS.md` root.
+    pub(super) fn global_text(&self) -> Option<&str> {
+        matches!(self.origin, RootOrigin::Global(_)).then_some(&*self.text)
+    }
+
     pub(super) fn global(binding: Arc<WorkspaceBinding>, path: PathBuf, text: &str) -> Self {
         Self {
             origin: RootOrigin::Global(binding),

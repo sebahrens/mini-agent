@@ -4275,14 +4275,31 @@ pub(crate) fn convert_history_prefix(
 /// prefix is the native wire history itself, cut before the user prompt at
 /// `cut_idx` (mini-agent-sskdu.265). The cut is verified: the wire history's
 /// user prompts must equal the session's own replay, one for one.
+#[cfg(test)]
 pub(crate) fn cache_fork_history(
     session: &Session,
     cut_idx: usize,
     keep_recent_tool_results: usize,
     input_token_budget: u64,
 ) -> Option<Vec<Message>> {
+    cache_fork_history_checked(
+        session,
+        cut_idx,
+        keep_recent_tool_results,
+        input_token_budget,
+    )
+    .ok()
+}
+
+/// [`cache_fork_history`] naming why the fork is ineligible.
+pub(crate) fn cache_fork_history_checked(
+    session: &Session,
+    cut_idx: usize,
+    keep_recent_tool_results: usize,
+    input_token_budget: u64,
+) -> Result<Vec<Message>, &'static str> {
     if session.prefix_has_images(cut_idx) {
-        return None;
+        return Err("images sit in the prefix");
     }
     let first_live = session.compacted_context().1;
     let tokens: u64 = session.messages[first_live.min(cut_idx)..cut_idx]
@@ -4291,16 +4308,36 @@ pub(crate) fn cache_fork_history(
         .sum();
     // Leave room for the instruction and the estimator's error.
     if tokens.saturating_add(2_000) > input_token_budget / 10 * 9 {
-        return None;
+        return Err("the prefix does not fit the summarizer input budget");
     }
     if let Some(native) = session.native_history_snapshot() {
-        return native_fork_prefix(session, native, cut_idx, keep_recent_tool_results);
+        return native_fork_prefix(session, native, cut_idx, keep_recent_tool_results)
+            .ok_or("the native wire history cannot be cut at the compaction point");
     }
-    Some(convert_history_prefix(
+    Ok(convert_history_prefix(
         session,
         cut_idx,
         keep_recent_tool_results,
     ))
+}
+
+/// Why a compaction cannot fork the conversation's own request, from the
+/// route-level conditions alone (`None` when the route allows it). The
+/// history-level conditions are named by [`cache_fork_history_checked`].
+pub(crate) fn cache_fork_route_skip(
+    has_agent: bool,
+    compaction_model_set: bool,
+    route_has_native_cache: bool,
+) -> Option<&'static str> {
+    if !has_agent {
+        Some("no agent exists yet (pre-turn compaction), so there is no request prefix to reuse")
+    } else if compaction_model_set {
+        Some("a separate compaction_model is configured")
+    } else if !route_has_native_cache {
+        Some("the route has no native prompt cache")
+    } else {
+        None
+    }
 }
 
 /// A user message that carries a prompt rather than tool results.
@@ -6966,6 +7003,7 @@ where
                             mid_turn_since_completion = 0;
                         }
                         let delta = turn.on_completion_call(&call, retry_config);
+                        output_policy.response_stop_reason(call.stop_reason);
                         if let Err(error) = output_policy
                             .usage(delta, turn.usage_ledger.total)
                             .await

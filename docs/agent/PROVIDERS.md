@@ -253,11 +253,13 @@ provider = "bedrock"
 model = "us.anthropic.claude-sonnet-5"
 ```
 
-Not yet verified live (needs an AWS account): that `/anthropic/v1/messages`
-streams plain SSE for a real region, and whether a Bedrock API key is accepted as
-`x-api-key` (as sent today) or must be `Authorization: Bearer`. Request shape is
-pinned by `provider_bedrock_tests.rs`; if a live run refuses either, change the
-route/header there. A failed credential chain now names its class (no
+Not verified against the live service; behaviour pinned by a stub (needs an AWS
+account): that `/anthropic/v1/messages` streams plain SSE for a real region, and
+whether a Bedrock API key is accepted as `x-api-key` (as sent today) or must be
+`Authorization: Bearer`. `provider_bedrock_tests.rs` pins the request path, the
+SSE parse, the `x-api-key` header for a key (SigV4 otherwise) and a clear,
+non-retried error naming `AWS_BEARER_TOKEN_BEDROCK` on a 401/403; if a live run
+refuses the route or header, change them there. A failed credential chain now names its class (no
 credentials, timeout, provider error) and an expired SSO session says to run
 `aws sso login --profile NAME`.
 
@@ -760,9 +762,10 @@ The sign-in exchanges the GitHub user token at `/copilot_internal/v2/token`, an
 internal GitHub endpoint that may issue Copilot tokens only to GitHub-approved
 editor integrations. If GitHub refuses it (HTTP 403/404) sign-in stops with a
 message saying so, and the supported fallbacks are `GITHUB_COPILOT_API_TOKEN` or
-`COPILOT_GITHUB_TOKEN`. This has not been verified against github.com with a
-fresh OAuth app (it needs a Copilot account); record the observed status here
-once checked. A model the plan or organization policy does not enable is reported
+`COPILOT_GITHUB_TOKEN`. Not verified against the live service; behaviour pinned by a
+stub: the device-code, token-poll, `/user` and token-exchange request sequence
+with the configured client id, and the refusal message, are covered by tests
+against a local stub server (no Copilot account was used). A model the plan or organization policy does not enable is reported
 as "this model is not available on your plan or not enabled for your account;
 run /models"; error bodies are never echoed.
 

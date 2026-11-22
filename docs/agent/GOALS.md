@@ -52,7 +52,8 @@ You are not locked out while a goal runs. Typing a message is a normal turn; the
 evaluates at its end. Pressing Esc stops the current round but leaves the goal active: the next
 message you send continues it (`goal: interrupted — still active`), and `/goal pause` parks it. The
 status line marks such an armed goal `idle`, and a second interrupt with no round settled in between
-parks it for you (`/goal resume` to continue).
+parks it for you (`/goal resume` to continue). The TUI interrupt notice and the headless stderr line (after
+SIGINT) both say the goal stays active and name `/goal pause`; headless continues it with `--goal-resume`.
 While a round runs, `/goal status`, `/goal pause`, `/goal bounds` and `/goal check` work; `/goal
 clear`, `resume`, `reopen` and a new objective wait until you press Esc or pause first. A pause
 lets the running round finish, and its cost is still counted. A goal that is already parked keeps

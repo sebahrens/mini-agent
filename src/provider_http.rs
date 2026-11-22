@@ -892,6 +892,19 @@ impl HttpClientExt for ProviderHttpClient {
         if let Some(guard) = &budget_guard {
             guard.set_estimate(request_usage_bound(request.body()));
         }
+        // OpenRouter only: remember where the real counts can be asked for if
+        // this stream is interrupted (mini-agent-qqknv).
+        let mut generation_ids = None;
+        if let Some(guard) = &budget_guard
+            && let Some(target) = crate::spend::generation::Target::for_request(
+                &self.0.client,
+                request.uri(),
+                request.headers(),
+            )
+        {
+            guard.set_generation_target(target);
+            generation_ids = Some(crate::spend::generation::IdSniffer::default());
+        }
         let unaffordable = crate::spend::run::Run::current()
             .is_some_and(|run| run.refuse_unaffordable(request.body().len()));
         async move {
@@ -941,6 +954,9 @@ impl HttpClientExt for ProviderHttpClient {
                         && let Some(guard) = counter.upgrade()
                     {
                         guard.add_streamed(bytes.len());
+                        if let Some(id) = generation_ids.as_mut().and_then(|ids| ids.feed(bytes)) {
+                            guard.note_generation_id(id);
+                        }
                     }
                     chunk.map_err(transport_error)
                 }));
@@ -1206,6 +1222,64 @@ pub(crate) mod tests {
             assert!(!text.contains(secret), "key leaked: {text}");
             assert!(!text.contains("key="), "query leaked: {text}");
         }
+    }
+
+    // mini-agent-bnynh: the budget preflight is on in the unit-test binary, and a
+    // refusal happens before any connection is made.
+    #[tokio::test]
+    async fn streaming_request_over_the_budget_is_refused_before_any_request_is_sent() {
+        use crate::spend::{Account, Ledger, PriceSnapshot, run::Run};
+        let root = crate::tests::OwnedTestDirectory::new("http-preflight");
+        let run = Run::fixture(
+            Account::new("http-preflight", Some(0.5), 0.0).unwrap(),
+            std::sync::Arc::new(Ledger::new(root.path())),
+            "http-preflight",
+            PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = ProviderHttpClient::new(reqwest::Client::new());
+        // 8 MB of body is at least 1M input tokens: $1 at $1 per million
+        // against a $0.50 cap.
+        let request = Request::builder()
+            .uri(format!("http://{}/v1/chat", listener.local_addr().unwrap()))
+            .body(vec![b'x'; 8_000_000])
+            .unwrap();
+        let probe = run.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::spend::run::scope(Some(run), async { client.send_streaming(request).await }),
+        )
+        .await
+        .expect("a refusal does not wait on the network");
+        assert!(result.is_err(), "the unaffordable request must be refused");
+        assert!(probe.was_refused());
+        let connected = tokio::time::timeout(Duration::from_millis(200), listener.accept()).await;
+        assert!(connected.is_err(), "no request may reach the server");
+
+        // A run that opted out sends the same request.
+        let run = Run::fixture(
+            Account::new("http-no-preflight", Some(0.5), 0.0).unwrap(),
+            std::sync::Arc::new(Ledger::new(root.path())),
+            "http-no-preflight",
+            PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false),
+        )
+        .without_preflight();
+        let request = Request::builder()
+            .uri(format!("http://{}/v1/chat", listener.local_addr().unwrap()))
+            .body(vec![b'x'; 8_000_000])
+            .unwrap();
+        let server = async {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            drop(socket.shutdown().await);
+        };
+        let send = async {
+            let _ =
+                crate::spend::run::scope(Some(run), async { client.send_streaming(request).await })
+                    .await;
+        };
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(server, send) })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
