@@ -250,7 +250,7 @@ impl RunCommand {
         })
     }
 
-    fn argv(&self, run: &RunRequest, elicit: bool) -> Vec<OsString> {
+    fn argv(&self, run: &RunRequest, elicit: bool, stream: bool) -> Vec<OsString> {
         let mut argv = self.args.clone();
         if let Some(model) = &run.model {
             argv = strip_valued_flag(argv, "--model");
@@ -275,6 +275,11 @@ impl RunCommand {
                 ]
                 .map(OsString::from),
             );
+        } else if stream {
+            // Progress notifications follow the child's native event stream
+            // (mini-agent-1ptzh); the server owns the schema.
+            argv = strip_valued_flag(argv, "--stream-json-schema");
+            argv.extend(["--output".into(), "stream-json".into()]);
         } else {
             argv.extend(["--output".into(), "json".into()]);
         }
@@ -603,11 +608,26 @@ impl ElicitBridge {
     }
 }
 
+/// How long into a run an approval ask may still wait: the run timeout less
+/// the stop grace (half the timeout when the grace alone would exceed it).
+fn ask_budget(command: &RunCommand) -> Duration {
+    let budget = command.timeout.saturating_sub(command.stop_grace);
+    if budget.is_zero() {
+        command.timeout / 2
+    } else {
+        budget
+    }
+}
+
 /// A run's way to ask the client for approval.
 #[derive(Clone)]
 struct Elicit {
     bridge: Arc<ElicitBridge>,
     out: tokio::sync::mpsc::Sender<Value>,
+    /// Latest moment an unanswered ask may still wait: the run deadline minus
+    /// the stop grace, so the child is released while it can still save its
+    /// session (mini-agent-mt2f2). Set when the run starts.
+    ask_deadline: Option<tokio::time::Instant>,
 }
 
 /// Withdraws an unanswered request when its run stops waiting.
@@ -678,7 +698,10 @@ impl Elicit {
         if sent.is_err() {
             return Err("the MCP client connection is closed".into());
         }
-        let response = match tokio::time::timeout(ELICIT_WAIT, rx).await {
+        let wait = self.ask_deadline.map_or(ELICIT_WAIT, |deadline| {
+            ELICIT_WAIT.min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+        });
+        let response = match tokio::time::timeout(wait, rx).await {
             Ok(Ok(response)) => response,
             Ok(Err(_)) => return Err("the approval request was dropped".into()),
             Err(_) => return Err("the client did not answer the approval request in time".into()),
@@ -707,7 +730,8 @@ impl Elicit {
 async fn read_control_stream(
     stdout: impl AsyncRead + Unpin,
     mut stdin: Option<tokio::process::ChildStdin>,
-    elicit: Elicit,
+    elicit: Option<Elicit>,
+    progress: Option<Progress>,
 ) -> (Vec<u8>, bool) {
     let mut lines = tokio::io::BufReader::new(stdout);
     let mut result = Vec::new();
@@ -743,6 +767,9 @@ async fn read_control_stream(
         let Ok(record) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
+        if let Some(progress) = &progress {
+            progress.record(&record);
+        }
         match record.get("type").and_then(Value::as_str) {
             Some("result") => {
                 result = line.clone();
@@ -750,9 +777,11 @@ async fn read_control_stream(
                 stdin = None;
             }
             Some("control_request")
-                if record.pointer("/request/subtype").and_then(Value::as_str)
-                    == Some("can_use_tool") =>
+                if elicit.is_some()
+                    && record.pointer("/request/subtype").and_then(Value::as_str)
+                        == Some("can_use_tool") =>
             {
+                let Some(elicit) = &elicit else { continue };
                 let Some(request_id) = record.get("request_id").and_then(Value::as_str) else {
                     continue;
                 };
@@ -785,9 +814,77 @@ async fn read_control_stream(
     }
 }
 
+/// Sends `notifications/progress` for one run's progress token. Cloned between
+/// the heartbeat and the event reader, which share one increasing counter.
+#[derive(Clone)]
 struct Progress {
     token: Value,
     out: tokio::sync::mpsc::Sender<Value>,
+    counter: Arc<std::sync::atomic::AtomicU64>,
+    last_turn: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+}
+
+/// Least time between two model-turn notifications; tool events are not
+/// throttled (a tool call is already one slow step).
+const TURN_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
+
+impl Progress {
+    fn new(token: Value, out: tokio::sync::mpsc::Sender<Value>) -> Self {
+        Self {
+            token,
+            out,
+            counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_turn: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    fn send(&self, message: String) {
+        let progress = self
+            .counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let _ = self.out.try_send(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {
+                "progressToken": self.token,
+                "progress": progress,
+                "message": message
+            }
+        }));
+    }
+
+    /// Reports one child stream-json record: each tool call start and finish
+    /// and each completed model turn.
+    fn record(&self, record: &Value) {
+        let name = || {
+            record
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("a tool")
+        };
+        match record.get("type").and_then(Value::as_str) {
+            Some("tool_call") => self.send(format!("tool {} started", name())),
+            Some("tool_result") => {
+                let failed = record.get("is_error").and_then(Value::as_bool) == Some(true);
+                self.send(format!(
+                    "tool {} {}",
+                    name(),
+                    if failed { "failed" } else { "finished" }
+                ));
+            }
+            Some("usage") => {
+                let mut last = self.last_turn.lock().unwrap_or_else(|e| e.into_inner());
+                let now = std::time::Instant::now();
+                if last.is_none_or(|at| now.duration_since(at) >= TURN_PROGRESS_INTERVAL) {
+                    *last = Some(now);
+                    drop(last);
+                    self.send("model turn finished".to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 async fn run_prompt(
@@ -800,7 +897,7 @@ async fn run_prompt(
     use crate::process_creation::CommandWrapCreationExt as _;
     let mut child = tokio::process::Command::new(&command.program);
     child
-        .args(command.argv(run, elicit.is_some()))
+        .args(command.argv(run, elicit.is_some(), progress.is_some()))
         .stdin(if elicit.is_some() {
             std::process::Stdio::piped()
         } else {
@@ -821,6 +918,10 @@ async fn run_prompt(
     };
     let pid = child.id();
     let _group_guard = GroupKillOnDrop(pid);
+    let elicit = elicit.map(|mut elicit| {
+        elicit.ask_deadline = Some(tokio::time::Instant::now() + ask_budget(command));
+        elicit
+    });
     let control_stdin = if elicit.is_some() {
         child.stdin().take()
     } else {
@@ -847,11 +948,16 @@ async fn run_prompt(
             let reads = async {
                 tokio::join!(
                     async {
-                        match elicit.clone() {
-                            Some(elicit) => {
-                                read_control_stream(stdout, control_stdin, elicit).await
-                            }
-                            None => read_capped(stdout, MAX_CAPTURE_BYTES).await,
+                        if elicit.is_some() || progress.is_some() {
+                            read_control_stream(
+                                stdout,
+                                control_stdin,
+                                elicit.clone(),
+                                progress.clone(),
+                            )
+                            .await
+                        } else {
+                            read_capped(stdout, MAX_CAPTURE_BYTES).await
                         }
                     },
                     read_capped(stderr, MAX_STDERR_BYTES),
@@ -888,7 +994,6 @@ async fn run_prompt(
             started + command.progress_interval,
             command.progress_interval,
         );
-        let mut beat = 0_u64;
         loop {
             tokio::select! {
                 done = &mut work => break Stop::Done(done),
@@ -909,17 +1014,11 @@ async fn run_prompt(
                 }
                 () = &mut cancelled => break Stop::Cancelled,
                 _ = tick.tick(), if progress.is_some() => {
-                    beat += 1;
                     if let Some(progress) = &progress {
-                        let _ = progress.out.try_send(json!({
-                            "jsonrpc": "2.0",
-                            "method": "notifications/progress",
-                            "params": {
-                                "progressToken": progress.token,
-                                "progress": beat,
-                                "message": format!("mini-agent run in progress ({} s elapsed)", started.elapsed().as_secs())
-                            }
-                        }));
+                        progress.send(format!(
+                            "mini-agent run in progress ({} s elapsed)",
+                            started.elapsed().as_secs()
+                        ));
                     }
                 }
             }
@@ -1160,10 +1259,10 @@ pub(crate) async fn serve(
                         .get("_meta")
                         .and_then(|meta| meta.get("progressToken"))
                         .filter(|token| token.is_string() || token.is_number())
-                        .map(|token| Progress { token: token.clone(), out: reply_tx.clone() });
+                        .map(|token| Progress::new(token.clone(), reply_tx.clone()));
                     let elicit = (command.elicit_approvals
                         && bridge.client_supports.load(std::sync::atomic::Ordering::Relaxed))
-                    .then(|| Elicit { bridge: bridge.clone(), out: reply_tx.clone() });
+                    .then(|| Elicit { bridge: bridge.clone(), out: reply_tx.clone(), ask_deadline: None });
                     let command = command.clone();
                     let reply_tx = reply_tx.clone();
                     let cancels = cancels.clone();
@@ -1673,19 +1772,39 @@ mod tests {
 
     #[tokio::test]
     async fn run_emits_progress_for_a_token_and_returns_the_continuation_session_id() {
+        // mini-agent-1ptzh: tool starts/finishes and model turns are reported,
+        // not just a heartbeat.
         let mut command = shell(
-            r#"sleep 1; printf '%s\n' '{"result":"done","session_id":"abc123","session_persisted":true}'"#,
+            r#"printf '%s\n' '{"type":"tool_call","id":"c1","name":"read","args":{}}' '{"type":"tool_result","id":"c1","name":"read","output":"x","is_error":false}' '{"type":"usage","usage":{},"cumulative":{}}'; sleep 1; printf '%s\n' '{"type":"result","result":"done","session_id":"abc123","session_persisted":true}'"#,
         );
         command.progress_interval = Duration::from_millis(200);
         let mut request = call(1, json!({"prompt":"x"}));
         request["params"]["_meta"] = json!({"progressToken":"tok"});
         let replies = exchange_with(command, &[request], 0).await;
         assert!(replies.len() >= 2, "{replies:?}");
+        let messages: Vec<&str> = replies
+            .iter()
+            .filter(|r| r["method"] == "notifications/progress")
+            .map(|r| r["params"]["message"].as_str().unwrap())
+            .collect();
+        for wanted in [
+            "tool read started",
+            "tool read finished",
+            "model turn finished",
+        ] {
+            assert!(messages.contains(&wanted), "{wanted} in {messages:?}");
+        }
         let progress = replies
             .iter()
             .find(|r| r["method"] == "notifications/progress")
             .expect("progress notification");
         assert_eq!(progress["params"]["progressToken"], "tok");
+        let values: Vec<f64> = replies
+            .iter()
+            .filter(|r| r["method"] == "notifications/progress")
+            .map(|r| r["params"]["progress"].as_f64().unwrap())
+            .collect();
+        assert!(values.windows(2).all(|w| w[0] < w[1]), "{values:?}");
         let done = replies.iter().find(|r| r["id"] == 1).unwrap();
         assert_eq!(done["result"]["structuredContent"]["session_id"], "abc123");
         let text = done["result"]["content"][0]["text"].as_str().unwrap();
@@ -1882,6 +2001,17 @@ mod tests {
             text.contains("timed out") && text.contains("no session id"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn ask_budget_leaves_the_stop_grace_to_save_the_session() {
+        // mini-agent-mt2f2
+        let mut command = shell("true");
+        command.timeout = Duration::from_secs(100);
+        command.stop_grace = Duration::from_secs(12);
+        assert_eq!(ask_budget(&command), Duration::from_secs(88));
+        command.timeout = Duration::from_secs(10);
+        assert_eq!(ask_budget(&command), Duration::from_secs(5));
     }
 
     #[tokio::test]

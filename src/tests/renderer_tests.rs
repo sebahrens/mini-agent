@@ -1750,6 +1750,8 @@ mod tool_output_folding {
             "Permission denied: Blocked by deny rule: shell = \"**\"",
             "Permission denied (non-interactive mode); effective mode: guarded",
             "Permission denied by PermissionRequest hook: no",
+            "Permission denied by the client: not now",
+            "Permission denied by the stream-json control channel: old session",
             "[status: failed]\nboom",
             "[status: not_started; the command was not run] no sandbox",
             "[status: timed_out; timeout_ms: 5]",

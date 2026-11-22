@@ -1870,7 +1870,16 @@ async fn serve_tcp_peers(
             accept_timeout: if first { settings.accept_timeout } else { None },
             connected: connected.clone(),
         };
-        let result = connect_agent(state.clone(), transport).await;
+        let busy = refuse_extra_peers(
+            listener
+                .try_clone()
+                .map_err(|e| anyhow::anyhow!("ACP TCP server error: TCP clone: {e}"))?,
+            connected.clone(),
+        );
+        let result = tokio::select! {
+            result = connect_agent(state.clone(), transport) => result,
+            () = busy => unreachable!("the busy responder never finishes"),
+        };
         if state.idle.is_retiring() || !connected.load(Ordering::Acquire) {
             return result.map_err(|e| anyhow::anyhow!("ACP TCP server error: {}", e));
         }
@@ -1884,6 +1893,44 @@ async fn serve_tcp_peers(
         // The old connection's sessions are dormant: they must not keep the
         // idle timer from running out while nobody is connected.
         state.idle.sessions_changed(0);
+    }
+}
+
+/// The line a second TCP peer reads while another peer is attached
+/// (mini-agent-mt2f2). One peer is served at a time; without this the second
+/// connection would wait silently until the first disconnected.
+const BUSY_LINE: &[u8] =
+    b"mini-agent ACP: busy, another client is connected; retry after it disconnects\n";
+
+/// Once a peer has authenticated, answers every further connection with
+/// [`BUSY_LINE`] and closes it, so a second client learns why it is not served.
+/// Runs until dropped. Writes are bounded in time and in number in flight.
+async fn refuse_extra_peers(listener: TcpListener, connected: Arc<std::sync::atomic::AtomicBool>) {
+    use tokio::io::AsyncWriteExt as _;
+    while !connected.load(Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let Ok(mut listener) = accept::tokio_listener(listener) else {
+        return std::future::pending().await;
+    };
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(8));
+    loop {
+        match accept::AcceptSource::accept(&mut listener).await {
+            Ok((mut stream, _)) => {
+                let Ok(permit) = in_flight.clone().try_acquire_owned() else {
+                    continue;
+                };
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        stream.write_all(BUSY_LINE).await?;
+                        stream.shutdown().await
+                    })
+                    .await;
+                });
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
+        }
     }
 }
 
@@ -18136,6 +18183,41 @@ brainstorm = "no-such-quick-model"
                 .contains_key(&SessionId::new(first))
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_second_tcp_peer_reads_a_busy_line_while_the_first_is_attached() {
+        // mini-agent-mt2f2
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+        let state = persona_state(
+            PERSONA_CONFIG,
+            counting_fixture(Arc::new(AtomicUsize::new(0))),
+        );
+        let listener = TcpListener::bind((DEFAULT_TCP_HOST, 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy = tokio::spawn(refuse_extra_peers(listener, connected.clone()));
+        // Nothing is refused before a peer is attached.
+        connected.store(true, Ordering::Release);
+        let mut second = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::net::TcpStream::connect(address),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::io::BufReader::new(&mut second).read_line(&mut line),
+        )
+        .await
+        .expect("the second peer is answered")
+        .unwrap();
+        assert!(line.contains("busy"), "{line}");
+        let _ = second.shutdown().await;
+        drop(state);
+        busy.abort();
     }
 
     #[tokio::test]
