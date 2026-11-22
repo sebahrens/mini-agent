@@ -220,11 +220,13 @@ pub enum AgentEvent {
     /// would otherwise have no record of the effect.
     Error {
         message: CompactString,
+        #[cfg_attr(not(feature = "acp"), allow(dead_code))]
         interactions: Vec<rig::completion::Message>,
     },
     /// Why the terminal event that follows ends the turn short, as a typed
     /// reason a client maps to a protocol stop reason without matching message
     /// text (mini-agent-nvnkx.273). Sent right before `Done` or `Error`.
+    #[cfg_attr(not(feature = "acp"), allow(dead_code))]
     StopCause(StopCause),
     /// The run was cancelled (session/cancel, connection teardown). Carries the
     /// transcript of the work that already happened, calls without a result
@@ -232,6 +234,7 @@ pub enum AgentEvent {
     /// the effects in history instead of rolling the turn back
     /// (mini-agent-nvnkx.272). Sent best-effort: a full channel drops it.
     Interrupted {
+        #[cfg_attr(not(feature = "acp"), allow(dead_code))]
         interactions: Vec<rig::completion::Message>,
     },
     /// Completed progress retained while the exact main turn waits for a new

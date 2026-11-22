@@ -1596,6 +1596,7 @@ mod tests {
         // Pinned difference from skills: bare $N is one based here.
         let template = "$1|$ARGUMENTS[0]";
         assert_eq!(expand_plain(template, "a b"), "a|a");
+        #[cfg(feature = "agent-skills")]
         assert_eq!(
             crate::extras::skills::placeholders::substitute(template, "a b", ""),
             "b|a"

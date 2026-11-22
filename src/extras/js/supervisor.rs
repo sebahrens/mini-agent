@@ -682,7 +682,7 @@ impl JsWorkerSupervisor {
             .await
     }
 
-    #[cfg(any(test, not(feature = "skills")))]
+    #[cfg(test)]
     pub(crate) async fn execute_bound_with_deadline(
         &self,
         invocation: InvocationId,
@@ -741,7 +741,7 @@ impl JsWorkerSupervisor {
         .await
     }
 
-    #[cfg(any(test, not(feature = "skills")))]
+    #[cfg(test)]
     async fn execute_inner(
         &self,
         request: RunStep,

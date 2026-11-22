@@ -617,6 +617,7 @@ mod tests {
             ready_path: None,
             preflight_witness: None,
             pty: None,
+            extra_env: Vec::new(),
         };
         let mut original = serde_json::to_value(&request).unwrap();
         assert!(original.get("preflight_witness").is_none());

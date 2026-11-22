@@ -14126,7 +14126,7 @@ echo PRIVATE_TEMP_PASS"#,
         );
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     use crate::tests::support::temp::TempDir;
 
     #[cfg(unix)]

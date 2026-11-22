@@ -90,8 +90,9 @@ macro_rules! task_delegation_rule {
         "Delegate when the search space is unknown or there are two or more independent, bounded questions; read files whose paths are already known directly, however many, and do known-location edits yourself. Use `run_in_background` only for long, independent work while you continue; its result is announced automatically when it settles, so do not poll. In headless runs call `task_result` once with a long `wait_secs` (for example 300) instead of short polls."
     };
 }
+#[cfg(feature = "subagents")]
 pub(crate) use task_delegation_rule;
-#[cfg(test)]
+#[cfg(all(test, feature = "subagents"))]
 pub const TASK_DELEGATION_RULE: &str = task_delegation_rule!();
 
 pub const TASK_TOOL_PROMPT: &str = concat!(

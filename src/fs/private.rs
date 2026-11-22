@@ -1074,7 +1074,7 @@ mod windows {
             if matches!(error.raw_os_error(), Some(32 | 33)) {
                 error
             } else {
-                private_path_error(path, &error)
+                crate::fs::private::private_path_error(path, &error)
             }
         })
     }

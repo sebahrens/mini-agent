@@ -1016,6 +1016,7 @@ pub(crate) fn describe(ctx: &Ctx) -> String {
 }
 
 /// Installed plugin directories that carry skills, for `skills_plugin_dirs`.
+#[cfg(any(test, feature = "agent-skills"))]
 pub(crate) fn installed_skill_dirs(plugins_dir: &Path) -> Vec<PathBuf> {
     let registry: Registry = std::fs::read_to_string(plugins_dir.join("installed.json"))
         .ok()

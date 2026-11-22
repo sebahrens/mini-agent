@@ -925,6 +925,7 @@ pub struct ReadArgs {
     /// Images only: keep the original pixels instead of downscaling to the
     /// provider's useful resolution.
     #[serde(default)]
+    #[cfg_attr(not(feature = "multimodal"), allow(dead_code))]
     pub full_resolution: bool,
 }
 

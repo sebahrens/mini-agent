@@ -48,9 +48,28 @@ fn doctor_cli_is_read_only_with_missing_invalid_and_configured_credentials_and_n
     listener.set_nonblocking(true).unwrap();
     let mut missing = root.command();
     missing.args(["--doctor", "--no-tools"]);
+    // A credential inherited from the developer or CI environment would
+    // satisfy the live credential check; this case is about having none.
+    for (name, _) in std::env::vars_os()
+        .filter_map(|(name, value)| Some((name.into_string().ok()?, value)))
+        .filter(|(name, _)| {
+            let upper = name.to_ascii_uppercase();
+            upper.ends_with("_API_KEY") || upper.ends_with("_TOKEN") || upper.ends_with("_KEY")
+        })
+    {
+        missing.env_remove(name);
+    }
     let output = bounded_output(missing);
+    // Doctor's live checks make a missing credential a failed required
+    // check, so the report is still printed but the exit status is 1.
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     assert!(
-        output.status.success(),
+        String::from_utf8_lossy(&output.stderr).contains("required check(s) failed"),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );

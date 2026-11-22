@@ -123,7 +123,6 @@ pub(crate) async fn scope_tool_call_id<F: std::future::Future>(
 
 /// The internal call id of the shell or non-shell tool call running in this
 /// task, if known.
-#[cfg(feature = "hooks")]
 pub(crate) fn current_any_call_id() -> Option<CompactString> {
     TOOL_CALL_ID
         .try_with(Clone::clone)

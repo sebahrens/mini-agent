@@ -227,5 +227,5 @@ location and version, not your conversation. Attach it to a bug report with the 
 
 ## VS Code and other editors
 
-See [vscode-acp-setup.md](vscode-acp-setup.md) for the VS Code troubleshooting section and
+See [vscode-acp-setup.md](../vscode-acp-setup.md) for the VS Code troubleshooting section and
 [EDITORS.md](EDITORS.md) for Zed, JetBrains and Neovim.
