@@ -261,6 +261,7 @@ pub(crate) async fn run_all(
             cli.resolve_windows_appcontainer_read_roots(cfg),
             cli.resolve_windows_appcontainer_write_roots(cfg),
         )
+        .with_shell(&cli.resolve_shell(cfg))
         .with_windows_toolchain_discovery(
             cfg.windows_appcontainer_toolchain_discovery.unwrap_or(true),
         )
