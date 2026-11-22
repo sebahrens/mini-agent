@@ -257,7 +257,7 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         .shaped(ConfigShape::Enum(crate::sandbox::SandboxProfile::NAMES)),
     aliased("sandbox-read-roots", &["sandbox_read_roots"]).shaped(ConfigShape::Strings),
     aliased("sandbox-write-roots", &["sandbox_write_roots"]).shaped(ConfigShape::Strings),
-    aliased("sandbox-toolchain-roots", &["sandbox_toolchain_roots"]).described("Read-only toolchain binds for the Linux bwrap sandbox (absolute or ~/). Absent selects the built-in default; a list, even empty, replaces it.").shaped(ConfigShape::Strings),
+    aliased("sandbox-toolchain-roots", &["sandbox_toolchain_roots"]).described("Read-only toolchain roots for the Linux bwrap and macOS Seatbelt sandboxes (absolute or ~/). Absent selects the built-in default; a list, even empty, replaces it.").shaped(ConfigShape::Strings),
     aliased("sandbox-home-mounts", &["sandbox_home_mounts"])
         .described("HOME-relative dot paths exposed to contained commands; `:rw` suffix for writable directories")
         .shaped(ConfigShape::Strings),

@@ -1185,7 +1185,7 @@ pub struct Cli {
     #[arg(
         long = "sandbox-toolchain-root",
         value_name = "PATH",
-        help = "Add a read-only toolchain bind for the Linux bwrap sandbox (repeatable; absolute or ~/; replaces sandbox-toolchain-roots and its default)"
+        help = "Add a read-only toolchain root for the Linux bwrap and macOS Seatbelt sandboxes (repeatable; absolute or ~/; replaces sandbox-toolchain-roots and its default)"
     )]
     pub sandbox_toolchain_roots: Vec<std::path::PathBuf>,
 
@@ -3572,7 +3572,11 @@ output_token_cost = 0.0
         let defaults = cli.resolve_sandbox_toolchain_roots(&cfg);
         assert_eq!(defaults, crate::sandbox::default_sandbox_read_roots());
         for expected in [
-            "/home/linuxbrew",
+            if cfg!(target_os = "macos") {
+                "/opt/homebrew/bin"
+            } else {
+                "/home/linuxbrew"
+            },
             "~/.cargo/bin",
             "~/.local/bin",
             "~/.rustup",
