@@ -2857,6 +2857,170 @@ pub(crate) fn windows_exchange_open_file_relative(
     })
 }
 
+/// Mark the object behind `file` (opened with DELETE access) for deletion.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_mark_open_file_deleted(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let information = FILE_DISPOSITION_INFO { DeleteFile: true };
+    // SAFETY: `file` owns a live handle with DELETE access and `information`
+    // has the layout required by FileDispositionInfo.
+    let ok = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle().cast(),
+            FileDispositionInfo,
+            (&information as *const FILE_DISPOSITION_INFO).cast(),
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        )
+    };
+    if ok == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+/// Open the regular file named `target` in a retained directory by handle with
+/// a share mode that denies concurrent writers (`FILE_SHARE_READ |
+/// FILE_SHARE_DELETE`), then verify on that handle that it is the approved
+/// object (`expected`) holding the approved bytes (`base`). Because writers are
+/// excluded for as long as the handle lives, the verification cannot be
+/// invalidated before the handle is moved or deleted.
+#[cfg(windows)]
+fn windows_open_verified_leaf_relative(
+    directory: &std::fs::File,
+    target: &std::ffi::OsStr,
+    expected: &CheckedMetadata,
+    base: &ContentDigest,
+    path: &Path,
+    cancellation_requested: impl Fn() -> bool,
+) -> std::io::Result<std::fs::File> {
+    use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ};
+    let old = retry_windows_lock_violation(
+        || {
+            windows_open_leaf_relative(
+                directory,
+                target,
+                DELETE,
+                FILE_SHARE_READ | FILE_SHARE_DELETE,
+            )
+        },
+        cancellation_requested,
+    )?;
+    let actual = checked_file_metadata(&old)?;
+    if !actual.is_file() || actual.file_type().is_symlink() {
+        return Err(path_changed_error(path));
+    }
+    ensure_same_file(path, expected, &actual)?;
+    if !base.matches_file(&old)? {
+        return Err(stale_content_error(path));
+    }
+    Ok(old)
+}
+
+/// Put `old` back under `target` create-only after a failed step. A name that
+/// was created meanwhile is never overwritten; the previous file then stays
+/// under `aside`, which the returned error names.
+#[cfg(windows)]
+fn windows_restore_aside(
+    directory: &std::fs::File,
+    old: &std::fs::File,
+    target: &std::ffi::OsStr,
+    aside: &std::ffi::OsStr,
+    error: std::io::Error,
+) -> std::io::Error {
+    match retry_windows_lock_violation(
+        || windows_rename_open_file_relative(directory, old, target, false),
+        || false,
+    ) {
+        Ok(()) => error,
+        Err(restore) => std::io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; the previous file was kept as {} ({restore})",
+                aside.to_string_lossy()
+            ),
+        ),
+    }
+}
+
+/// By-handle checked replacement of `target` by `replacement` (an open handle
+/// with DELETE access to the new file) inside a retained directory.
+///
+/// The old file is opened without following a reparse point and with writers
+/// excluded, verified against `expected` and `base`, moved aside by that same
+/// handle, and the replacement is published create-only. A failed publication
+/// puts the old object back create-only. The old object is deleted last. A
+/// concurrent writer therefore either holds the file open (the open is
+/// refused) or changed it before the verification (the replacement is refused);
+/// no name-based check-then-replace gap remains. Residual window: between the
+/// move aside and the publication the target name does not exist.
+#[cfg(windows)]
+pub(crate) fn windows_checked_replace_leaf_relative(
+    directory: &std::fs::File,
+    replacement: &std::fs::File,
+    target: &std::ffi::OsStr,
+    expected: &CheckedMetadata,
+    base: &ContentDigest,
+    path: &Path,
+    cancellation_requested: impl Fn() -> bool,
+) -> std::io::Result<()> {
+    let old = windows_open_verified_leaf_relative(
+        directory,
+        target,
+        expected,
+        base,
+        path,
+        &cancellation_requested,
+    )?;
+    let aside = std::ffi::OsString::from(format!(".mini-agent-{}", uuid::Uuid::new_v4()));
+    retry_windows_lock_violation(
+        || windows_rename_open_file_relative(directory, &old, &aside, false),
+        &cancellation_requested,
+    )?;
+    let publish = retry_windows_lock_violation(
+        || windows_rename_open_file_relative(directory, replacement, target, false),
+        || false,
+    );
+    if let Err(error) = publish {
+        return Err(windows_restore_aside(
+            directory, &old, target, &aside, error,
+        ));
+    }
+    // The replacement is published; the displaced object is no longer named by
+    // anything the user can see. Failing to delete it only leaves a hidden file.
+    let _ = windows_mark_open_file_deleted(&old);
+    Ok(())
+}
+
+/// By-handle checked retirement of `target`: verify as for replacement, move
+/// the exact verified object aside (freeing the name at once) and delete it.
+#[cfg(windows)]
+pub(crate) fn windows_retire_leaf_relative(
+    directory: &std::fs::File,
+    target: &std::ffi::OsStr,
+    expected: &CheckedMetadata,
+    base: &ContentDigest,
+    path: &Path,
+) -> std::io::Result<()> {
+    let old =
+        windows_open_verified_leaf_relative(directory, target, expected, base, path, || false)?;
+    let aside = std::ffi::OsString::from(format!(".mini-agent-{}", uuid::Uuid::new_v4()));
+    retry_windows_lock_violation(
+        || windows_rename_open_file_relative(directory, &old, &aside, false),
+        || false,
+    )?;
+    if let Err(error) = windows_mark_open_file_deleted(&old) {
+        return Err(windows_restore_aside(
+            directory, &old, target, &aside, error,
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments, unsafe_code)]
 fn atomic_write_platform(
@@ -3197,13 +3361,34 @@ fn atomic_write_platform(
         }
     }
 
+    // An approved replacement of an existing file is bound to the verified
+    // object by handle instead of checking the name and then replacing it.
+    let checked_replace = match (initial_target.as_ref(), expected_content) {
+        (Some(initial), Some(base)) if !mode.create_only() => Some((initial, base)),
+        (None, Some(_)) if !mode.create_only() => {
+            delete_open_file(&file);
+            return Err(stale_content_error(&target));
+        }
+        _ => None,
+    };
     let publish_result = observe_windows_atomic!(
         "publication",
         cancellation.publish(|| {
-            observe_windows_atomic!(
-                "rename",
-                rename_open_file(&directory, &file, leaf, !mode.create_only(), cancellation)
-            )
+            observe_windows_atomic!("rename", {
+                if let Some((initial, base)) = checked_replace {
+                    windows_checked_replace_leaf_relative(
+                        &directory,
+                        &file,
+                        leaf,
+                        initial,
+                        base,
+                        &target,
+                        || cancellation.cancellation_requested(),
+                    )
+                } else {
+                    rename_open_file(&directory, &file, leaf, !mode.create_only(), cancellation)
+                }
+            })
         })
     );
     if let Err(error) = publish_result {

@@ -785,3 +785,99 @@ fn private_persistence_writes_are_durable_and_stay_private() {
     assert!(crate::fs::private_atomic_write_sync(&link, b"a = 2\n").is_err());
     assert_eq!(std::fs::read(&target).unwrap(), b"a = 1\n");
 }
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_expecting_write_refuses_a_file_held_open_for_writing() {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = TempDir::new("win_expecting_held");
+    let path = dir.path().join("file.txt");
+    std::fs::write(&path, "old contents").unwrap();
+    let base = crate::fs::ContentDigest::of(b"old contents");
+    let approved_parent = crate::fs::stable_path_metadata(dir.path()).await.unwrap();
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .share_mode(7)
+        .open(&path)
+        .unwrap();
+
+    let result =
+        crate::fs::atomic_write_resolved_expecting(&path, "agent", approved_parent, base).await;
+
+    drop(writer);
+    assert!(
+        result.is_err(),
+        "a concurrent writer must block the replacement"
+    );
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "old contents");
+    assert_eq!(temp_residue(dir.path()), 0);
+    assert!(!has_aside_residue(dir.path()));
+}
+
+#[cfg(windows)]
+fn has_aside_residue(dir: &Path) -> bool {
+    std::fs::read_dir(dir).unwrap().any(|e| {
+        e.unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".mini-agent-")
+    })
+}
+
+/// A change made after the name-based pre-check, at the publication decision
+/// point, is caught by the verification on the opened handle.
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_expecting_write_detects_a_change_made_just_before_publication() {
+    let dir = TempDir::new("win_expecting_race");
+    let path = dir.path().join("file.txt");
+    std::fs::write(&path, "old contents").unwrap();
+    let base = crate::fs::ContentDigest::of(b"old contents");
+    let approved_parent = crate::fs::stable_path_metadata(dir.path()).await.unwrap();
+    let (cancellation, probe) = AtomicWriteCancellation::with_publication_probe_for_test();
+    let writer_path = path.clone();
+    let writer = tokio::spawn(async move {
+        crate::fs::atomic_write_resolved_expecting_cancellable(
+            &writer_path,
+            b"agent output",
+            approved_parent,
+            base,
+            cancellation,
+        )
+        .await
+    });
+    let reached = probe.clone();
+    tokio::task::spawn_blocking(move || reached.wait_until_reached())
+        .await
+        .unwrap();
+    std::fs::write(&path, "concurrent editor").unwrap();
+    probe.resume();
+
+    let error = writer
+        .await
+        .unwrap()
+        .expect_err("stale replacement refused");
+
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{error}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "concurrent editor");
+    assert_eq!(temp_residue(dir.path()), 0);
+    assert!(!has_aside_residue(dir.path()));
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn windows_expecting_write_replaces_and_leaves_no_residue() {
+    let dir = TempDir::new("win_expecting_ok");
+    let path = dir.path().join("file.txt");
+    std::fs::write(&path, "old\r\ncontents\r\n").unwrap();
+    let base = crate::fs::ContentDigest::of(b"old\r\ncontents\r\n");
+    let approved_parent = crate::fs::stable_path_metadata(dir.path()).await.unwrap();
+
+    crate::fs::atomic_write_resolved_expecting(&path, "new\r\ncontents\r\n", approved_parent, base)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read(&path).unwrap(), b"new\r\ncontents\r\n");
+    assert_eq!(temp_residue(dir.path()), 0);
+    assert!(!has_aside_residue(dir.path()));
+}
