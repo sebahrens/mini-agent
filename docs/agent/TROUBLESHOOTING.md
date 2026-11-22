@@ -132,7 +132,7 @@ same check on its own.
 On Windows the LPAC gate accepts only supported install locations: under `%USERPROFILE%` or
 `%LOCALAPPDATA%` (the per-user MSI), `%CARGO_HOME%\bin` (default `%USERPROFILE%\.cargo\bin`), a cargo
 `target\debug` or `target\release` directory, `%TEMP%`/`%TMP%`, and Program Files, ProgramData or
-the Windows directory. An executable anywhere else (for example `cargo install --root` on another
+the Windows directory. An executable anywhere else (for example a `cargo install` with a custom install root on another
 drive) reports `<path> is not a supported install location for the JavaScript tool`; copy
 `mini-agent.exe` to a supported location. See [WINDOWS_INSTALL.md](WINDOWS_INSTALL.md).
 
@@ -141,7 +141,7 @@ drive) reports `<path> is not a supported install location for the JavaScript to
 The structured `git` tool needs the AppContainer sandbox: with `--no-sandbox` it is not offered
 (`Windows structured Git requires AppContainer`; run git through the shell tool instead).
 `mini-agent --git-runtime-check` runs the bundled Git inside the container
-(`git rev-parse --git-dir`, which succeeds or reports "not a git repository" when the executable, its
+(a `git rev-parse` that resolves the git directory, which succeeds or reports "not a git repository" when the executable, its
 DLLs and the working directory all work). The runtime directory
 (`<local data>\git-runtime\<id>`) holds `git.exe` and its DLL closure; every file is granted to the
 container as a read/execute root, one grant per file (the files have protected private ACLs, so a

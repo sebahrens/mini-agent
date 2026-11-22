@@ -11730,7 +11730,6 @@ mod sandbox_tests {
         );
     }
 
-    #[cfg(any(unix, windows))]
     fn canonical_scratch() -> (TempDir, PathBuf) {
         let scratch = TempDir::new("sandbox");
         let root = std::fs::canonicalize(scratch.path()).unwrap();
