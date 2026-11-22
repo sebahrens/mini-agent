@@ -2663,6 +2663,200 @@ pub(crate) fn windows_rename_open_file_relative(
     }
 }
 
+/// Open one existing leaf of a retained directory by handle, without following
+/// a reparse point and without any ambient path: `NtCreateFile` is relative to
+/// `directory`. `share` is the share mode other openers must satisfy.
+#[cfg(windows)]
+#[allow(unsafe_code)]
+pub(crate) fn windows_open_leaf_relative(
+    directory: &std::fs::File,
+    name: &std::ffi::OsStr,
+    access: u32,
+    share: u32,
+) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        NtCreateFile,
+    };
+    use windows_sys::Win32::Foundation::{
+        OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, SYNCHRONIZE,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+
+    let mut name: Vec<u16> = name.encode_wide().collect();
+    if name.is_empty()
+        || name == [46]
+        || name == [46, 46]
+        || name.iter().any(|unit| matches!(*unit, 0 | 47 | 58 | 92))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid leaf name",
+        ));
+    }
+    let name_bytes = name
+        .len()
+        .checked_mul(std::mem::size_of::<u16>())
+        .filter(|bytes| *bytes <= u16::MAX as usize)
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "leaf too long"))?;
+    let object_name = UNICODE_STRING {
+        Length: name_bytes as u16,
+        MaximumLength: name_bytes as u16,
+        Buffer: name.as_mut_ptr(),
+    };
+    let object_attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: directory.as_raw_handle().cast(),
+        ObjectName: &object_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: std::ptr::null(),
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut io_status = IO_STATUS_BLOCK::default();
+    let mut handle = std::ptr::null_mut();
+    // SAFETY: the structures and the UTF-16 leaf outlive the call and
+    // RootDirectory is a live directory handle owned by the caller. FILE_OPEN
+    // never creates; FILE_OPEN_REPARSE_POINT opens a link itself, not its target.
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            access | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            &object_attributes,
+            &mut io_status,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            share,
+            FILE_OPEN,
+            FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT | FILE_SYNCHRONOUS_IO_NONALERT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if status < 0 {
+        // SAFETY: accepts any NTSTATUS returned by NtCreateFile.
+        let code = unsafe { RtlNtStatusToDosError(status) };
+        return Err(std::io::Error::from_raw_os_error(code as i32));
+    }
+    if handle.is_null() {
+        return Err(std::io::Error::other("relative open returned no handle"));
+    }
+    // SAFETY: successful NtCreateFile returned a new owned handle.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle.cast()) })
+}
+
+/// Create-only rename of the object currently named `source` to `target`
+/// inside one retained directory. Fails with `AlreadyExists` when `target` is
+/// occupied and `NotFound` when `source` is absent.
+#[cfg(windows)]
+pub(crate) fn windows_rename_no_replace_relative(
+    directory: &std::fs::File,
+    source: &std::ffi::OsStr,
+    target: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+    let file = windows_open_leaf_relative(
+        directory,
+        source,
+        DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )?;
+    windows_rename_open_file_relative(directory, &file, target, false)
+}
+
+/// Checked name exchange for a retained directory, built from handle-bound
+/// operations because Windows has no atomic exchange or compare-and-replace.
+///
+/// `replacement` is an open handle (DELETE access) to the new file currently
+/// named `replacement_name`. On success `target` names the replacement and the
+/// object that previously held `target` is named `replacement_name`, exactly
+/// as after `renameat2(RENAME_EXCHANGE)`, so callers can validate the
+/// displaced object after publication and roll back.
+///
+/// The old target is opened by handle without following a reparse point and
+/// with a share mode that denies concurrent writers (`FILE_SHARE_READ |
+/// FILE_SHARE_DELETE`), and every later step renames that handle, not a name.
+/// The object moved away is therefore always the one the handle verified,
+/// even if the name is swapped concurrently. Residual window: between moving
+/// the old object aside and publishing the replacement the target name does
+/// not exist, so a reader can see it absent, a concurrent creator of the name
+/// wins (the replacement then fails with `AlreadyExists`, the old file is put
+/// back when its name is still free), and a crash leaves the old content under
+/// a `.mini-agent-*` sibling name instead of losing it.
+#[cfg(windows)]
+pub(crate) fn windows_exchange_open_file_relative(
+    directory: &std::fs::File,
+    replacement: &std::fs::File,
+    replacement_name: &std::ffi::OsStr,
+    target: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_SHARE_DELETE,
+        FILE_SHARE_READ,
+    };
+
+    let old = retry_windows_lock_violation(
+        || {
+            windows_open_leaf_relative(
+                directory,
+                target,
+                DELETE,
+                FILE_SHARE_READ | FILE_SHARE_DELETE,
+            )
+        },
+        || false,
+    )?;
+    if old.metadata()?.file_attributes() & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)
+        != 0
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "workspace replacement target is not a regular file",
+        ));
+    }
+    let aside = std::ffi::OsString::from(format!(".mini-agent-{}", uuid::Uuid::new_v4()));
+    retry_windows_lock_violation(
+        || windows_rename_open_file_relative(directory, &old, &aside, false),
+        || false,
+    )?;
+    let publish = retry_windows_lock_violation(
+        || windows_rename_open_file_relative(directory, replacement, target, false),
+        || false,
+    );
+    if let Err(error) = publish {
+        // Put the verified old object back; create-only, so a file somebody
+        // created meanwhile is never overwritten (the old content then stays
+        // under `aside`, reported by the error).
+        return match windows_rename_open_file_relative(directory, &old, target, false) {
+            Ok(()) => Err(error),
+            Err(restore) => Err(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; the previous file was kept as {} ({restore})",
+                    aside.to_string_lossy()
+                ),
+            )),
+        };
+    }
+    windows_rename_open_file_relative(directory, &old, replacement_name, false).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!(
+                "{error}; the previous file was kept as {}",
+                aside.to_string_lossy()
+            ),
+        )
+    })
+}
+
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments, unsafe_code)]
 fn atomic_write_platform(

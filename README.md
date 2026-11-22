@@ -172,11 +172,20 @@ ACLs; learned-skill process spawning remains disabled there until an immutable-e
 exists. If a required backend or live proof fails, that capability—or JavaScript itself—is
 unavailable instead of silently running with more authority.
 
-One narrower residual race remains on Windows: replacing an existing workspace file re-verifies
-the target's identity and content digest immediately before a handle-relative, POSIX-semantics
-rename, but NT has no destination compare-and-swap, so the window is slightly wider than on Linux
-and macOS. Replacement requires a filesystem with 128-bit file IDs and POSIX rename support (NTFS
-or ReFS); FAT, exFAT and some network shares are refused.
+Existing-file edits on Windows: `edit` and `write` with `overwrite` replace a workspace file
+through a checked, handle-bound exchange. The old file is opened without following reparse
+points and with a share mode that denies concurrent writers; its identity and content digest are
+verified; that same handle is then moved aside, the replacement is published create-only, and the
+verified file is moved back out of the way and re-validated (rolled back create-only if a foreign
+file raced in). NT has no atomic exchange or destination compare-and-swap, so, unlike Linux and
+macOS, the target name is briefly absent: a concurrent reader can see "not found", a process that
+creates the name inside that window wins (the edit then fails, nothing is overwritten), and a
+crash inside it leaves the old content under a `.mini-agent-*` sibling instead of losing it. A
+file held open for writing by another program makes the edit fail rather than race. An absolute
+path that the permission system approves takes a separate route that re-verifies identity and
+content digest immediately before a handle-relative, POSIX-semantics rename; that route has no
+destination compare-and-swap, so its window is slightly wider. Both require NTFS or ReFS; FAT,
+exFAT and some network shares are refused.
 
 See [the architecture overview](ARCHITECTURE.md) and
 [brokered runtime specification](docs/specs/phase-6-brokered-js-runtime.md) for the exact threat

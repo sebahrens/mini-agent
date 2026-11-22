@@ -188,11 +188,12 @@ uninherited full-file-access allow entries and rejects other trustees or rights.
 SDDL account aliases in diagnostics do not confer authority; owner, regular-file
 and single-link checks remain independent requirements.
 
-On Windows, edits to an existing configuration currently fail closed because
-the retained workspace writer does not support atomic compare-and-replace.
-Creating a new private configuration is supported. Existing-file add/remove
-support remains pending under `mini-agent-i7ro6.57.1`; the native temporary-file
-ownership test does not establish a Windows add/remove round trip.
+On Windows the retained workspace writer now emulates checked replacement with
+handle-bound moves (`paths::exchange_relative`; the target name is briefly
+absent, see README), so existing private files can be replaced. Existing-file
+add/remove support for this configuration remains unverified under
+`mini-agent-i7ro6.57.1`; the native temporary-file ownership test does not
+establish a Windows add/remove round trip.
 
 The Windows-only `fs::private::windows::operator_config_lease_probe` tests are
 finite falsification experiments on private owned inert files. They measure
@@ -201,7 +202,6 @@ metadata races and reader-before-marker ordering. An experiment can pass by
 observing a bypass and explicitly rejecting the candidate protocol before any
 candidate write. These results do not implement configuration transactions,
 crash recovery, trust approval or Windows existing-file add/remove support.
-The ordinary workspace compare-and-replace restriction remains unchanged.
 
 A further test-only retirement experiment uses a retained DELETE/read Share0
 handle and no-replace native rename, with a full surviving read-only view after
