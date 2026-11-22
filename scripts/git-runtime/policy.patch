@@ -402,3 +402,29 @@
  	while (fd < 2)
  		fd = xdup(fd);
  	if (fd > 2)
+--- a/connect.c
++++ b/connect.c
+@@ -1528,6 +1528,23 @@
+ 					     version);
+ 			}
+ 		}
++#ifdef GIT_WINDOWS_NATIVE
++		/*
++		 * mini-agent: the bundled runtime has no sh.exe, and a host
++		 * sh.exe found on PATH lies outside an AppContainer's reach.
++		 * For the stock programs of a local path, run the built-in
++		 * `git upload-pack` / `git receive-pack` directly: the path is
++		 * one argument, so nothing needs a shell.
++		 */
++		if (scheme != URL_SCHEME_SSH &&
++		    (!strcmp(prog, "git-upload-pack") ||
++		     !strcmp(prog, "git-receive-pack"))) {
++			conn->use_shell = 0;
++			conn->git_cmd = 1;
++			strvec_push(&conn->args, prog + strlen("git-"));
++			strvec_push(&conn->args, path);
++		} else
++#endif
+ 		strvec_push(&conn->args, cmd.buf);
+ 
+ 		if (start_command(conn))

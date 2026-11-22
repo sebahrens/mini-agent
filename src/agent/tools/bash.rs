@@ -2510,8 +2510,12 @@ pub(crate) fn sandbox_failure_note(
         && WINDOWS_CWD_MARKERS
             .iter()
             .any(|marker| lowered.contains(marker));
+    let local_remote_failure = sandbox.backend_name() == "appcontainer"
+        && lowered.contains("does not appear to be a git repository")
+        && lowered.contains("could not read from remote repository");
     if !network_failure
         && !cwd_failure
+        && !local_remote_failure
         && toolchain_hint.is_none()
         && !SANDBOX_FAILURE_MARKERS
             .iter()
@@ -2579,6 +2583,11 @@ pub(crate) fn sandbox_failure_note(
     {
         note.push_str(
             " PowerShell Remove-Item and Move-Item cannot resolve a relative path here; pipe the item (`Get-Item name | Remove-Item`) or pass its full path (`Join-Path (Get-Location).ProviderPath name`).",
+        );
+    }
+    if local_remote_failure {
+        note.push_str(
+            " A local-path remote can only be fetched from, or pushed to, when its directory is inside the workspace or a configured root: add it to `windows-appcontainer-read-roots` (fetch, ls-remote) or `windows-appcontainer-write-roots` (push) in the global config (restart required), or clone it into the workspace.",
         );
     }
     if let Some(hint) = &toolchain_hint {
@@ -4225,6 +4234,29 @@ mod tests {
         )
         .unwrap();
         assert!(nul.contains("only an elevated launcher"), "{nul}");
+    }
+
+    #[test]
+    fn a_local_remote_outside_the_granted_roots_gets_the_root_note() {
+        let sandbox = Sandbox::new(true, "appcontainer");
+        let output = "fatal: 'C:/elsewhere/r.git' does not appear to be a git repository\nfatal: Could not read from remote repository.";
+        let note = sandbox_failure_note(&sandbox, false, true, output).unwrap();
+        assert!(note.contains("windows-appcontainer-read-roots"), "{note}");
+        assert!(note.contains("windows-appcontainer-write-roots"), "{note}");
+        // A plain access failure of a real remote (no such text) does not get it.
+        assert_eq!(
+            sandbox_failure_note(
+                &sandbox,
+                false,
+                true,
+                "fatal: Authentication failed for 'x'\nfatal: Could not read from remote repository."
+            ),
+            None
+        );
+        assert_eq!(
+            sandbox_failure_note(&Sandbox::new(true, "bwrap"), false, true, output),
+            None
+        );
     }
 
     #[cfg(unix)]
