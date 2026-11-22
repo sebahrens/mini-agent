@@ -618,6 +618,9 @@ jobs:
           - os: windows-latest
             rust-target: x86_64-pc-windows-msvc
             vscode-target: win32-x64
+          - os: windows-11-arm
+            rust-target: aarch64-pc-windows-msvc
+            vscode-target: win32-arm64
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -710,11 +713,11 @@ jobs:
 
       - name: Verify candidate set and checksums
         run: |
-          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64; do
+          for target in linux-x64 linux-arm64 darwin-x64 darwin-arm64 win32-x64 win32-arm64; do
             test -f "mini-agent-$RELEASE_VERSION-$target.vsix"
             test -f "mini-agent-$RELEASE_VERSION-$target.cdx.json"
           done
-          test "$(find . -maxdepth 1 -name '*.vsix' | wc -l)" -eq 5
+          test "$(find . -maxdepth 1 -name '*.vsix' | wc -l)" -eq 6
           sha256sum *.vsix *.cdx.json | sort > VSIX_SHA256SUMS
 
       - name: Upload side-loadable candidate set
@@ -729,22 +732,35 @@ jobs:
           retention-days: 1
 
   windows-msi:
-    name: Windows MSI
+    name: Windows MSI ${{ matrix.msi-arch }}
     needs: [build-windows, vscode-vsix]
-    runs-on: windows-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            msi-arch: x64
+            rust-target: x86_64-pc-windows-msvc
+          - os: windows-11-arm
+            msi-arch: arm64
+            rust-target: aarch64-pc-windows-msvc
+    env:
+      MSI_ARCH: ${{ matrix.msi-arch }}
+      RUST_TARGET: ${{ matrix.rust-target }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Download Windows binary archive
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: archives-x86_64-pc-windows-msvc
+          name: archives-${{ matrix.rust-target }}
           path: msi-input
 
       - name: Download Windows VSIX
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: vsix-win32-x64
+          name: vsix-win32-${{ matrix.msi-arch }}
           path: msi-input
 
       - name: Validate MSI policy
@@ -753,12 +769,12 @@ jobs:
       - name: Build MSI with pinned WiX
         shell: pwsh
         run: |
-          tar.exe -xzf msi-input/mini-agent-x86_64-pc-windows-msvc.tar.gz -C msi-input
+          tar.exe -xzf "msi-input/mini-agent-$env:RUST_TARGET.tar.gz" -C msi-input
           $productVersion = ($env:GITHUB_REF_NAME.TrimStart('v') -split '-')[0]
           $binary = (Resolve-Path msi-input/mini-agent.exe).Path
-          $vsixCandidates = @(Get-ChildItem msi-input/mini-agent-*-win32-x64.vsix)
+          $vsixCandidates = @(Get-ChildItem "msi-input/mini-agent-*-win32-$env:MSI_ARCH.vsix")
           if ($vsixCandidates.Count -ne 1) {
-            throw "Expected exactly one win32-x64 VSIX, found $($vsixCandidates.Count)"
+            throw "Expected exactly one win32-$env:MSI_ARCH VSIX, found $($vsixCandidates.Count)"
           }
           $vsix = $vsixCandidates[0].FullName
           $thirdPartyLicenses = (Resolve-Path msi-input/THIRD_PARTY_LICENSES).Path
@@ -766,6 +782,7 @@ jobs:
             --configuration Release `
             --output msi-output `
             -p:ProductVersion=$productVersion `
+            -p:MsiArch=$env:MSI_ARCH `
             -p:BinaryPath=$binary `
             -p:VsixPath=$vsix `
             -p:ThirdPartyLicensesPath=$thirdPartyLicenses
@@ -774,7 +791,7 @@ jobs:
       - name: Quiet install, smoke, and uninstall
         shell: pwsh
         run: |
-          $msi = (Resolve-Path msi-output/mini-agent-windows-x64.msi).Path
+          $msi = (Resolve-Path "msi-output/mini-agent-windows-$env:MSI_ARCH.msi").Path
           $installLog = Join-Path $env:RUNNER_TEMP mini-agent-msi-install.log
           $installResult = Start-Process msiexec.exe `
             -ArgumentList "/i `"$msi`" /quiet /norestart /l*v `"$installLog`"" `
@@ -819,26 +836,48 @@ jobs:
             throw "PATH smoke: uninstall removed the entry check failed, user PATH still has $installDir"
           }
 
-      - name: Generate MSI checksum
-        shell: pwsh
-        run: |
-          $msi = 'msi-output/mini-agent-windows-x64.msi'
-          $hash = (Get-FileHash $msi -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$hash  mini-agent-windows-x64.msi" | Set-Content -Encoding ascii msi-output/MSI_SHA256SUMS
-
       - name: Upload Windows installer
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: windows-msi-${{ matrix.msi-arch }}
+          path: msi-output/mini-agent-windows-${{ matrix.msi-arch }}.msi
+          if-no-files-found: error
+          retention-days: 1
+
+  windows-installer:
+    name: Assemble Windows installers
+    needs: [windows-msi]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download MSI packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: windows-msi-*
+          merge-multiple: true
+          path: msi-set
+
+      - name: Generate the shared MSI checksum manifest
+        working-directory: msi-set
+        run: |
+          test "$(find . -maxdepth 1 -name '*.msi' | wc -l)" -eq 2
+          test -f mini-agent-windows-x64.msi
+          test -f mini-agent-windows-arm64.msi
+          sha256sum mini-agent-windows-x64.msi mini-agent-windows-arm64.msi > MSI_SHA256SUMS
+
+      - name: Upload Windows installers
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-installer
           path: |
-            msi-output/mini-agent-windows-x64.msi
-            msi-output/MSI_SHA256SUMS
+            msi-set/mini-agent-windows-x64.msi
+            msi-set/mini-agent-windows-arm64.msi
+            msi-set/MSI_SHA256SUMS
           if-no-files-found: error
           retention-days: 1
 
   publish-release:
     name: Publish GitHub release
-    needs: [verify-ci, package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-msi]
+    needs: [verify-ci, package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-installer]
     # The release environment admits only selected v* tags. Repository
     # administrators may add required reviewers as a separate human gate.
     environment: release
@@ -907,16 +946,19 @@ jobs:
             VSIX_SHA256SUMS
             MSI_SHA256SUMS
             mini-agent-windows-x64.msi
+            mini-agent-windows-arm64.msi
             mini-agent-${RELEASE_VERSION}-linux-x64.vsix
             mini-agent-${RELEASE_VERSION}-linux-arm64.vsix
             mini-agent-${RELEASE_VERSION}-darwin-x64.vsix
             mini-agent-${RELEASE_VERSION}-darwin-arm64.vsix
             mini-agent-${RELEASE_VERSION}-win32-x64.vsix
+            mini-agent-${RELEASE_VERSION}-win32-arm64.vsix
             mini-agent-${RELEASE_VERSION}-linux-x64.cdx.json
             mini-agent-${RELEASE_VERSION}-linux-arm64.cdx.json
             mini-agent-${RELEASE_VERSION}-darwin-x64.cdx.json
             mini-agent-${RELEASE_VERSION}-darwin-arm64.cdx.json
             mini-agent-${RELEASE_VERSION}-win32-x64.cdx.json
+            mini-agent-${RELEASE_VERSION}-win32-arm64.cdx.json
           )
           printf '%s\n' "${expected[@]}" > expected-release.txt
           python3 scripts/release_artifacts.py validate-set \

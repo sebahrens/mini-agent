@@ -23,7 +23,7 @@
           <File Id="MiniAgentExe" Source="$(var.BinaryPath)" Name="mini-agent.exe" KeyPath="yes" Checksum="yes" />
         </Component>
         <Component Id="MiniAgentVsixComponent" Guid="*" Bitness="always64">
-          <File Id="MiniAgentVsix" Source="$(var.VsixPath)" Name="mini-agent-win32-x64.vsix" />
+          <File Id="MiniAgentVsix" Source="$(var.VsixPath)" Name="mini-agent-win32-$(var.MsiArch).vsix" />
         </Component>
         <Component Id="InstallVsCodeExtensionScriptComponent" Guid="*" Bitness="always64">
           <File Id="InstallVsCodeExtensionScript" Source="install-vscode-extension.cmd" />

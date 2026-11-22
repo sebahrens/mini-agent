@@ -53,6 +53,13 @@ def validate(root: Path) -> list[str]:
         f"installer.wixproj must pin WixToolset.Util.wixext {WIX_VERSION}",
     )
     project_text = project_path.read_text(encoding="utf-8")
+    _require(
+        errors,
+        "<InstallerPlatform>$(MsiArch)</InstallerPlatform>" in project_text
+        and "<OutputName>mini-agent-windows-$(MsiArch)</OutputName>" in project_text
+        and "'$(MsiArch)' != 'x64' And '$(MsiArch)' != 'arm64'" in project_text,
+        "installer.wixproj must build x64 or arm64 from MsiArch and name the output after it",
+    )
     for required_input in ("BinaryPath", "VsixPath", "ThirdPartyLicensesPath", "ProductVersion"):
         _require(
             errors,
@@ -86,7 +93,7 @@ def validate(root: Path) -> list[str]:
     }
     expected_files = {
         "MiniAgentExe": ("$(var.BinaryPath)", "mini-agent.exe"),
-        "MiniAgentVsix": ("$(var.VsixPath)", "mini-agent-win32-x64.vsix"),
+        "MiniAgentVsix": ("$(var.VsixPath)", "mini-agent-win32-$(var.MsiArch).vsix"),
         "InstallVsCodeExtensionScript": ("install-vscode-extension.cmd", None),
         "LicenseText": ("$(var.RepositoryRoot)\\LICENSE", "LICENSE.txt"),
         "NoticeText": ("$(var.RepositoryRoot)\\NOTICE", "NOTICE.txt"),
@@ -244,7 +251,11 @@ def validate(root: Path) -> list[str]:
     for fragment in (
         "windows-msi:",
         "python3 scripts/check_windows_msi.py",
-        "Get-ChildItem msi-input/mini-agent-*-win32-x64.vsix",
+        'Get-ChildItem "msi-input/mini-agent-*-win32-$env:MSI_ARCH.vsix"',
+        "-p:MsiArch=$env:MSI_ARCH",
+        "msi-arch: arm64",
+        "rust-target: aarch64-pc-windows-msvc",
+        "windows-installer:",
         "/quiet",
         "/norestart",
         "(Resolve-Path msi-input/THIRD_PARTY_LICENSES).Path",
@@ -252,6 +263,7 @@ def validate(root: Path) -> list[str]:
         "'THIRD_PARTY_LICENSES.txt'",
         "MSI_SHA256SUMS",
         "mini-agent-windows-x64.msi",
+        "mini-agent-windows-arm64.msi",
         "& $installed --print-config",
         "startup/configuration smoke",
         "PATH smoke: bare-name resolution",

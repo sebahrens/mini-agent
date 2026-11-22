@@ -1,6 +1,6 @@
 # Install mini-agent on Windows
 
-The supported x86-64 Windows packages are published on the
+The supported Windows packages (x86-64 and ARM64) are published on the
 [GitHub Releases page](https://github.com/sebahrens/mini-agent/releases/latest). The VS Code extension
 is not currently published in the Visual Studio Marketplace, so search results there are not an
 installation source for mini-agent.
@@ -8,7 +8,8 @@ installation source for mini-agent.
 ## Recommended: install the MSI
 
 1. Open the latest GitHub release in a browser.
-2. Download `mini-agent-windows-x64.msi` and `MSI_SHA256SUMS` into the same folder.
+2. Download `mini-agent-windows-x64.msi` (on Windows on ARM: `mini-agent-windows-arm64.msi`) and
+   `MSI_SHA256SUMS` into the same folder.
 3. In PowerShell, verify the downloaded file before opening it:
 
    ```powershell
@@ -40,15 +41,15 @@ intended VS Code user as described below.
 
 ## Windows on ARM
 
-The MSI and the VS Code extension are x64 builds. On Windows on ARM download
-`mini-agent-aarch64-pc-windows-msvc.tar.gz` and `SHA256SUMS` from the same release, verify the digest as above,
-extract the archive with `tar -xzf`, and put `mini-agent.exe` on `PATH`; Scoop selects the same archive
-through its `arm64` architecture entry. Do not run the x64 build under emulation: the guarded Git and
-JavaScript tools need the native build. There is no ARM64 MSI or VSIX yet.
+Use the native ARM64 build: `mini-agent-windows-arm64.msi` with the same steps as above (set `$asset`
+to that name), or the archive `mini-agent-aarch64-pc-windows-msvc.tar.gz` (verify it against
+`SHA256SUMS`, extract with `tar -xzf`, put `mini-agent.exe` on `PATH`; Scoop and winget select the
+ARM64 package themselves). The ARM64 MSI bundles the `win32-arm64` VSIX. Do not run the x64 build
+under emulation: the guarded Git and JavaScript tools need the native build.
 
 ## Install only the VS Code extension
 
-Download the `mini-agent-<version>-win32-x64.vsix` asset and `VSIX_SHA256SUMS` from the same release.
+Download the `mini-agent-<version>-win32-x64.vsix` asset (`win32-arm64` on Windows on ARM) and `VSIX_SHA256SUMS` from the same release.
 Verify it with the same procedure, changing `$asset` and the checksum filename, then install it:
 
 ```powershell

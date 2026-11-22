@@ -363,7 +363,8 @@ and provenance checks. Set `MINI_AGENT_INSTALL_NO_TOKEN=1` or `MINI_AGENT_INSTAL
 fallback.
 
 On x86-64 Windows, the same release publishes
-`mini-agent-windows-x64.msi` plus `MSI_SHA256SUMS`. After verifying the
+`mini-agent-windows-x64.msi` (and `mini-agent-windows-arm64.msi` for Windows on ARM) plus
+`MSI_SHA256SUMS`. After verifying the
 checksum, open the MSI for a per-user, no-admin install; it also attempts to
 side-load the bundled VSIX when VS Code is installed. Enterprise deployment
 can use `msiexec /i mini-agent-windows-x64.msi ALLUSERS=1 /quiet /norestart`.

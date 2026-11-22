@@ -9,7 +9,7 @@ read/execute grant. mini-agent verifies that effective access and never attempts
 protected executable's ACL; a hardened enterprise ACL that removes this access causes the JS and
 shell containment preflights to fail closed with an explicit startup error.
 
-The package contains `mini-agent.exe`, the native win32-x64 VSIX, the release's GPL notice and
+The package contains `mini-agent.exe`, the native win32 VSIX for the package architecture (win32-x64 or win32-arm64), the release's GPL notice and
 Corresponding Source directions, and `THIRD_PARTY_LICENSES.txt`, the Rust dependency license
 inventory taken from the same release archive as the executable. After a successful first install, a commit custom action looks
 for `code.cmd` on `PATH` and in the standard user and machine VS Code locations. If VS Code is
@@ -17,7 +17,9 @@ present it installs the bundled VSIX with `--force`; absence or extension-instal
 roll back the binary installation. A service-account GPO deployment therefore installs the MSI
 payload but does not mutate another user's VS Code profile.
 
-Build from a Windows checkout with the .NET 6 or newer SDK:
+Build from a Windows checkout with the .NET 6 or newer SDK. The package architecture comes from
+`MsiArch` (`x64`, the default, or `arm64`; the output is `mini-agent-windows-<MsiArch>.msi` and the
+VSIX must be the matching `win32-<MsiArch>` build; add `-p:MsiArch=arm64` for the ARM64 package):
 
 ```powershell
 dotnet build packaging/windows/installer.wixproj `

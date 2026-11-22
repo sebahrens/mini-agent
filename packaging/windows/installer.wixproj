@@ -1,10 +1,12 @@
 <Project Sdk="WixToolset.Sdk/6.0.2">
   <PropertyGroup>
     <OutputType>Package</OutputType>
-    <OutputName>mini-agent-windows-x64</OutputName>
-    <InstallerPlatform>x64</InstallerPlatform>
+    <!-- MsiArch is the Windows architecture of the package: x64 (default) or arm64. -->
+    <MsiArch Condition="'$(MsiArch)' == ''">x64</MsiArch>
+    <OutputName>mini-agent-windows-$(MsiArch)</OutputName>
+    <InstallerPlatform>$(MsiArch)</InstallerPlatform>
     <RepositoryRoot>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..'))</RepositoryRoot>
-    <DefineConstants>BinaryPath=$(BinaryPath);VsixPath=$(VsixPath);ThirdPartyLicensesPath=$(ThirdPartyLicensesPath);ProductVersion=$(ProductVersion);RepositoryRoot=$(RepositoryRoot)</DefineConstants>
+    <DefineConstants>BinaryPath=$(BinaryPath);VsixPath=$(VsixPath);MsiArch=$(MsiArch);ThirdPartyLicensesPath=$(ThirdPartyLicensesPath);ProductVersion=$(ProductVersion);RepositoryRoot=$(RepositoryRoot)</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
@@ -14,7 +16,8 @@
   <Target Name="RequireInstallerInputs" BeforeTargets="BeforeBuild">
     <Error Condition="'$(ProductVersion)' == ''" Text="ProductVersion is required." />
     <Error Condition="'$(BinaryPath)' == '' Or !Exists('$(BinaryPath)')" Text="BinaryPath must name mini-agent.exe." />
-    <Error Condition="'$(VsixPath)' == '' Or !Exists('$(VsixPath)')" Text="VsixPath must name the win32-x64 VSIX." />
+    <Error Condition="'$(VsixPath)' == '' Or !Exists('$(VsixPath)')" Text="VsixPath must name the win32 VSIX for MsiArch." />
+    <Error Condition="'$(MsiArch)' != 'x64' And '$(MsiArch)' != 'arm64'" Text="MsiArch must be x64 or arm64." />
     <Error Condition="'$(ThirdPartyLicensesPath)' == '' Or !Exists('$(ThirdPartyLicensesPath)')" Text="ThirdPartyLicensesPath must name the release archive's THIRD_PARTY_LICENSES." />
   </Target>
 </Project>

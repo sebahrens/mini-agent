@@ -6,7 +6,7 @@ const host = vi.hoisted(() => ({ download: vi.fn(), command: vi.fn(), tests: vi.
 vi.mock('@vscode/test-electron', () => ({
   downloadAndUnzipVSCode: host.download, runVSCodeCommand: host.command, runTests: host.tests,
 }));
-// The win32-x64 target runs the installed binary's containment check on a
+// The win32-* targets run the installed binary's containment check on a
 // Windows host; this offline test installs nothing, so stub that lookup.
 vi.mock('node:child_process', async (importOriginal) => ({
   ...(await importOriginal<typeof import('node:child_process')>()),

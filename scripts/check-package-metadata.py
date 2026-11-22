@@ -228,16 +228,19 @@ EXPECTED_VSCODE_RELEASE_ARTIFACTS = (
     "VSIX_SHA256SUMS",
     "MSI_SHA256SUMS",
     "mini-agent-windows-x64.msi",
+    "mini-agent-windows-arm64.msi",
     "mini-agent-${RELEASE_VERSION}-linux-x64.vsix",
     "mini-agent-${RELEASE_VERSION}-linux-arm64.vsix",
     "mini-agent-${RELEASE_VERSION}-darwin-x64.vsix",
     "mini-agent-${RELEASE_VERSION}-darwin-arm64.vsix",
     "mini-agent-${RELEASE_VERSION}-win32-x64.vsix",
+    "mini-agent-${RELEASE_VERSION}-win32-arm64.vsix",
     "mini-agent-${RELEASE_VERSION}-linux-x64.cdx.json",
     "mini-agent-${RELEASE_VERSION}-linux-arm64.cdx.json",
     "mini-agent-${RELEASE_VERSION}-darwin-x64.cdx.json",
     "mini-agent-${RELEASE_VERSION}-darwin-arm64.cdx.json",
     "mini-agent-${RELEASE_VERSION}-win32-x64.cdx.json",
+    "mini-agent-${RELEASE_VERSION}-win32-arm64.cdx.json",
 )
 # `just sync-version` writes this digest into every recipe when the version
 # changes; `just post-release` replaces it with the published artifact digests.
@@ -548,7 +551,7 @@ def validate_workflow(text: str, binary: str) -> list[str]:
             f"CHANGELOG section; missing={missing_release_notes}"
         )
     publication_fragments = (
-        "needs: [verify-ci, package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-msi]",
+        "needs: [verify-ci, package-metadata, archive-smoke, corresponding-source, checksums, vscode-candidates, windows-installer]",
         "python3 scripts/release_artifacts.py validate-set \\",
         "python3 scripts/release_artifacts.py verify \\",
         "--manifest private-publish/checksums/SHA256SUMS",

@@ -2,7 +2,8 @@
 
 Status: the release workflow builds `aarch64-pc-windows-msvc` natively on a `windows-11-arm` runner
 and publishes `mini-agent-aarch64-pc-windows-msvc.tar.gz` and the lite equivalent (zip-style archives).
-The ARM64 build ships as an archive only: no MSI, no win32-arm64 VSIX and no npm platform package.
+The ARM64 build ships as an archive, an MSI (`mini-agent-windows-arm64.msi`) and a `win32-arm64` VSIX; there
+is still no npm platform package.
 Running the x64 binary under emulation on ARM64 Windows is not supported: the shell, git and
 js tools are unavailable there, so use the native archive.
 
@@ -26,8 +27,9 @@ How it works:
   `ci-success`. The runtime checks run on the release archive in `archive-smoke`.
 - The Scoop manifest carries an `arm64` architecture entry (and `autoupdate`) for the ARM64 archive.
 
-Why no ARM64 MSI yet: WiX 6 can build an `arm64` package, but the MSI embeds the VS Code extension for its
-own architecture, and the release builds no `win32-arm64` VSIX (it needs a VS Code ARM64 integration run,
-`vscode-target` and npm platform wiring, and `check-package-metadata.py` pins the five-VSIX set). Until that
-exists the ARM64 MSI and the winget `arm64` installer are deferred; winget lists only the x64 MSI. Install
-the ARM64 archive by hand or with Scoop.
+ARM64 MSI and VSIX: the release builds the `win32-arm64` VSIX on `windows-11-arm` (the same test, package,
+SBOM and clean VS Code install steps as the other five targets; `package:win32-arm64` and the `win32-arm64`
+entry in `editors/vscode/scripts/platform.mjs`), then builds the MSI per architecture with the existing WiX
+project (`MsiArch` property, one `windows-msi` job per architecture, the ARM64 one on `windows-11-arm`).
+`windows-installer` assembles both MSIs and a single `MSI_SHA256SUMS`. The winget installer template carries an
+`arm64` entry for the ARM64 MSI. `ci.yml`'s `windows-msi` job stays x64-only (fixture build and install); the ARM64 MSI is built, installed and uninstalled by the release job.

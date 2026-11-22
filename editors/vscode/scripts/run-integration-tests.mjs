@@ -42,8 +42,8 @@ try {
   }
 
   stage('configuration');
-  const platform = target === 'win32-x64'
-    ? 'win32-x64-archive'
+  const platform = target.startsWith('win32-')
+    ? `${target}-archive`
     : target === 'darwin-x64'
       ? 'darwin'
       : target;
@@ -161,7 +161,7 @@ try {
       throw new Error(`Installed candidate was not listed by clean VS Code:\n${stdout}`);
     }
     // The installed Windows binary can only execute on a Windows host.
-    if (target === 'win32-x64' && process.platform === 'win32') {
+    if (target.startsWith('win32-') && process.platform === 'win32') {
       const installedName = readdirSync(extensionsDir).find((name) => (
         name.startsWith(`mini-agent.mini-agent-${manifest.version}`)
       ));

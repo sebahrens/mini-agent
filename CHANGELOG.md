@@ -6,7 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Windows on ARM now has a native `mini-agent-windows-arm64.msi` (WiX, with the bundled `win32-arm64` VSIX), a `win32-arm64` VSIX candidate and a winget `arm64` installer entry; `MSI_SHA256SUMS` lists both MSIs (w4-arm64).
+
 ### Fixed
+
+- Windows: a slow child started through the guarded output helper (for example PowerShell on a loaded ARM64 host) no longer holds the process-creation lock for its whole lifetime, which had made the git tool's `stage` and `commit` fail with "guarded Git startup repository/cache roots cannot be retained"; the lock is held only across the spawn. The two repository-root queries now run one after another, and a missing managed hooks file no longer costs a PowerShell ACL probe at startup (w4-arm64).
 
 - On Windows, `/rewind` Restore workspace now works: whole-workspace snapshots use the handle-bound checked primitives, never follow junctions or symbolic links, and refuse the whole restore (nothing changed) when a file is held open by another program or a case-only rename makes the plan ambiguous (mini-agent-rb4w2).
 - An interrupt (TUI and headless) says explicitly that the goal stays active and names `/goal pause` / `--goal-resume`; a state test pins that an interrupt after a completed tool call keeps the turn and adds the host "cut off" notice (mini-agent-27kzu).

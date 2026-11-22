@@ -1,5 +1,6 @@
 export const TARGETS = Object.freeze({
   'win32-x64': { format: 'pe', arch: 'x64', binary: 'mini-agent.exe' },
+  'win32-arm64': { format: 'pe', arch: 'arm64', binary: 'mini-agent.exe' },
   'darwin-x64': { format: 'macho', arch: 'x64', binary: 'mini-agent' },
   'darwin-arm64': { format: 'macho', arch: 'arm64', binary: 'mini-agent' },
   'linux-x64': { format: 'elf', arch: 'x64', binary: 'mini-agent' },
