@@ -541,6 +541,20 @@ class ReleaseArchiveLayoutTests(unittest.TestCase):
 
         run.assert_not_called()
 
+    def test_windows_acl_step_allows_a_slow_powershell_start_and_names_a_timeout(self) -> None:
+        response = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(RELEASE.subprocess, "run", return_value=response) as run:
+            RELEASE._harden_windows_install_directory(
+                Path(r"C:\private"), platform_name="nt", environment={"SystemRoot": r"C:\Windows"}
+            )
+        self.assertGreaterEqual(run.call_args.kwargs["timeout"], 60)
+        expired = subprocess.TimeoutExpired("powershell", 1)
+        with mock.patch.object(RELEASE.subprocess, "run", side_effect=expired):
+            with self.assertRaisesRegex(RELEASE.ReleaseArtifactError, r"timed out after \d+ s"):
+                RELEASE._harden_windows_install_directory(
+                    Path(r"C:\private"), platform_name="nt", environment={"SystemRoot": r"C:\Windows"}
+                )
+
     def test_windows_smoke_install_rejects_acl_command_failure(self) -> None:
         response = subprocess.CompletedProcess([], 5, "", "access denied")
         with mock.patch.object(RELEASE.subprocess, "run", return_value=response):
