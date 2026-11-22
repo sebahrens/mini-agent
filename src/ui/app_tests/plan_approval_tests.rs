@@ -131,10 +131,13 @@ impl Provider {
         }
     }
     fn config(&self) -> config::Config {
-        serde_json::from_value(serde_json::json!({
+        let mut cfg: config::Config = serde_json::from_value(serde_json::json!({
             "session_title_model":"off", "compact":false,
             "custom_providers":{"plan80":{"provider_type":"openai","base_url":format!("http://{}/v1",self.address),"api_style":"completions"}}
-        })).unwrap()
+        })).unwrap();
+        // Micro-dollar caps pin response-based accounting (mini-agent-bnynh).
+        cfg.budget_preflight_off = true;
+        cfg
     }
     fn calls(&self) -> Vec<serde_json::Value> {
         self.requests.lock().unwrap().clone()

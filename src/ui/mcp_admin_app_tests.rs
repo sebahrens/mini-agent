@@ -2154,6 +2154,7 @@ async fn native_deferred_wire_case(same_response: bool, hook: Option<&str>, cost
                     false,
                 ),
             )
+            .without_preflight()
         });
         #[cfg(feature = "hooks")]
         scope.set_hook_execution_root(root.path());

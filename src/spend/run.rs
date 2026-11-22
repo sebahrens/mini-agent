@@ -29,6 +29,11 @@ pub(crate) struct Run {
     reasoning_exclusive: bool,
     cache_ttl: crate::config::PromptCacheTtl,
     cap_required: bool,
+    /// Whether the HTTP layer refuses a request whose prompt alone exceeds
+    /// the remaining USD budget. On by default; micro-dollar fixtures that pin
+    /// response-based accounting turn it off with [`Self::without_preflight`].
+    /// `MINI_AGENT_BUDGET_PREFLIGHT=0` disables it for a process.
+    preflight_refusal: bool,
     refused: Arc<std::sync::atomic::AtomicBool>,
     /// Why the last ledger flush failed, so a capped run that stops because
     /// spend cannot be recorded says so instead of claiming the budget ran out.
@@ -42,6 +47,21 @@ pub(crate) struct Run {
 }
 
 tokio::task_local! { static CURRENT: Option<Run>; }
+
+/// Whether runs built from `cfg` refuse an unaffordable request before
+/// sending it: always in production, and in tests unless a micro-dollar
+/// fixture opts out (mini-agent-bnynh).
+fn preflight_enabled(cfg: &Config) -> bool {
+    #[cfg(test)]
+    {
+        !cfg.budget_preflight_off
+    }
+    #[cfg(not(test))]
+    {
+        let _ = cfg;
+        true
+    }
+}
 
 impl Run {
     #[cfg(test)]
@@ -65,6 +85,7 @@ impl Run {
             reasoning_exclusive: false,
             cache_ttl: Default::default(),
             cap_required,
+            preflight_refusal: true,
             refused: Default::default(),
             tracking_detail: Default::default(),
             sdk_request: Default::default(),
@@ -74,6 +95,14 @@ impl Run {
             #[cfg(feature = "subagents")]
             background_pool: Default::default(),
         }
+    }
+
+    /// Test fixtures with micro-dollar caps pin response-based accounting
+    /// contracts that a pre-send refusal would hide.
+    #[cfg(test)]
+    pub(crate) fn without_preflight(mut self) -> Self {
+        self.preflight_refusal = false;
+        self
     }
 
     #[cfg(feature = "subagents")]
@@ -177,6 +206,7 @@ impl Run {
             kind,
             setup_error: initialization_error.or(setup_error),
             cap_required: cfg.max_budget_usd.is_some(),
+            preflight_refusal: preflight_enabled(cfg),
             refused: Default::default(),
             tracking_detail: Default::default(),
             sdk_request: Default::default(),
@@ -227,6 +257,7 @@ impl Run {
             kind: RequestKind::Turn,
             setup_error,
             cap_required: cfg.max_budget_usd.is_some(),
+            preflight_refusal: preflight_enabled(cfg),
             refused: Default::default(),
             tracking_detail: Default::default(),
             sdk_request: Default::default(),
@@ -679,12 +710,9 @@ impl Run {
     /// cheaper of the input and cache-read rates), so it never refuses a
     /// request that could have fit. Returns true when refused.
     pub(crate) fn refuse_unaffordable(&self, body_bytes: usize) -> bool {
-        // For providers billed far below their list price. The unit-test
-        // binary never refuses here: its fixtures use micro-dollar caps and
-        // absurd prices to pin the response-based accounting contracts, which
-        // a pre-send refusal would hide. The refusal itself is pinned by
-        // `refuse_unaffordable_checked` tests.
-        if cfg!(test)
+        // The env switch is for providers billed far below their list price.
+        // Fixtures with micro-dollar caps and absurd prices opt out per run.
+        if !self.preflight_refusal
             || std::env::var_os("MINI_AGENT_BUDGET_PREFLIGHT").is_some_and(|value| value == "0")
         {
             return false;
