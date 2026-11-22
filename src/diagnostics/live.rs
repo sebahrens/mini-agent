@@ -107,6 +107,14 @@ pub(crate) fn sandbox_status(status: &str, reason: Option<&str>, enabled: bool) 
     }
 }
 
+fn first_output_line(bytes: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(bytes)
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_string)
+}
+
 /// Run `<program> --version` through the sandbox; failure is a warning because
 /// the tool may simply be absent.
 pub(crate) async fn tool_in_sandbox(sandbox: &crate::sandbox::Sandbox, program: &str) -> Outcome {
@@ -143,11 +151,53 @@ pub(crate) async fn tool_in_sandbox(sandbox: &crate::sandbox::Sandbox, program: 
         Ok(output) => Outcome::Warn(bounded(format!(
             "{program} failed inside the sandbox ({:?}): {}",
             output.status,
-            String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .next()
-                .unwrap_or("no output")
+            first_output_line(&output.stderr)
+                .or_else(|| first_output_line(&output.stdout))
+                .unwrap_or_else(|| "no output".to_string())
         ))),
+    }
+}
+
+/// Command names the sandboxed Python probe tries, in order. Windows has no
+/// `python3`: the interpreter is `python`, or the `py` launcher.
+pub(crate) fn python_probe_names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["python", "py"]
+    } else {
+        &["python3"]
+    }
+}
+
+fn python_check_name() -> &'static str {
+    if cfg!(windows) {
+        "sandboxed python"
+    } else {
+        "sandboxed python3"
+    }
+}
+
+/// Probe each name in turn; the first that runs wins, otherwise the first
+/// failure is reported (with the remaining names noted).
+pub(crate) async fn first_tool_in_sandbox(
+    sandbox: &crate::sandbox::Sandbox,
+    names: &[&str],
+) -> Outcome {
+    let mut first_failure = None;
+    for name in names {
+        match tool_in_sandbox(sandbox, name).await {
+            Outcome::Pass(text) => return Outcome::Pass(text),
+            other => {
+                first_failure.get_or_insert(other);
+            }
+        }
+    }
+    match first_failure {
+        Some(Outcome::Warn(text)) if names.len() > 1 => Outcome::Warn(bounded(format!(
+            "{text} (also tried: {})",
+            names[1..].join(", ")
+        ))),
+        Some(outcome) => outcome,
+        None => Outcome::Warn("no command names to probe".into()),
     }
 }
 
@@ -235,14 +285,14 @@ pub(crate) async fn run_all(
         }
     };
     if enabled && sandbox_ok {
-        for program in ["git", "python3"] {
-            let name = if program == "git" {
-                "sandboxed git"
-            } else {
-                "sandboxed python3"
-            };
-            checks.push(Check::of(name, tool_in_sandbox(&sandbox, program).await));
-        }
+        checks.push(Check::of(
+            "sandboxed git",
+            tool_in_sandbox(&sandbox, "git").await,
+        ));
+        checks.push(Check::of(
+            python_check_name(),
+            first_tool_in_sandbox(&sandbox, python_probe_names()).await,
+        ));
     }
     #[cfg(feature = "js")]
     if cli.tool_is_eligible(cfg, "js") {
@@ -296,6 +346,26 @@ impl Check {
 mod tests {
     use super::*;
     use crate::auth::LoginRecordState as S;
+
+    #[test]
+    fn the_sandboxed_python_probe_uses_the_names_of_the_host_platform() {
+        if cfg!(windows) {
+            assert_eq!(python_probe_names(), ["python", "py"]);
+            assert_eq!(python_check_name(), "sandboxed python");
+        } else {
+            assert_eq!(python_probe_names(), ["python3"]);
+            assert_eq!(python_check_name(), "sandboxed python3");
+        }
+    }
+
+    #[test]
+    fn a_failed_probe_reports_the_first_non_empty_line_of_stderr_or_stdout() {
+        assert_eq!(
+            first_output_line(b"\r\n  \nfatal: nope\nmore"),
+            Some("fatal: nope".to_string())
+        );
+        assert_eq!(first_output_line(b"  \n"), None);
+    }
 
     #[test]
     fn symlinked_launch_is_reported_with_the_real_path() {
