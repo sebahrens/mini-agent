@@ -2151,6 +2151,16 @@ where
     result
 }
 
+/// Close an interrupted turn in the saved history with the host marker, unless
+/// it already ends with one, so a later turn is not read as a request to
+/// finish the cancelled one (mini-agent-l8lb2).
+fn mark_interrupted_history(interactions: &mut Vec<rig::completion::Message>) {
+    let marker = crate::agent::runner::interrupted_turn_marker();
+    if interactions.last() != Some(&marker) {
+        interactions.push(marker);
+    }
+}
+
 /// [`run_headless_turn`] without the process-wide forced-stop record, so tests
 /// can drive it with injected signals.
 async fn run_headless_turn_with<F>(
@@ -2201,6 +2211,12 @@ where
                     };
                     if let Err(error) = signal {
                         result.failure = Some(anyhow::anyhow!(error).context("headless signal handler failed"));
+                    } else if result
+                        .failure
+                        .as_ref()
+                        .is_some_and(crate::agent::runner::is_headless_interrupt)
+                    {
+                        mark_interrupted_history(&mut result.interactions);
                     }
                     (result, Some(deadline), None)
                 }
@@ -4108,6 +4124,17 @@ mod tests {
     }
 
     // mini-agent-nvnkx.158
+    #[test]
+    fn an_interrupted_turn_is_closed_in_history_with_one_marker() {
+        let mut interactions = Vec::new();
+        super::mark_interrupted_history(&mut interactions);
+        super::mark_interrupted_history(&mut interactions);
+        assert_eq!(interactions.len(), 1);
+        let text = format!("{:?}", interactions[0]);
+        assert!(text.contains("turn interrupted"), "{text}");
+        assert!(text.contains("unless the user asks for it again"), "{text}");
+    }
+
     #[test]
     fn an_interrupted_result_keeps_the_partial_text_and_marks_the_cut() {
         use super::{HeadlessStopReason, interrupted_result};

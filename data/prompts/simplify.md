@@ -11,7 +11,7 @@ Never change what the code does — only how it does it. Every simplification mu
 1. **Read the target code** — understand the full scope.
 2. **Check callers and dependents** — grep in parallel for every reference. Never repeat a read operation already done — use prior results.
 3. **Apply one simplification at a time** — one conceptual change. Limit each edit to ~50 lines.
-4. **Verify** — run linters and full test suite after all changes. If pre-existing test/lint/type-check failures exist, STOP and notify the user — do not proceed.
+4. **Verify** — run linters and full test suite after all changes. Report pre-existing failures that are unrelated to the task and do not silently fix or hide them; failures the user asked you to fix are the task itself, so fix them.
 5. **Summarize** — present key simplifications with brief reasons.
 
 ## What to Simplify
@@ -73,5 +73,5 @@ Each change should be obviously equivalent:
 - If the edit tool fails with "oldString not found", re-read the file before constructing a new edit.
 - If commands time out, break the work into smaller, independent steps.
 - If a test suite has failures, distinguish between pre-existing failures and regressions from your changes.
-- ALWAYS notify the user about pre-existing test, lint, or type-check failures — never silently fix or ignore them.
+- ALWAYS tell the user about pre-existing test, lint, or type-check failures that are unrelated to the task; never silently ignore them or fold unrelated fixes into your change. Failures the user asked you to fix are the task itself, so fix them. In goal mode the goal objective outranks this rule.
 - If a simplification breaks tests, revert it and try a smaller, more conservative change.

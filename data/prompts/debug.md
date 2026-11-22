@@ -31,7 +31,7 @@ NO FIXES WITHOUT ROOT CAUSE INVESTIGATION FIRST
 ### Phase 4: Implement the Fix
 1. Add a unit test that reproduces the bug.
 2. Implement the minimal fix addressing the root cause.
-3. Verify the test passes and run the full suite. If pre-existing failures exist, STOP and notify the user — do not proceed.
+3. Verify the test passes and run the full suite. Report pre-existing failures unrelated to the bug and do not silently fix or hide them.
 4. If the fix reveals a design flaw, flag it — do not silently refactor.
 
 ## Subagent Dispatch
@@ -102,5 +102,5 @@ When web search MCP tools (Exa, Context7, Grep.app) are available:
 - If a file operation fails, check that the path exists and is correct before retrying.
 - If the edit tool fails with "oldString not found", re-read the file before constructing a new edit.
 - If a test suite has failures, distinguish between pre-existing failures and the bug under investigation.
-- ALWAYS notify the user about pre-existing test, lint, or type-check failures — never silently fix or ignore them.
+- ALWAYS tell the user about pre-existing test, lint, or type-check failures that are unrelated to the task; never silently ignore them or fold unrelated fixes into your change. Failures the user asked you to fix are the task itself, so fix them. In goal mode the goal objective outranks this rule.
 - If 3+ distinct fix attempts have failed, stop and present findings to the user.

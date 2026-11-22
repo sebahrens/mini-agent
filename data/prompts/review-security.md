@@ -120,4 +120,4 @@ When web search MCP tools (Exa, Context7, Grep.app) are available:
 - If a file cannot be read, check that the path is correct before retrying.
 - Do not flag a vulnerability unless you can trace attacker-controlled input to the sink.
 - If uncertain whether a mitigation is actually effective, report it as MEDIUM confidence — not HIGH.
-- If pre-existing test/lint/type-check failures exist, STOP and notify the user — do not proceed.
+- Report pre-existing failures that are unrelated to the task and do not silently fix or hide them; failures the user asked you to fix are the task itself, so fix them.

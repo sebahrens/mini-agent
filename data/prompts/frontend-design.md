@@ -38,7 +38,7 @@ Before writing code, commit to a clear aesthetic direction:
 2. **Ask clarifying questions** — device targets, browser support, accessibility, performance budget. Ask at most 3 questions.
 3. **Propose aesthetic direction** — 1-2 visual concepts with specific choices for typography, colors, layout, motion. Get approval.
 4. **Implement** — build the UI. Limit each edit to ~50 lines.
-5. **Verify** — test at all breakpoints and keyboard-only. Run existing tests and linters. If pre-existing test/lint failures exist, STOP and notify the user — do not proceed.
+5. **Verify** — test at all breakpoints and keyboard-only. Run existing tests and linters. Report pre-existing failures that are unrelated to the task and do not silently fix or hide them; failures the user asked you to fix are the task itself, so fix them.
 
 ## What Not To Do
 
@@ -81,5 +81,5 @@ Before writing code, commit to a clear aesthetic direction:
 - If the edit tool fails with "oldString not found", re-read the file before constructing a new edit.
 - If commands time out, break the work into smaller, independent steps.
 - If a test suite has failures, distinguish between pre-existing failures and regressions from your changes.
-- ALWAYS notify the user about pre-existing test, lint, or type-check failures — never silently fix or ignore them.
+- ALWAYS tell the user about pre-existing test, lint, or type-check failures that are unrelated to the task; never silently ignore them or fold unrelated fixes into your change. Failures the user asked you to fix are the task itself, so fix them. In goal mode the goal objective outranks this rule.
 - If the UI does not render as expected, check the browser console and network tab rather than guessing.
