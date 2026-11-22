@@ -6966,6 +6966,7 @@ where
                             mid_turn_since_completion = 0;
                         }
                         let delta = turn.on_completion_call(&call, retry_config);
+                        output_policy.response_stop_reason(call.stop_reason);
                         if let Err(error) = output_policy
                             .usage(delta, turn.usage_ledger.total)
                             .await

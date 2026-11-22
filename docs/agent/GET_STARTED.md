@@ -468,6 +468,7 @@ unchanged. Mapping:
 |---|---|
 | `system` `init` | unchanged, plus `permissionMode` |
 | `assistant_text` | `{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":...}]},"session_id":...}` |
+| (stop reason) | a text `assistant` message's `message.stop_reason` is the provider's reason for that response (`end_turn`, `max_tokens`, `refusal`, ... as each provider family reports it; stop sequences read `end_turn`), and `null` only when the provider gave none; a `tool_use` message is always `tool_use` |
 | `tool_call` | `assistant` message with a `tool_use` block (`id`, `name`, `input`); `provider_call_id` rides on the record |
 | `tool_result` | `{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":...,"content":...,"is_error":...}]}}` |
 | `text_delta` / `reasoning_delta` (`--include-partial-messages`) | `stream_event` records framed per message: `message_start`, then per content block `content_block_start` (own `index`; thinking and text never share one), `content_block_delta` with that `index`, `content_block_stop`, and `message_delta` + `message_stop` when the final `assistant` record (or the `result`) arrives |

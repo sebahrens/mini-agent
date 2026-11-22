@@ -278,6 +278,22 @@ fn set_response_usage(value: Option<serde_json::Value>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
 }
 
+/// The provider's stop reason for the response whose records are being
+/// written (`--stream-json-schema claude` text `message.stop_reason`).
+static RESPONSE_STOP_REASON: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+fn response_stop_reason() -> Option<&'static str> {
+    *RESPONSE_STOP_REASON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn set_response_stop_reason(value: Option<&'static str>) {
+    *RESPONSE_STOP_REASON
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+}
+
 fn response_flow() -> std::sync::MutexGuard<'static, ResponseFlow> {
     RESPONSE_FLOW
         .lock()
@@ -295,6 +311,7 @@ fn begin_response_content() -> bool {
     flow.open = true;
     drop(flow);
     set_response_usage(None);
+    set_response_stop_reason(None);
     true
 }
 
@@ -634,7 +651,7 @@ pub(crate) fn claude_stream_records(event: serde_json::Value) -> Vec<serde_json:
         let stop_reason = if block["type"] == "tool_use" {
             json!("tool_use")
         } else {
-            serde_json::Value::Null
+            response_stop_reason().map_or(serde_json::Value::Null, |reason| json!(reason))
         };
         let mut record = json!({
             "type":"assistant",
@@ -1161,6 +1178,14 @@ impl HeadlessOutputPolicy {
             }
         }
         Ok(())
+    }
+
+    /// Records the provider's stop reason for the response about to be flushed
+    /// (call before [`Self::usage`], which flushes its buffered text).
+    pub(crate) fn response_stop_reason(self, reason: Option<rig::completion::StopReason>) {
+        if self.format == cli::OutputFormat::StreamJson {
+            set_response_stop_reason(reason.map(rig::completion::StopReason::as_str));
+        }
     }
 
     pub(crate) async fn usage(
@@ -6277,6 +6302,35 @@ mod headless_output_policy_tests {
         set_response_usage(None);
         assert_eq!(usage["input_tokens"], 7);
         assert_eq!(usage["output_tokens"], 3);
+    }
+
+    /// mini-agent-qqknv: a Claude-schema text message carries the provider's
+    /// stop reason, and null when the provider gave none.
+    #[test]
+    fn claude_text_message_carries_the_provider_stop_reason() {
+        let text = || serde_json::json!({"type":"assistant_text","text":"hi","truncated":false});
+        let reason = |records: Vec<serde_json::Value>| {
+            records
+                .iter()
+                .find(|row| row["type"] == "assistant")
+                .map(|row| row["message"]["stop_reason"].clone())
+                .unwrap()
+        };
+        for stop in [
+            rig::completion::StopReason::EndTurn,
+            rig::completion::StopReason::MaxTokens,
+            rig::completion::StopReason::Refusal,
+        ] {
+            set_response_stop_reason(Some(stop.as_str()));
+            assert_eq!(reason(claude_stream_records(text())), stop.as_str());
+        }
+        set_response_stop_reason(None);
+        assert!(reason(claude_stream_records(text())).is_null());
+        let call = serde_json::json!({"type":"tool_call","id":"c","name":"read","args":{}});
+        set_response_stop_reason(Some("end_turn"));
+        let records = claude_stream_records(call);
+        set_response_stop_reason(None);
+        assert_eq!(reason(records), "tool_use");
     }
 
     /// mini-agent-7b0m8: the piped-stdin notice fires only when data arrives.

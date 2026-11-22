@@ -61,7 +61,10 @@ A stream that is interrupted after it opened is charged an estimate: the request
 the output implied by the bytes received (two bytes per token), never more than the request's
 `max_tokens` bound. Its ledger row carries `estimated: true` (absent otherwise), and the exit
 summary names those tokens ("estimated for interrupted requests") so its token counts and its
-cost describe the same requests. A capped run also refuses, before sending, a request whose
+cost describe the same requests. For an OpenRouter stream that announced its generation id, one lookup
+of OpenRouter's generation endpoint (at most 3 seconds, failure-tolerant, never blocking shutdown longer)
+replaces that estimate with the provider's own token counts and cost, and the row's `estimated` flag is
+cleared; if the lookup fails or times out the estimate stands. Other providers are never queried. A capped run also refuses, before sending, a request whose
 prompt and tool list alone are certain to cost more than the remaining USD budget; it stops
 with exit code 4 and a stderr line naming the cost floor and the flag to raise.
 

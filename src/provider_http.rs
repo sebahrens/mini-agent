@@ -892,6 +892,19 @@ impl HttpClientExt for ProviderHttpClient {
         if let Some(guard) = &budget_guard {
             guard.set_estimate(request_usage_bound(request.body()));
         }
+        // OpenRouter only: remember where the real counts can be asked for if
+        // this stream is interrupted (mini-agent-qqknv).
+        let mut generation_ids = None;
+        if let Some(guard) = &budget_guard
+            && let Some(target) = crate::spend::generation::Target::for_request(
+                &self.0.client,
+                request.uri(),
+                request.headers(),
+            )
+        {
+            guard.set_generation_target(target);
+            generation_ids = Some(crate::spend::generation::IdSniffer::default());
+        }
         let unaffordable = crate::spend::run::Run::current()
             .is_some_and(|run| run.refuse_unaffordable(request.body().len()));
         async move {
@@ -941,6 +954,9 @@ impl HttpClientExt for ProviderHttpClient {
                         && let Some(guard) = counter.upgrade()
                     {
                         guard.add_streamed(bytes.len());
+                        if let Some(id) = generation_ids.as_mut().and_then(|ids| ids.feed(bytes)) {
+                            guard.note_generation_id(id);
+                        }
                     }
                     chunk.map_err(transport_error)
                 }));
