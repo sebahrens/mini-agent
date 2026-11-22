@@ -149,12 +149,15 @@ directory grant would not be inherited). Probe failures:
 
 - Exit code `-1073741515` (0xC0000135) or `-1073741790` (0xC0000022): the container could not read a
   DLL beside `git.exe`.
-- `fatal: could not open '/dev/null'`: the container has no access to the NUL device (Git opens it
-  first).
-- `cannot resolve its working directory inside the Windows AppContainer`: upstream Git resolves the
-  working directory with `GetFinalPathNameByHandleW` and a DOS volume name, which an AppContainer is
-  denied. The structured tool is withheld because every operation would fail; use git through the
-  shell tool.
+- `cannot resolve its working directory inside the Windows AppContainer`: the bundled Git predates the
+  runtime patch that falls back to the plain current directory when `GetFinalPathNameByHandleW` is
+  denied (an AppContainer cannot resolve DOS volume names). The structured tool is withheld because
+  every operation would fail; use git through the shell tool and rebuild the runtime from the current
+  `scripts/git-runtime/policy.patch`.
+
+The bundled Git needs no ACL change on the NUL device or on the drive root: where the container cannot
+open `/dev/null` by name, the patched runtime keeps the launcher's standard handles (startup) and
+substitutes a private delete-on-close temporary file for sub-command redirections.
 
 ### [sandbox network: blocked host:port (reason)]
 

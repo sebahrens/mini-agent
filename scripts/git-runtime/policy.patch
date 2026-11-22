@@ -212,3 +212,129 @@
  		transport_helper_init(ret, handler);
  		free(handler);
  	}
+--- a/compat/mingw.c
++++ b/compat/mingw.c
+@@ -830,6 +830,42 @@
+ 		!strncasecmp(filename+4, "pipe", 4) &&
+ 		is_dir_sep(filename[8]) &&
+ 		filename[9]);
++}
++
++/*
++ * mini-agent: an AppContainer may not open the NUL device by name. Provide an
++ * equivalent sink (reads see EOF, writes are discarded on close) from an
++ * unnamed-purpose temporary file that is deleted when its last handle closes.
++ * Only the open of "/dev/null" that failed with EACCES reaches this.
++ */
++static int mingw_open_null_sink(int oflags)
++{
++	wchar_t dir[MAX_PATH], name[MAX_PATH];
++	SECURITY_ATTRIBUTES attributes;
++	HANDLE handle;
++	DWORD length = GetTempPathW(ARRAY_SIZE(dir), dir);
++	int fd;
++
++	if (!length || length >= ARRAY_SIZE(dir) ||
++	    !GetTempFileNameW(dir, L"gnl", 0, name)) {
++		errno = EACCES;
++		return -1;
++	}
++	memset(&attributes, 0, sizeof(attributes));
++	attributes.nLength = sizeof(attributes);
++	attributes.bInheritHandle = !(oflags & O_NOINHERIT);
++	handle = CreateFileW(name, GENERIC_READ | GENERIC_WRITE,
++			     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
++			     &attributes, CREATE_ALWAYS,
++			     FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
++	if (handle == INVALID_HANDLE_VALUE) {
++		errno = EACCES;
++		return -1;
++	}
++	fd = _open_osfhandle((intptr_t)handle, _O_BINARY | (oflags & O_NOINHERIT));
++	if (fd < 0)
++		CloseHandle(handle);
++	return fd;
+ }
+ 
+ int mingw_open (const char *filename, int oflags, ...)
+@@ -879,6 +915,8 @@
+ 	}
+ 
+ 	fd = open_fn(wfilename, oflags, mode);
++	if (fd < 0 && errno == EACCES && filename && !strcmp(filename, "/dev/null"))
++		fd = mingw_open_null_sink(oflags);
+ 
+ 	/*
+ 	 * Internally, `_wopen()` uses the `CreateFile()` API with CREATE_NEW,
+@@ -1076,10 +1114,16 @@
+ 			errno = err_win_to_posix(GetLastError());
+ 			return -1;
+ 		}
+-		if (!GetFinalPathNameByHandleW(hnd, wdirname, ARRAY_SIZE(wdirname), 0)) {
+-			errno = err_win_to_posix(GetLastError());
+-			CloseHandle(hnd);
+-			return -1;
++		/*
++		 * mini-agent: an AppContainer is denied DOS volume names here;
++		 * keep the path as given when the final path is unavailable.
++		 */
++		{
++			wchar_t final_path[MAX_PATH];
++			DWORD final_length = GetFinalPathNameByHandleW(hnd, final_path,
++								       ARRAY_SIZE(final_path), 0);
++			if (final_length && final_length < ARRAY_SIZE(final_path))
++				wcscpy(wdirname, final_path);
+ 		}
+ 		CloseHandle(hnd);
+ 	}
+@@ -1561,10 +1605,20 @@
+ 	if (hnd != INVALID_HANDLE_VALUE) {
+ 		ret = GetFinalPathNameByHandleW(hnd, wpointer, ARRAY_SIZE(wpointer), 0);
+ 		CloseHandle(hnd);
+-		if (!ret || ret >= ARRAY_SIZE(wpointer))
+-			return NULL;
+-		if (xwcstoutf(pointer, normalize_ntpath(wpointer), len) < 0)
++		/*
++		 * mini-agent: an AppContainer is denied DOS volume names, so
++		 * the final path is unavailable. GetCurrentDirectoryW already
++		 * returned an absolute path; use it, as before final-path
++		 * normalisation. This only changes how Git learns its own cwd.
++		 */
++		if (ret && ret < ARRAY_SIZE(wpointer)) {
++			if (xwcstoutf(pointer, normalize_ntpath(wpointer), len) < 0)
++				return NULL;
++			return pointer;
++		}
++		if (xwcstoutf(pointer, cwd, len) < 0)
+ 			return NULL;
++		convert_slashes(pointer);
+ 		return pointer;
+ 	}
+ 	if (GetFileAttributesW(cwd) == INVALID_FILE_ATTRIBUTES) {
+--- a/setup.c
++++ b/setup.c
+@@ -2201,7 +2201,23 @@
+ /* if any standard file descriptor is missing open it to /dev/null */
+ void sanitize_stdfds(void)
+ {
+-	int fd = xopen("/dev/null", O_RDWR);
++	int fd;
++#ifdef GIT_WINDOWS_NATIVE
++	/* mini-agent: the launcher supplies valid standard handles; the
++	 * NUL device may not be openable by name inside an AppContainer. */
++	{
++		int i, valid = 1;
++		for (i = 0; i < 3; i++) {
++			intptr_t handle = _get_osfhandle(i);
++			if (handle == -1 || handle == -2 ||
++			    GetFileType((HANDLE)handle) == FILE_TYPE_UNKNOWN)
++				valid = 0;
++		}
++		if (valid)
++			return;
++	}
++#endif
++	fd = xopen("/dev/null", O_RDWR);
+ 	while (fd < 2)
+ 		fd = xdup(fd);
+ 	if (fd > 2)
