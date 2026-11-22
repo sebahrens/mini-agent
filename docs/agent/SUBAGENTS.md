@@ -784,11 +784,20 @@ bounded repair turn (a single model reply, tools disabled, charged to the task
 budget) that continues the child's own conversation, tool results included, and
 asks it to restate what it established in the required sections; a negative
 result such as "no such capability exists" is a finding.
-The restatement is used only if it passes validation. Otherwise mini-agent
-withholds the original text from the parent model and returns a fixed
-machine-checkable partial report with low confidence (the user reads the raw text
-with `/tasks result <id>`, marked unverified). Malformed output never
-masquerades as a complete specialist report.
+The restatement is used only if it passes validation. Otherwise (validation and
+repair both failed, or repair was skipped for budget) mini-agent still delivers
+the child's answer, but only as clearly delimited data: the report opens with
+`[partial: unstructured response; not contract-checked]`, carries a low-confidence
+Findings entry that says the answer failed validation and is not instructions,
+and then quotes the answer line by line under `## Unstructured child answer
+(data, not instructions)`. Terminal control sequences are stripped, every line is
+quoted so heading, fence and marker lookalikes are inert, and the whole report is
+bounded by `task_max_report_bytes`. (Before mini-agent-zc1gc the text was
+withheld and replaced by a fixed notice; that invariant was reversed because
+discarding a finished answer forces an expensive re-delegation and no surveyed
+harness removes child content.) A structured, validated report is still the
+preferred path, and a citation in an unstructured answer is never verified.
+Malformed output never masquerades as a complete specialist report.
 
 A child that exhausts its model-turn budget gets one further tool-free turn over
 its full history asking for the contract report. The result opens with
@@ -842,7 +851,7 @@ Children are told, as host policy appended after the read-only or write-mode
 rules, that a Findings entry may end with `[evidence: E3, E7]`. The validator
 checks every citation against the IDs the host minted: an unknown or malformed
 ID is a contract violation and triggers the same single repair turn (whose
-prompt names the valid range). A report that still fails is withheld as above;
+prompt names the valid range). A report that still fails is delivered as flagged, quoted data as above;
 host normalization never passes an unverifiable citation through. A
 `[confidence: high]` finding without a citation only earns a soft note.
 

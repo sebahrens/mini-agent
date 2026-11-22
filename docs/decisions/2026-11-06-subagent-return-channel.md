@@ -13,8 +13,14 @@ with a default of zero.
 - A child starts with a fresh context, read-only by default, at depth 1 (`TaskTool` is never in a
   child tool set), under the parent's permission checker. Permissions are inherited and never widened.
 - Its final text must satisfy the host-owned Findings / Unverified / Coverage contract. One tool-free
-  repair turn is allowed. A report that still fails is withheld from the parent model and replaced by a
-  fixed host report; the raw text is kept for the user only (`/tasks result <id>`).
+  repair turn is allowed. A report that still fails is delivered as quoted, flagged data under
+  `[partial: unstructured response; not contract-checked]`, with controls stripped, every line
+  quoted and the size bounded; the raw text is also kept for the user (`/tasks result <id>`).
+  **Amended 2026-11-22 (mini-agent-zc1gc):** this originally withheld the text and replaced it with a
+  fixed host report ("raw unvalidated child text never reaches the parent"). That invariant is
+  reversed: a finished answer is no longer discarded, because re-delegation costs more and
+  `contract: none` personas already bypass the contract. Containment now rests on the quoting,
+  sanitising, size bound and explicit "not instructions" note.
 - Accepted text is quoted line by line between `[subagent output begins]` and `[subagent output
   ends]`, and capped per child and per call.
 - After each child run the host walks the child's own conversation and records every tool result in
