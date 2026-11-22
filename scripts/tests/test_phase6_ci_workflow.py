@@ -155,6 +155,7 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         "clippy", "test", "all-features", "parallel-test-smoke",
         "windows-default-compile", "windows-hooks-compile", "mcp-stdio", "lsp-lifecycle",
     )
+    SHARED_CACHE_JOBS = ("test", "parallel-test-smoke", "windows-default-compile")
     CLEAN_ROOM_CONTAINMENT_JOBS = (
         "macos-worker-containment-gate", "windows-worker-containment-gate",
         "windows-general-sandbox-policy", "phase6-cross-platform-gate",
@@ -175,8 +176,15 @@ class Phase6CiWorkflowTests(unittest.TestCase):
                     body.index("- name: Install Rust"),
                 )
                 rust = body.split("- name: Install Rust\n", 1)[1].split("\n      - name:", 1)[0]
-                self.assertIn("cache-key: ${{ steps.cache-key.outputs.key }}", rust)
-                self.assertNotIn("cache-shared-key:", rust)
+                # Jobs that build the identical dependency graph share one cache
+                # through the derived key (OS, ImageOS and row all inside it), so
+                # the shared key can never revive cross-image restoration.
+                self.assertIn(
+                    "cache-shared-key: ${{ steps.cache-key.outputs.key }}"
+                    if name in self.SHARED_CACHE_JOBS
+                    else "cache-key: ${{ steps.cache-key.outputs.key }}",
+                    rust,
+                )
                 self.assertNotRegex(rust, r"(?m)^          cache: false")
 
     def test_containment_gates_stay_uncached_for_clean_room_evidence(self) -> None:
@@ -806,8 +814,19 @@ class Phase6CiWorkflowTests(unittest.TestCase):
         all_features_header = job_body(self.workflow, "all-features").split(
             "    steps:\n", 1
         )[0]
-        for header in (matrix_header, all_features_header):
-            self.assertIn("RUST_MIN_STACK: 8388608", header)
+        self.assertIn("RUST_MIN_STACK: 8388608", all_features_header)
+        # The matrix job exports it after Install Rust so the variable does not
+        # enter rust-cache's key and split the cache it shares with other jobs.
+        test_body = job_body(self.workflow, "test")
+        self.assertNotIn("RUST_MIN_STACK", matrix_header)
+        self.assertLess(
+            test_body.index("- name: Install Rust"),
+            test_body.index("echo 'RUST_MIN_STACK=8388608' >> \"$GITHUB_ENV\""),
+        )
+        self.assertLess(
+            test_body.index("echo 'RUST_MIN_STACK=8388608' >> \"$GITHUB_ENV\""),
+            test_body.index("on Linux"),
+        )
 
         all_features = job_body(self.workflow, "all-features")
         main_step = all_features.split("name: Test all features", 1)[1].split(

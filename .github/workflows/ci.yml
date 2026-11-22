@@ -574,11 +574,6 @@ jobs:
             features: "--no-default-features --features mcp,js,sandbox,skills,memory"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
-    env:
-      # Rust test threads default to a 2 MiB stack. The combined hooks +
-      # skills debug configuration builds larger async test futures on both
-      # hosted platforms; production workers retain their explicit 8 MiB stack.
-      RUST_MIN_STACK: 8388608
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -621,7 +616,7 @@ jobs:
         if: steps.fp.outputs.skip != 'true'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
-          cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-shared-key: ${{ steps.cache-key.outputs.key }}
           # Save the compiled dependencies even when a later test step fails:
           # a red row must not leave the next run to recompile from cold.
           cache-on-failure: true
@@ -632,6 +627,19 @@ jobs:
         run: |
           rustc --version
           cargo --version
+
+      # Rust test threads default to a 2 MiB stack. The combined hooks +
+      # skills debug configuration builds larger async test futures on both
+      # hosted platforms; production workers retain their explicit 8 MiB stack.
+      # Exported after Install Rust, not as job `env`: rust-cache hashes every
+      # RUST* variable into its key, which would stop this job sharing its
+      # compiled-dependency cache with the jobs that build the same row
+      # (mini-agent-nvnkx.8). RUST_MIN_STACK is a runtime variable and does
+      # not change what is compiled.
+      - name: Raise the Rust test thread stack
+        if: steps.fp.outputs.skip != 'true'
+        shell: bash
+        run: echo 'RUST_MIN_STACK=8388608' >> "$GITHUB_ENV"
 
       - name: Test (${{ matrix.features }}) on Linux
         if: matrix.os != 'macos-latest' && steps.fp.outputs.skip != 'true'
@@ -836,7 +844,10 @@ jobs:
         if: steps.fp.outputs.skip != 'true'
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
-          cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-shared-key: ${{ steps.cache-key.outputs.key }}
+          # The `test` job on the same OS builds the identical default dependency
+          # graph and is the one saver of this shared key (mini-agent-nvnkx.8).
+          cache-save-if: "false"
           # Save the compiled dependencies even when a later test step fails:
           # a red row must not leave the next run to recompile from cold.
           cache-on-failure: true
@@ -894,7 +905,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           rustflags: ''
-          cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-shared-key: ${{ steps.cache-key.outputs.key }}
           # Save the compiled dependencies even when a later test step fails:
           # a red row must not leave the next run to recompile from cold.
           cache-on-failure: true
@@ -2818,22 +2829,27 @@ jobs:
         run: echo 'TMPDIR=/private/tmp' >> "$GITHUB_ENV"
 
       # Each feature row compiles a different dependency graph, so it gets its
-      # own cache key; without it the four rows of one OS share a key and fight
-      # over a single reservation (mini-agent-4tq4t). ImageOS keeps runner
-      # images apart.
+      # own cache key (derived from the cargo feature arguments, so it equals
+      # the `test` job's key for the same row and the two share one cache
+      # instead of each reserving a copy; mini-agent-4tq4t, nvnkx.8). ImageOS
+      # keeps runner images apart.
       - name: Derive the compiled-dependency cache key
         id: cache-key
         shell: bash
         env:
-          CACHE_ROW: ${{ matrix.feature.name }}
+          CACHE_ROW: ${{ matrix.feature.args }}
         run: |
           slug=$(printf '%s' "$CACHE_ROW" | tr -c 'A-Za-z0-9' '-' | sed 's/--*/-/g;s/^-//;s/-$//')
-          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-platform-paths-${slug:-default}" >> "$GITHUB_OUTPUT"
+          echo "key=${RUNNER_OS}-${ImageOS:-unknown}-${slug:-default}" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
-          cache-key: ${{ steps.cache-key.outputs.key }}
+          cache-shared-key: ${{ steps.cache-key.outputs.key }}
+          # Rows that `test` (Linux, macOS) or windows-default-compile (Windows default)
+          # already compile with the same features restore their cache and do not
+          # save; only rows without such a saver save (mini-agent-nvnkx.8).
+          cache-save-if: ${{ matrix.feature.name == 'mcp-js' || (matrix.os == 'windows-latest' && matrix.feature.name != 'default') }}
           cache-on-failure: true
 
       - name: Test deterministic and real platform path acceptance
