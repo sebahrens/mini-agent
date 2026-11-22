@@ -4,7 +4,7 @@
 the vendored official source archive. It verifies SHA-256
 `26c56c296b38c0695b26fa95f475f1d01704d2d38e73465ca30b0b2f5dc789d3`
 and the repository policy patch SHA-256
-`874d50cd59799c7420fcafb7cf209041211269007d6cefc6be2777086d1103b6`
+`e97656f935dda030286a3547532494b33bc55cce6ddfe6e9a666dbbb2023d333`
 before extraction or compilation. The archive's upstream signature was checked
 when acquiring the pinned source; this offline script verifies the pinned bytes.
 It never downloads dependencies, changes HOME, installs system packages, or

@@ -214,12 +214,10 @@
  	}
 --- a/compat/mingw.c
 +++ b/compat/mingw.c
-@@ -830,6 +830,42 @@
- 		!strncasecmp(filename+4, "pipe", 4) &&
- 		is_dir_sep(filename[8]) &&
+@@ -832,6 +832,42 @@
  		filename[9]);
-+}
-+
+ }
+ 
 +/*
 + * mini-agent: an AppContainer may not open the NUL device by name. Provide an
 + * equivalent sink (reads see EOF, writes are discarded on close) from an
@@ -254,9 +252,11 @@
 +	if (fd < 0)
 +		CloseHandle(handle);
 +	return fd;
- }
- 
++}
++
  int mingw_open (const char *filename, int oflags, ...)
+ {
+ 	typedef int (*open_fn_t)(wchar_t const *wfilename, int oflags, ...);
 @@ -879,6 +915,8 @@
  	}
  
@@ -287,7 +287,45 @@
  		}
  		CloseHandle(hnd);
  	}
-@@ -1561,10 +1605,20 @@
+@@ -1237,6 +1281,23 @@
+ 	return 0;
+ }
+ 
++/*
++ * mini-agent: an AppContainer may be denied attribute access on the ancestors
++ * of its working directory, yet each of them is by construction an existing
++ * directory. Report only that fact for a denied strict ancestor of the cwd.
++ */
++static int is_denied_cwd_ancestor(const wchar_t *path)
++{
++	wchar_t cwd[MAX_PATH];
++	DWORD length = GetCurrentDirectoryW(ARRAY_SIZE(cwd), cwd);
++	size_t path_length = wcslen(path);
++
++	if (!length || length >= ARRAY_SIZE(cwd) || !path_length ||
++	    path_length >= length || wcsnicmp(path, cwd, path_length))
++		return 0;
++	return cwd[path_length] == L'\\' || cwd[path_length] == L'/';
++}
++
+ int mingw_lstat(const char *file_name, struct stat *buf)
+ {
+ 	WIN32_FILE_ATTRIBUTE_DATA fdata;
+@@ -1276,6 +1337,13 @@
+ 		filetime_to_timespec(&(fdata.ftLastAccessTime), &(buf->st_atim));
+ 		filetime_to_timespec(&(fdata.ftLastWriteTime), &(buf->st_mtim));
+ 		filetime_to_timespec(&(fdata.ftCreationTime), &(buf->st_ctim));
++		return 0;
++	}
++
++	if (GetLastError() == ERROR_ACCESS_DENIED && is_denied_cwd_ancestor(wfilename)) {
++		memset(buf, 0, sizeof(*buf));
++		buf->st_nlink = 1;
++		buf->st_mode = S_IFDIR | 0755;
+ 		return 0;
+ 	}
+ 
+@@ -1561,10 +1629,20 @@
  	if (hnd != INVALID_HANDLE_VALUE) {
  		ret = GetFinalPathNameByHandleW(hnd, wpointer, ARRAY_SIZE(wpointer), 0);
  		CloseHandle(hnd);
