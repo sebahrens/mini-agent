@@ -196,7 +196,7 @@ worktree-isolated child is also told its branch, the base commit and whether
 the parent checkout had uncommitted changes the worktree lacks; the same
 statement appears in the isolated-worktree section of its result. Every child's
 system prompt ends with an environment block (working directory, UTC date and
-platform).
+platform; a write child also gets its branch line and a short `git status`).
 
 Optional `max_turns` and `timeout_secs` arguments set the child model-turn
 budget and the whole-call deadline for one call (for example
@@ -705,8 +705,11 @@ mode: review
   root instruction overlay with its nested instruction files, respectively the
   architecture text, out of this persona's children; use them for scout
   personas that should start light. The injected byte counts are logged at
-  debug level. Worktree-isolated write children already start without the
-  parent's instruction overlay.
+  debug level. A worktree-isolated write child starts without the root
+  instruction overlay and is not given one: workspace instructions load only
+  for a project config the user has trusted, trust is bound to that config's
+  path, and a newly created worktree path cannot be trusted, so rebinding would
+  either load nothing or require weakening the trust check.
 - `isolation` is `worktree` or `none` (default). With `mode: write`,
   `worktree` runs each child in its own git worktree and branch; see
   [Worktree-isolated write children](#worktree-isolated-write-children).

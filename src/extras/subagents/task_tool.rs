@@ -1192,6 +1192,7 @@ fn resolve_persona_runtime_with(
             }),
             memory_dir: None,
             omit_instructions: specialization.extras.omit_instructions,
+            git_status: None,
             omit_architecture: specialization.extras.omit_architecture,
             #[cfg(feature = "mcp")]
             mcp_servers: specialization.mcp_servers.clone(),
@@ -2793,6 +2794,16 @@ impl ChildPlan {
                 ),
                 (false, _) => (None, authorization, execution_prompt),
             };
+            // A write child also learns the branch and status it starts from.
+            #[cfg_attr(not(feature = "git-worktree"), allow(unused_mut))]
+            let mut persona = persona;
+            #[cfg(feature = "git-worktree")]
+            if persona.write_mode
+                && let Some(workspace) = authorization.workspace()
+            {
+                persona.git_status =
+                    crate::extras::git_worktree::short_status(workspace.root()).await;
+            }
             let model = client
                 .completion_model_with_cache_ttl(model_name, config.cache_ttl.unwrap_or_default());
             // Persona-scoped MCP: connect only the servers and exact tools

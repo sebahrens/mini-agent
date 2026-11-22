@@ -236,6 +236,9 @@ pub(crate) struct PersonaExecution {
     /// Persona `instructions: false`: no instruction overlay or nested
     /// instruction files for this child.
     pub(crate) omit_instructions: bool,
+    /// Branch line and short `git status` of the child's workspace, filled for
+    /// write personas only (mini-agent-irrra).
+    pub(crate) git_status: Option<String>,
     /// Persona `architecture: false`: no architecture text for this child.
     pub(crate) omit_architecture: bool,
     /// Exact server -> wire-level tool names granted to this persona. `None`
@@ -395,7 +398,11 @@ impl SubagentAuthorization {
     /// * The sandbox is rebound to the worktree, so a shell command can write
     ///   only there. If the sandbox is off, host-wide, or has an extra write
     ///   root overlapping a denied root, the shell tool is removed instead.
-    /// * Parent-bound read-only JS and workspace instructions are dropped.
+    /// * Parent-bound read-only JS and workspace instructions are dropped. They
+    ///   are not rebound to the worktree: workspace instructions load only for
+    ///   a project config the user trusted, the trust binding is bound to the
+    ///   config's path, and a fresh worktree path can never be trusted
+    ///   (mini-agent-l4lqw).
     #[cfg(all(feature = "git-worktree", feature = "subagents"))]
     pub(crate) fn isolated_to(
         &self,
@@ -1228,6 +1235,7 @@ fn build_explore_agent_inner_with_suffix<M: CompletionModel + 'static>(
             &workspace.root().display().to_string(),
             &jiff::Timestamp::now().to_string()[..10],
             std::env::consts::OS,
+            persona.git_status.as_deref(),
         ));
     }
 
@@ -3206,6 +3214,7 @@ mod provider_param_tests {
             memory_dir: None,
             omit_instructions: false,
             omit_architecture: false,
+            git_status: None,
             #[cfg(feature = "mcp")]
             mcp_servers: None,
         }

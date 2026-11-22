@@ -3406,6 +3406,35 @@ fn retained_worktree_diagnostic(info: &WorktreeInfo, extras: &WorktreeExtraPaths
     message
 }
 
+/// Branch line and a short status of `repo_path` for a write child's
+/// environment block (mini-agent-irrra): at most 12 lines and 1500 bytes,
+/// `None` when git cannot answer. Runs through the hardened query runner.
+pub(crate) async fn short_status(repo_path: &Path) -> Option<String> {
+    const MAX_LINES: usize = 12;
+    const MAX_BYTES: usize = 1500;
+    let repo_path = canonical_path(repo_path, "workspace").ok()?;
+    let output = run_query(&repo_path, "status", ["status", "--short", "--branch"])
+        .await
+        .ok()?;
+    let text = String::from_utf8_lossy(trim_line(&output.stdout)).into_owned();
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut summary = String::new();
+    for line in lines.iter().take(MAX_LINES) {
+        if summary.len() + line.len() > MAX_BYTES {
+            break;
+        }
+        if !summary.is_empty() {
+            summary.push('\n');
+        }
+        summary.push_str(line);
+    }
+    let shown = summary.lines().count();
+    if lines.len() > shown {
+        summary.push_str(&format!("\n... and {} more", lines.len() - shown));
+    }
+    (!summary.is_empty()).then_some(summary)
+}
+
 pub async fn worktree_has_uncommitted(worktree_path: &Path) -> Result<bool, String> {
     let worktree_path = canonical_path(worktree_path, "worktree")?;
     has_uncommitted_changes_at(&worktree_path).await
