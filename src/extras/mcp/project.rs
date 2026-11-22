@@ -1518,12 +1518,7 @@ mod publication_tests {
             ..Default::default()
         };
         crate::config::inject_mcp_defaults(&mut builtins);
-        let trusted = builtins
-            .mcp_servers
-            .as_ref()
-            .unwrap()
-            .get("Exa Web Search")
-            .unwrap();
+        let trusted = builtins.mcp_servers.as_ref().unwrap().get("exa").unwrap();
         assert!(server_source_is_current(
             &workspace,
             "exa",

@@ -8548,6 +8548,40 @@ pub(super) fn announce_tool_call(
 }
 
 /// A live output preview as content on the call's own id.
+/// The `tool_call_update` fields for a finished call. Tool output is
+/// untrusted, so terminal controls are stripped before it reaches an
+/// editor's terminal-like views (mini-agent-i51kw).
+fn tool_result_fields(
+    output: &str,
+    is_error: bool,
+    diff: Option<ToolCallContent>,
+    shell_workdir: Option<Option<String>>,
+) -> ToolCallUpdateFields {
+    let output = crate::ui::events::sanitize_output(output);
+    let mut content = Vec::new();
+    content.extend(diff);
+    content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
+        output.to_string(),
+    ))));
+    let mut fields = ToolCallUpdateFields::new()
+        .status(ToolCallStatus::Completed)
+        .content(content);
+    if is_error {
+        fields.status = Some(ToolCallStatus::Failed);
+    }
+    // Shell calls run in mini-agent's own sandbox, never in a client
+    // terminal; the result carries what a console view needs.
+    if let Some(workdir) = shell_workdir {
+        fields.raw_output = Some(serde_json::json!({
+            "kind": "shell",
+            "status": if is_error { "failed" } else { "completed" },
+            "workdir": workdir,
+            "output": output.as_str(),
+        }));
+    }
+    fields
+}
+
 fn tool_progress_update(id: &str, text: &str) -> ToolCallUpdate {
     ToolCallUpdate::new(
         ToolCallId::new(id.to_owned()),
@@ -8650,27 +8684,7 @@ impl OpenCalls {
         toolcall::forget_args(&id);
         let diff = self.diffs.remove(&id);
         toolcall::record_result(session_id.0.as_ref(), output, is_error, diff.as_ref());
-        let mut content = Vec::new();
-        content.extend(diff);
-        content.push(ToolCallContent::from(ContentBlock::Text(TextContent::new(
-            output.to_owned(),
-        ))));
-        let mut fields = ToolCallUpdateFields::new()
-            .status(ToolCallStatus::Completed)
-            .content(content);
-        if is_error {
-            fields.status = Some(ToolCallStatus::Failed);
-        }
-        // Shell calls run in mini-agent's own sandbox, never in a client
-        // terminal; the result carries what a console view needs.
-        if let Some(workdir) = shell {
-            fields.raw_output = Some(serde_json::json!({
-                "kind": "shell",
-                "status": if is_error { "failed" } else { "completed" },
-                "workdir": workdir,
-                "output": output,
-            }));
-        }
+        let fields = tool_result_fields(output, is_error, diff, shell);
         let notif = SessionNotification::new(
             session_id.clone(),
             SessionUpdate::ToolCallUpdate(ToolCallUpdate::new(ToolCallId::new(id), fields)),
@@ -20158,5 +20172,29 @@ mod routed_spend_tests {
         assert_eq!(pricing.output_token_cost, 60.0);
         // The startup profile is untouched.
         assert_eq!(startup.prices.input, Some(1.0));
+    }
+}
+
+#[cfg(test)]
+mod tool_result_sanitising_tests {
+    use super::*;
+
+    #[test]
+    fn tool_result_text_and_shell_raw_output_have_terminal_controls_removed() {
+        // mini-agent-i51kw
+        let hostile = "ok\x1b]0;pwned\x07\x1b[31mred\x1b[0m\u{202e}done\r\n";
+        let fields = tool_result_fields(hostile, false, None, Some(Some("/w".to_owned())));
+        let Some(content) = fields.content else {
+            panic!("content");
+        };
+        let ToolCallContent::Content(block) = &content[0] else {
+            panic!("text content");
+        };
+        let ContentBlock::Text(text) = &block.content else {
+            panic!("text block");
+        };
+        assert_eq!(text.text, "okreddone\n");
+        let raw = fields.raw_output.unwrap();
+        assert_eq!(raw["output"], "okreddone\n");
     }
 }

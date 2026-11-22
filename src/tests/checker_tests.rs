@@ -2296,7 +2296,7 @@ fn mcp_exa_web_tools_are_not_exempt_in_readonly_or_planwrite() {
     for mode in [SecurityMode::ReadOnly, SecurityMode::PlanWrite] {
         let mut checker = make_checker(mode);
         for tool_name in ["websearch", "webfetch"] {
-            let input = format!("mcp_tool:Exa Web Search:{tool_name}");
+            let input = format!("mcp_tool:exa:{tool_name}");
             assert!(
                 !matches!(
                     checker.check_mcp(&input, registration.trusted_identity(), tool_name),
@@ -2396,10 +2396,31 @@ fn readonly_denies_unrelated_prefix() {
 }
 
 #[test]
+fn legacy_exa_web_search_rule_still_matches_the_renamed_built_in() {
+    let config = PermissionConfig {
+        mcp_tool: Some(ToolPerm::Granular(
+            [("mcp_tool:Exa Web Search:*".to_owned(), Action::Deny)].into(),
+        )),
+        ..PermissionConfig::default()
+    };
+    let mut checker = PermissionChecker::new(
+        &configs_from(config),
+        SecurityMode::Standard,
+        None,
+        default_modes(),
+    )
+    .expect("valid permission test configuration");
+    assert!(matches!(
+        checker.check("mcp_tool", "mcp_tool:exa:websearch"),
+        CheckResult::Denied(_),
+    ));
+}
+
+#[test]
 fn standard_mode_still_allows_exa_mcp_via_default() {
     let mut checker = make_checker(SecurityMode::Standard);
     assert!(matches!(
-        checker.check("mcp_tool", "mcp_tool:Exa Web Search:websearch"),
+        checker.check("mcp_tool", "mcp_tool:exa:websearch"),
         CheckResult::Allowed,
     ));
 }

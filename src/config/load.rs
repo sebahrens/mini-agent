@@ -3679,6 +3679,13 @@ fn project_config_unknown_key_warnings(path: &Path) -> Vec<String> {
     }
 }
 
+/// Id of the built-in Exa web-search server (a valid server name).
+#[cfg(feature = "mcp")]
+pub(crate) const EXA_SERVER_NAME: &str = "exa";
+/// The built-in's name before 2026-11-21; kept for config and rule migration.
+#[cfg(feature = "mcp")]
+pub(crate) const LEGACY_EXA_SERVER_NAME: &str = "Exa Web Search";
+
 #[cfg(feature = "mcp")]
 pub fn inject_mcp_defaults(cfg: &mut Config) {
     let mut servers = cfg.mcp_servers.take().unwrap_or_default();
@@ -3688,11 +3695,22 @@ pub fn inject_mcp_defaults(cfg: &mut Config) {
         if let Ok(key) = std::env::var("EXA_API_KEY") {
             headers.insert("x-api-key".to_string(), key);
         }
+        // The built-in was registered as "Exa Web Search" until 2026-11-21,
+        // a name the server-name validator rejects. A user entry still under
+        // the legacy name moves to the valid id (mini-agent-n02qh).
+        if !servers.contains_key(EXA_SERVER_NAME)
+            && servers
+                .get(LEGACY_EXA_SERVER_NAME)
+                .is_some_and(|server| server.trusted_identity().is_none())
+            && let Some(user) = servers.remove(LEGACY_EXA_SERVER_NAME)
+        {
+            servers.insert(EXA_SERVER_NAME.to_string(), user);
+        }
         servers
-            .entry("Exa Web Search".to_string())
+            .entry(EXA_SERVER_NAME.to_string())
             .or_insert_with(|| McpServerConfig::built_in(TrustedMcpServer::EXA, headers));
     } else {
-        remove_built_in(&mut servers, "Exa Web Search");
+        remove_built_in(&mut servers, EXA_SERVER_NAME);
     }
 
     if cfg.resolve_enable_context7_mcp() {
@@ -4278,6 +4296,28 @@ mod config_delta_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[cfg(feature = "mcp")]
+    #[test]
+    fn every_built_in_mcp_server_name_passes_the_validator() {
+        let mut cfg = Config {
+            enable_exa_mcp: Some(true),
+            enable_context7_mcp: Some(true),
+            enable_grepapp_mcp: Some(true),
+            ..Default::default()
+        };
+        crate::config::inject_mcp_defaults(&mut cfg);
+        let servers = cfg.mcp_servers.unwrap();
+        assert_eq!(servers.len(), 3);
+        for (name, server) in &servers {
+            assert!(server.trusted_identity().is_some(), "{name}");
+            assert!(
+                crate::extras::mcp::config::is_valid_server_name(name),
+                "built-in server name {name:?} must pass the validator"
+            );
+        }
+        assert!(servers.contains_key("exa"));
+    }
+
     // mini-agent-ydfkp: a user-defined server that happens to share a
     // built-in's name is the user's; only injected built-ins are transient.
     #[cfg(feature = "mcp")]
@@ -4312,7 +4352,10 @@ mod config_delta_tests {
             crate::config::inject_mcp_defaults(&mut before);
             let servers = before.mcp_servers.as_ref().unwrap();
             assert!(servers["Context7"].trusted_identity().is_none());
-            assert!(servers["Exa Web Search"].trusted_identity().is_none());
+            assert!(
+                servers["exa"].trusted_identity().is_none(),
+                "a user entry under the legacy name moves to the valid id"
+            );
             assert!(
                 servers["Grep.app"].trusted_identity().is_some(),
                 "an enabled built-in without a user entry is injected"
