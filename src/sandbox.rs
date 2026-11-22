@@ -5471,7 +5471,10 @@ impl Sandbox {
             .map_err(|error| format!("sandbox: create Git stdin file: {error}"))?;
         let written = file.write_all(input).and_then(|()| file.flush());
         drop(file);
-        let guard = GitStdinFile { path };
+        // Git rejects the verbatim `\\?\` spelling; the child needs the ordinary path.
+        let guard = GitStdinFile {
+            path: windows::child_process_path(&path),
+        };
         written.map_err(|error| format!("sandbox: write Git stdin file: {error}"))?;
         Ok(guard)
     }
