@@ -268,7 +268,6 @@ class GitRuntimeCiTests(unittest.TestCase):
         self.assertIn("scripts.tests.test_build_git_runtime_musl", job_body(self.ci, "fmt"))
         self.assertIn("using: composite", self.action)
         self.assertIn(f"uses: msys2/setup-msys2@{PIN}", self.action)
-        self.assertEqual(self.action.count("if: runner.os == 'Windows'"), 4)
         self.assertIn("msystem: UCRT64", self.action)
         # Windows ARM64 builds natively in CLANGARM64 from the same pinned action and signed MSYS2 repository.
         self.assertIn("msystem: CLANGARM64", self.action)
@@ -277,16 +276,27 @@ class GitRuntimeCiTests(unittest.TestCase):
         self.assertEqual(self.action.count("msys2/setup-msys2@" + PIN), 2)
         self.assertIn("path-type: minimal", self.action)
         steps = CHECK_PACKAGE_METADATA.parse_yaml_document(self.action)["runs"]["steps"]
-        provision = next(step for step in steps if step.get("uses", "").startswith("msys2/setup-msys2@"))
-        self.assertIn("diffutils", provision["with"]["install"].split())  # Git GIT-VERSION-GEN requires /usr/bin/cmp.
-        self.assertIn("mingw-w64-ucrt-x86_64-pcre2", provision["with"]["install"].split())
-        # setup-msys2's cache=true path ends with pacman -Scc, deleting the
-        # signed installed archives required by the source collector. Disable
-        # that cache only when collecting, retaining the ordinary CI cache.
-        self.assertEqual(
-            provision["with"].get("cache"),
-            "${{ inputs.collect-sources != 'true' }}",
-        )
+        for provision in (step for step in steps if step.get("uses", "").startswith("msys2/setup-msys2@")):
+            # Package sync and install are done by the retrying steps below, not by the action's single attempt.
+            self.assertIn(provision["with"].get("update"), (False, "false"))
+            self.assertNotIn("install", provision["with"])
+            self.assertIn(provision["with"].get("cache"), (False, "false"))
+        install = next(step for step in steps if step.get("name", "").startswith("Install the explicit build dependencies"))
+        for package in ("diffutils", "mingw-w64-ucrt-x86_64-pcre2", "mingw-w64-clang-aarch64-pcre2"):
+            self.assertIn(package, install["run"].split())  # diffutils: Git GIT-VERSION-GEN requires /usr/bin/cmp.
+        # Retries with backoff, and only the base plus the toolchain repository are synchronised.
+        self.assertIn("for attempt in 1 2 3", install["run"])
+        sync = next(step for step in steps if step.get("name", "").startswith("Synchronise and upgrade"))
+        self.assertIn("for attempt in 1 2 3", sync["run"])
+        self.assertIn('name != "msys" && name != keep', sync["run"])
+        # A prepared payload is reused only for unchanged pinned inputs, never during source collection.
+        cache = next(step for step in steps if step.get("id") == "bundle-cache")
+        self.assertEqual(cache["if"], "runner.os == 'Windows' && inputs.collect-sources != 'true'")
+        for pinned in ("policy.patch", "git-2.56.0.tar.xz", "build-git-runtime-windows.py", "action.yml", "inputs.target"):
+            self.assertIn(pinned, cache["with"]["key"])
+        for step in steps:
+            if step.get("uses", "").startswith("msys2/") or step.get("name", "").startswith(("Synchronise", "Install the explicit", "Build and select")):
+                self.assertIn("steps.bundle-cache.outputs.cache-hit != 'true'", step["if"])
         for package in ["make patch python", "gcc", "curl-winssl", "zlib", "expat", "libiconv"]:
             self.assertIn(package, self.action)
         self.assertIn("shell: msys2 {0}", self.action)
