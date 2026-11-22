@@ -936,6 +936,7 @@ const UNIFORM_SITES: &[(&str, &str, usize, &str)] = &[
     ),
     // Thread, task and HTTP-status expressions that are not process launches.
     ("src/setup/mod.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    ("src/sandbox/windows.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     ("src/logging.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     (
         "src/extras/subagents/resume.rs",
@@ -2705,6 +2706,7 @@ const EXACT_UNIFORM_SITE_CLASSES: &[(&str, &str, usize, &str)] = &[
     ),
     // Thread, task and HTTP-status expressions that are not process launches.
     ("src/setup/mod.rs", ".spawn(|| {", 1, "NON-PROCESS"),
+    ("src/sandbox/windows.rs", ".spawn(|| {", 1, "NON-PROCESS"),
     ("src/logging.rs", ".spawn(move || {", 1, "NON-PROCESS"),
     (
         "src/extras/subagents/resume.rs",
