@@ -2032,15 +2032,33 @@ fn guarded_runtime_dir_of(program: &Path) -> Option<PathBuf> {
         .find(|protected| protected == dir)
 }
 
-/// `configured` with the guarded runtime directory appended once.
+/// Regular files directly inside the guarded runtime `directory`, sorted and
+/// bounded; links and subdirectories are never granted.
 #[cfg(any(test, feature = "git-worktree"))]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-fn with_runtime_read_root(configured: &[PathBuf], runtime: Option<PathBuf>) -> Vec<PathBuf> {
+fn runtime_file_roots(directory: &Path) -> Vec<PathBuf> {
+    const MAX_RUNTIME_FILES: usize = 64;
+    let mut files: Vec<PathBuf> = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .collect();
+    files.sort();
+    files.truncate(MAX_RUNTIME_FILES);
+    files
+}
+
+/// `configured` with each runtime file appended once.
+#[cfg(any(test, feature = "git-worktree"))]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn with_runtime_read_roots(configured: &[PathBuf], runtime_files: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut roots = configured.to_vec();
-    if let Some(runtime) = runtime
-        && !roots.contains(&runtime)
-    {
-        roots.push(runtime);
+    for file in runtime_files {
+        if !roots.contains(&file) {
+            roots.push(file);
+        }
     }
     roots
 }
@@ -5344,17 +5362,18 @@ impl Sandbox {
     }
 
     /// Configured AppContainer read roots plus, when `program` lives in the
-    /// guarded Git runtime, that runtime directory. The payload is flat: git.exe
-    /// loads its DLL closure and helpers from beside itself, and the container
-    /// is otherwise granted only the executable file, so a launch without the
-    /// directory fails with STATUS_DLL_NOT_FOUND (0xC0000135).
+    /// guarded Git runtime, every file of that runtime directory. The payload is
+    /// flat: git.exe loads its DLL closure and helpers from beside itself. The
+    /// files carry protected private DACLs, so a grant on the directory is not
+    /// inherited and the container is otherwise granted only the executable;
+    /// without per-file grants the launch fails with 0xC0000135/0xC0000022.
     #[cfg(any(test, feature = "git-worktree"))]
     #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     fn git_service_read_roots(&self, program: &Path) -> Vec<PathBuf> {
-        with_runtime_read_root(
-            &self.windows_appcontainer_read_roots,
-            guarded_runtime_dir_of(program),
-        )
+        let runtime_files = guarded_runtime_dir_of(program)
+            .map(|dir| runtime_file_roots(&dir))
+            .unwrap_or_default();
+        with_runtime_read_roots(&self.windows_appcontainer_read_roots, runtime_files)
     }
 
     #[cfg(any(test, feature = "git-worktree"))]
@@ -11630,16 +11649,25 @@ mod sandbox_tests {
     }
 
     #[test]
-    fn git_service_read_roots_add_runtime_directory_once() {
-        let configured = vec![PathBuf::from("configured")];
+    fn git_service_read_roots_grant_each_runtime_file_once() {
+        let (_scratch, root) = canonical_scratch();
+        std::fs::write(root.join("git.exe"), b"x").unwrap();
+        std::fs::write(root.join("libcurl.dll"), b"x").unwrap();
+        std::fs::create_dir(root.join("nested")).unwrap();
+        let files = runtime_file_roots(&root);
+        assert_eq!(files, vec![root.join("git.exe"), root.join("libcurl.dll")]);
+        let configured = vec![PathBuf::from("configured"), root.join("git.exe")];
+        let roots = with_runtime_read_roots(&configured, files.clone());
         assert_eq!(
-            with_runtime_read_root(&configured, None),
-            vec![PathBuf::from("configured")]
+            roots,
+            vec![
+                PathBuf::from("configured"),
+                root.join("git.exe"),
+                root.join("libcurl.dll")
+            ]
         );
-        let runtime = PathBuf::from("runtime");
-        let roots = with_runtime_read_root(&configured, Some(runtime.clone()));
-        assert_eq!(roots, vec![PathBuf::from("configured"), runtime.clone()]);
-        assert_eq!(with_runtime_read_root(&roots, Some(runtime)), roots);
+        assert_eq!(with_runtime_read_roots(&roots, files), roots);
+        assert!(runtime_file_roots(&root.join("missing")).is_empty());
     }
 
     #[cfg(unix)]

@@ -142,7 +142,8 @@ The structured `git` tool needs the AppContainer sandbox: with `--no-sandbox` it
 (`Windows structured Git requires AppContainer`) and git runs only through the shell tool.
 `mini-agent --git-runtime-check` runs the bundled Git inside the container. The runtime directory
 (`<local data>\git-runtime\<id>`) holds `git.exe` and its DLL closure; it is granted to the container
-as a read/execute root. Exit code `-1073741515` (0xC0000135, DLL not found) from that probe means the
+as read/execute roots, one grant per file (the files have protected private ACLs, so a directory grant
+is not inherited). Exit code `-1073741515` (0xC0000135, DLL not found) from that probe means the
 container could not read a DLL beside `git.exe`.
 
 ### [sandbox network: blocked host:port (reason)]
