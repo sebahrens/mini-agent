@@ -2575,7 +2575,7 @@ pub(crate) fn sandbox_failure_note(
         && lowered.contains("access is denied")
     {
         note.push_str(
-            " In cmd.exe `dir` cannot enumerate directories here; `for %f in (*) do @echo %f` (files) and `for /d %d in (*) do @echo %d` (directories) work, as does PowerShell Get-ChildItem.",
+            " In cmd.exe `dir`, `del` and `>NUL` are refused in the default sandbox (a platform limit of these built-ins; the opt-in keys named in this note lift it); `for %f in (*) do @echo %f` (files) and `for /d %d in (*) do @echo %d` (directories) work, as does PowerShell Get-ChildItem.",
         );
     }
     if sandbox.uses_powershell_workspace_drive()
