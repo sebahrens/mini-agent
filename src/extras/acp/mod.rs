@@ -14409,7 +14409,10 @@ mod protocol_tests {
             McpServer::Http(McpServerHttp::new("remote", "https://example.com/mcp")),
         )
         .expect("HTTP servers are refused while the gate is closed");
+        #[cfg(feature = "mcp")]
         assert!(message.contains("not advertised"), "{message}");
+        #[cfg(not(feature = "mcp"))]
+        assert!(message.contains("no MCP support"), "{message}");
         #[cfg(feature = "mcp")]
         {
             assert!(
