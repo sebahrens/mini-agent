@@ -213,6 +213,19 @@ pub(crate) async fn run_all(
         )
         .with_bwrap_read_roots(cli.resolve_sandbox_toolchain_roots(cfg))
         .with_workspace_binding(workspace);
+    // Doctor is read-only: run the sandboxed probes against a throwaway cache
+    // rather than creating `<cache>/sandbox-runtime` in the user's profile.
+    let scratch = std::env::temp_dir().join(format!(
+        "mini-agent-doctor-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos())
+    ));
+    let sandbox = match sandbox.clone().with_ephemeral_cache_dir(&scratch) {
+        Ok(pinned) => pinned,
+        Err(_) => sandbox,
+    };
     let probe = sandbox.clone();
     let matrix = tokio::time::timeout(
         CHECK_TIMEOUT,
@@ -248,6 +261,7 @@ pub(crate) async fn run_all(
     if cli.tool_is_eligible(cfg, "js") {
         checks.push(Check::of("js worker", js_worker().await));
     }
+    let _ = std::fs::remove_dir_all(&scratch);
     checks
 }
 
