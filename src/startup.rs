@@ -3896,7 +3896,7 @@ impl Startup {
     #[allow(clippy::too_many_arguments)]
     async fn finish_print_model(
         &mut self,
-        msg: String,
+        _msg: String,
         schema: Option<std::sync::Arc<crate::output_schema::OutputSchema>>,
         output: crate::print::HeadlessOutputPolicy,
         identity: (String, String),
@@ -4057,11 +4057,8 @@ impl Startup {
                         persistence_failure = Some(error);
                     }
                 }
-                let _ =
-                    session::chat_history::append_entry(&session::chat_history::ChatHistoryEntry {
-                        content: msg,
-                        timestamp: session.updated_at.clone(),
-                    });
+                // Scripted and CI prompts stay out of the TUI's Up-arrow and
+                // Ctrl+R input history (mini-agent-ukk9a).
             }
         }
         #[cfg_attr(

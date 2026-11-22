@@ -396,8 +396,11 @@ pub(crate) const FINITE_ARGUMENT_COMMANDS: &[&str] = &[
 /// Commands whose bare form is a complete command (`/vim` toggles). Their
 /// arguments complete on Tab, but accepting the command with Enter or a space
 /// never opens the argument picker, so Enter still runs the bare form.
+/// `/undo` belongs here because its only argument, `stash`, reaches into git:
+/// Enter on the exact command must be the plain conversation undo
+/// (mini-agent-zgfwi).
 pub(crate) const COMPLETE_ONLY_COMMANDS: &[&str] =
-    &["/reasoning", "/vim", "/sessions", "/compress"];
+    &["/reasoning", "/vim", "/sessions", "/compress", "/undo"];
 
 /// Replace the typed `/query` with the highlighted command plus a space, and
 /// open the argument picker when the command has one.
