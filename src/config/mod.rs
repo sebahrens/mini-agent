@@ -1266,6 +1266,11 @@ pub struct Config {
     /// Interactive startup presentation only; never persisted or sent to a model.
     #[serde(skip)]
     pub update_notice: Option<String>,
+    /// Test fixtures with micro-dollar caps set this so their runs skip the
+    /// pre-send budget refusal (mini-agent-bnynh). Absent from production.
+    #[cfg(test)]
+    #[serde(skip)]
+    pub(crate) budget_preflight_off: bool,
 }
 
 /// The result of [`Config::resolve_prompt_route`].
