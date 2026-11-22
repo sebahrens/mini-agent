@@ -2482,6 +2482,8 @@ const GLOBAL_ONLY_PROJECT_KEYS: &[&str] = &[
     "shell_env_allow_secrets",
     "shell_auto_allow_sandboxed",
     "windows_appcontainer_toolchain_discovery",
+    "windows_appcontainer_ancestor_listing",
+    "windows_appcontainer_null_device",
     "sandbox_network_private_hosts",
     "sandbox_network_upstream_proxy",
     "web_fetch_local_origins",

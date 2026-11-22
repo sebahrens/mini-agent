@@ -156,6 +156,16 @@ directory grant would not be inherited). Probe failures:
   denied. The structured tool is withheld because every operation would fail; use git through the
   shell tool.
 
+### Windows shell: PowerShell starts in `C:\`, `dir` or `git` say "Access is denied" / "Unable to read current working directory", `python` or `node` is not recognized, `/dev/null` cannot be opened
+
+The Windows AppContainer shell reads only the workspace, the cache and what `ALL APPLICATION PACKAGES` already reads. Three opt-in global-config keys (all default `false`) widen it; the `[sandbox: ...]` note on the failing command names the one that matches:
+
+- `windows-appcontainer-ancestor-listing = true`: lets the container list the entries (names, sizes, timestamps) inside each parent of the workspace, which PowerShell, `cmd dir` and Git need to resolve the working directory. System-owned parents (`C:\Users`, the drive root) need mini-agent started from an elevated launcher.
+- `windows-appcontainer-null-device = true`: with an elevated launcher, lets the container open the NUL device (Git, `>nul`, Python/Node `DEVNULL`). Otherwise use the `git` tool.
+- `windows-appcontainer-toolchain-discovery = true`: read and execute on the install directory of `python`, `node`, ... when the command names them. An administrator-owned install needs an elevated launcher; or add the directory to `windows-appcontainer-read-roots`.
+
+`mini-agent --doctor` shows the effective state of the three keys, and a warning when an earlier elevated session left grants that an unelevated launch could not remove (start mini-agent elevated once to clear them). Settings are global-only and a managed policy can force each off. See `docs/agent/CONFIG.md`.
+
 ### [sandbox network: blocked host:port (reason)]
 
 A contained command reached a host that `sandbox-network = "allowlist"` does not permit. Add the host

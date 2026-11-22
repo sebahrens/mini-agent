@@ -111,43 +111,41 @@ command in `standard` mode runs without a prompt while an enforced `workspace` o
 `host-read` sandbox with network `deny` or `allowlist` contains it; deny and ask
 rules, destructive commands and `escalate=true` still prompt.
 
-On Windows the AppContainer shell is launched in the workspace and can list and
-read it. The shells resolve the working directory by name (PowerShell
-`Set-Location`, cmd.exe `dir`/`del`, `GetLongPathName` enumerate each ancestor to
-case-correct it), so every named ancestor of the workspace that does not already
-admit application packages receives, for the launch's unique profile SID only,
-`FILE_TRAVERSE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE` on the
-directory itself with no inheritance: the container can list the names inside
-each ancestor, nothing is readable below it beyond its own ACLs, and nothing is
-writable. The grants are revoked when the command ends. They are best effort: an
-ancestor whose DACL the user cannot change is left as it is (user-owned directories
-are changeable; `C:\\Users` and a drive root normally need an elevated start, and a
-grant is skipped when `ALL APPLICATION PACKAGES` already lists the directory).
-Without them PowerShell can start in `C:\\` and `cmd.exe dir` is refused, which is an
-operating-system limit of the container, not a policy choice. The cmd.exe UTF-8 prelude
-is skipped under AppContainer (it redirected `chcp` to `nul`), and every Windows
-PowerShell launch sets `$PSStyle.OutputRendering = 'PlainText'`, so PowerShell errors
-carry no ANSI colour sequences in any front end (ACP included).
+On Windows the AppContainer shell is launched in the workspace with the explicit roots
+only. Three opt-in, default-off, global-only keys widen it; each is documented in
+`docs/agent/CONFIG.md` with what it exposes, and `--doctor` and `--print-config` show
+their effective state. Without them the container reads the workspace, the cache, the
+shell and what `ALL APPLICATION PACKAGES` already reads, so these symptoms remain on a
+default start: PowerShell can start in `C:\` (its `Set-Location` and `Get-ChildItem`
+enumerate every parent of the workspace to case-correct it), `cmd.exe dir`/`del` and Git
+are refused (`GetLongPathName` and the drive root), interpreters outside `Program Files`
+are not runnable, and `/dev/null` and `nul` cannot be opened (Git, `>nul`, Python
+`DEVNULL`). A failure that matches one of them gets a `[sandbox: ...]` note naming the key
+that would enable it, and saying where an elevated launcher is needed.
 
-Interpreters and build tools installed outside `Program Files` (a runner tool
-cache, `C:\Python312`, a Chocolatey or Scoop directory) are on `PATH` but are not
-readable by the container. Unless `windows-appcontainer-toolchain-discovery` is
-`false`, the shell grants read and execute (never write) on the install
-directory of each well-known command the host `PATH` resolves that the launched command
-names (each grant writes and revokes one ACE per object below the root, so a command that
-uses no toolchain pays nothing), within the size
-and exclusion rules documented in `docs/agent/CONFIG.md` (the same idea as
-`sandbox-toolchain-roots` on Linux). The grant is best effort per root: a root
-whose DACL the user cannot change is skipped, never an error. A failed command
-that names a program the host resolves but the sandbox cannot run gets a
-`[sandbox: ...]` note naming `windows-appcontainer-read-roots`.
+- `windows-appcontainer-ancestor-listing` grants the profile SID traverse and name
+  listing (`FILE_TRAVERSE | FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE`,
+  non-inheriting) on each parent of the workspace and the drive root. It exposes the
+  names, sizes, timestamps and attributes inside those parents. System-owned parents
+  (`C:\Users`, the drive root) can only be changed by an elevated launcher; the grants
+  are best effort, never propagate to children, and are revoked at the end of the
+  command or by the next launch's recovery sweep.
+- `windows-appcontainer-null-device` lets an elevated launcher add the container to the
+  NUL device access list for the command (explicit elevation check, kernel-object write,
+  journaled before it is made and revoked by the sweep if the helper dies).
+- `windows-appcontainer-toolchain-discovery` grants read and execute on the install
+  directory of the well-known commands a launched command names (python, node, ...), in
+  the size and exclusion rules of CONFIG.md; a grant that cannot be made is skipped.
 
-The container cannot open the NUL device by default (the device DACL does not
-admit AppContainers), which breaks Git for Windows (it opens `/dev/null` first),
-cmd.exe `>nul`, Python `subprocess.DEVNULL` and Node ignored stdio. When
-mini-agent runs elevated it adds a temporary read/write ACE for the launch's
-unique SID on `\\.\NUL` and revokes it at cleanup; otherwise the limitation
-stands, the failure note says so, and Git operations should use the `git` tool.
+An elevated session can leave grants on system directories that a later unelevated launch
+cannot withdraw. That launch keeps the journal, logs a warning and continues, and
+`--doctor` reports the retained grants until an elevated launch clears them.
+
+Independent of those keys, the cmd.exe UTF-8 prelude is skipped under AppContainer (it
+redirected `chcp` to `nul`), and every Windows PowerShell launch sets
+`$PSStyle.OutputRendering = 'PlainText'`, so PowerShell errors carry no ANSI colour
+sequences in any front end (ACP included). Sessions started at the same time run the
+production preflight one at a time under an owner-only cross-process mutex.
 
 `pty = true` and `job_status action=input`/`keys` exist on Unix and, on
 Windows, under the AppContainer sandbox backend. On Windows the AppContainer

@@ -614,6 +614,7 @@ mod tests {
             configured_write_roots: vec![],
             optional_read_roots: Vec::new(),
             null_device: false,
+            ancestor_listing: false,
             parent_pid: 1,
             parent_created: 1,
             ready_path: None,

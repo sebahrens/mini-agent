@@ -93,6 +93,9 @@ pub(crate) struct DiscoveryEnvironment {
     /// Whether every application package already reads and executes the tree under a directory
     /// (an inheritable `ALL APPLICATION PACKAGES` ACE), so no grant is needed.
     pub(crate) already_readable: Option<fn(&Path) -> bool>,
+    /// mini-agent's own configuration, credential, data, state and cache directories: a proposal
+    /// may neither contain nor lie inside one.
+    pub(crate) excluded_roots: Vec<PathBuf>,
 }
 
 impl DiscoveryEnvironment {
@@ -131,6 +134,7 @@ impl DiscoveryEnvironment {
             home,
             protected_roots,
             already_readable: None,
+            excluded_roots: Vec::new(),
         })
     }
 }
@@ -164,24 +168,58 @@ fn lowered_name(path: &Path) -> Option<String> {
         .map(|name| name.to_string_lossy().to_ascii_lowercase())
 }
 
+/// Whether `prefix` looks like a tool install (it has `lib`, `Lib`, `include` or `libexec`) and
+/// holds no repository or secret marker (`.git`, `.env`) within two levels. Only such a prefix is
+/// granted in place of its `bin`/`Scripts` directory: `D:\\dev\\bin\\make.exe` must not expose `D:\\dev`.
+fn looks_like_install(prefix: &Path) -> bool {
+    const LIBRARY_DIRECTORIES: [&str; 4] = ["lib", "include", "libexec", "lib64"];
+    const MARKERS: [&str; 2] = [".git", ".env"];
+    let Ok(entries) = std::fs::read_dir(prefix) else {
+        return false;
+    };
+    let mut has_library = false;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if MARKERS.contains(&name.as_str()) {
+            return false;
+        }
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            if LIBRARY_DIRECTORIES.contains(&name.as_str()) {
+                has_library = true;
+            }
+            let Ok(children) = std::fs::read_dir(entry.path()) else {
+                continue;
+            };
+            for child in children.flatten() {
+                let child = child.file_name().to_string_lossy().to_ascii_lowercase();
+                if MARKERS.contains(&child.as_str()) {
+                    return false;
+                }
+            }
+        }
+    }
+    has_library
+}
+
 /// The directory to propose for a resolved executable: its own directory, except that a
 /// `Scripts` directory (pip, pytest, ...) or a `bin` directory of an install prefix (Go, Ruby,
-/// a JDK, MinGW) proposes the prefix above it, where the standard library lives. A `bin` under a
-/// dot-directory (`.cargo\bin`, `.local\bin`) stays as it is: dot-directories also hold
-/// configuration and credentials.
+/// a JDK, MinGW) proposes the prefix above it, where the standard library lives, when the prefix
+/// [looks like an install](looks_like_install); otherwise only the `bin`/`Scripts` directory is
+/// proposed. A `bin` under a dot-directory (`.cargo\bin`, `.local\bin`) stays as it is:
+/// dot-directories also hold configuration and credentials.
 fn proposed_directory(executable: &Path) -> Option<PathBuf> {
     let directory = executable.parent()?;
     let prefix = directory.parent().map(Path::to_path_buf);
-    match lowered_name(directory).as_deref() {
-        Some("scripts") => prefix,
-        Some("bin")
-            if prefix
-                .as_deref()
-                .and_then(lowered_name)
-                .is_some_and(|name| !name.starts_with('.')) =>
-        {
-            prefix
-        }
+    let promote = match lowered_name(directory).as_deref() {
+        Some("scripts") => true,
+        Some("bin") => prefix
+            .as_deref()
+            .and_then(lowered_name)
+            .is_some_and(|name| !name.starts_with('.')),
+        _ => false,
+    };
+    match prefix {
+        Some(prefix) if promote && looks_like_install(&prefix) => Some(prefix),
         _ => Some(directory.to_path_buf()),
     }
 }
@@ -197,6 +235,8 @@ pub(crate) enum Rejection {
     ContainsCredentials,
     TooLarge,
     OverBudget,
+    ContainsLinks,
+    OverlapsExcludedRoot,
 }
 
 fn credential_child_present(directory: &Path) -> bool {
@@ -205,25 +245,48 @@ fn credential_child_present(directory: &Path) -> bool {
         .any(|name| std::fs::symlink_metadata(directory.join(name)).is_ok())
 }
 
-/// Count the entries below `root` without following links, stopping at `limit + 1`.
-pub(crate) fn bounded_entry_count(root: &Path, limit: usize) -> usize {
-    let mut count = 0usize;
+/// What a bounded walk below a root found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TreeScan {
+    /// Entries seen (capped at `limit + 1`).
+    pub(crate) entries: usize,
+    /// A symbolic link or junction exists below the root: an inheritable grant could follow it
+    /// out of the tree, so such a root is never proposed.
+    pub(crate) has_link: bool,
+}
+
+/// Walk `root` without following links, stopping at `limit + 1` entries.
+pub(crate) fn scan_tree(root: &Path, limit: usize) -> TreeScan {
+    let mut scan = TreeScan {
+        entries: 0,
+        has_link: false,
+    };
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
         let Ok(entries) = std::fs::read_dir(&directory) else {
             continue;
         };
         for entry in entries.flatten() {
-            count += 1;
-            if count > limit {
-                return count;
+            scan.entries += 1;
+            if scan.entries > limit {
+                return scan;
             }
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                pending.push(entry.path());
+            match entry.file_type() {
+                Ok(kind) if kind.is_symlink() => {
+                    scan.has_link = true;
+                    return scan;
+                }
+                Ok(kind) if kind.is_dir() => pending.push(entry.path()),
+                _ => {}
             }
         }
     }
-    count
+    scan
+}
+
+/// Count the entries below `root` without following links, stopping at `limit + 1`.
+pub(crate) fn bounded_entry_count(root: &Path, limit: usize) -> usize {
+    scan_tree(root, limit).entries
 }
 
 /// The entry count of an acceptable proposal.
@@ -259,11 +322,21 @@ fn judge(
     if credential_child_present(directory) {
         return Err(Rejection::ContainsCredentials);
     }
-    let entries = bounded_entry_count(directory, entry_limit);
-    if entries > entry_limit {
+    if environment
+        .excluded_roots
+        .iter()
+        .any(|excluded| same_or_inside(excluded, directory) || same_or_inside(directory, excluded))
+    {
+        return Err(Rejection::OverlapsExcludedRoot);
+    }
+    let scan = scan_tree(directory, entry_limit);
+    if scan.has_link {
+        return Err(Rejection::ContainsLinks);
+    }
+    if scan.entries > entry_limit {
         return Err(Rejection::TooLarge);
     }
-    Ok(entries)
+    Ok(scan.entries)
 }
 
 /// A proposed read/execute root and the command words that make a launch need it.
@@ -527,6 +600,7 @@ mod tests {
                 home: Some(self.canonical().join("home").join("me")),
                 protected_roots: Vec::new(),
                 already_readable: None,
+                excluded_roots: Vec::new(),
             }
         }
     }
@@ -544,6 +618,7 @@ mod tests {
         let fixture = Fixture::new();
         let scripts = fixture.tool("tools/python312/Scripts", "pip");
         let root = scripts.parent().unwrap().to_path_buf();
+        std::fs::create_dir(root.join("Lib")).unwrap();
         let environment = fixture.environment(&[scripts]);
         assert_eq!(roots(&environment), vec![root]);
     }
@@ -553,11 +628,66 @@ mod tests {
         let fixture = Fixture::new();
         let ruby_bin = fixture.tool("tools/ruby33/bin", "ruby");
         let ruby_root = ruby_bin.parent().unwrap().to_path_buf();
+        std::fs::create_dir(ruby_root.join("lib")).unwrap();
         assert_eq!(roots(&fixture.environment(&[ruby_bin])), vec![ruby_root]);
         let cargo_bin = fixture.tool("home/me/.cargo/bin", "cargo");
         let mut environment = fixture.environment(std::slice::from_ref(&cargo_bin));
         environment.home = Some(fixture.canonical().join("elsewhere"));
         assert_eq!(roots(&environment), vec![cargo_bin]);
+    }
+
+    #[test]
+    fn a_bin_directory_of_a_non_install_prefix_grants_only_the_bin_directory() {
+        let fixture = Fixture::new();
+        // `dev/bin/make` with no library directory: the parent is a project area, not an install.
+        let bin = fixture.tool("dev/bin", "make");
+        std::fs::create_dir(bin.parent().unwrap().join("notes")).unwrap();
+        assert_eq!(
+            roots(&fixture.environment(std::slice::from_ref(&bin))),
+            vec![bin]
+        );
+        // An install-shaped prefix holding a repository marker is not promoted either.
+        let bin = fixture.tool("tools/ruby/bin", "ruby");
+        let prefix = bin.parent().unwrap().to_path_buf();
+        std::fs::create_dir(prefix.join("lib")).unwrap();
+        std::fs::create_dir_all(prefix.join("share").join(".git")).unwrap();
+        assert_eq!(
+            roots(&fixture.environment(std::slice::from_ref(&bin))),
+            vec![bin]
+        );
+        std::fs::remove_dir(prefix.join("share").join(".git")).unwrap();
+        assert_eq!(
+            roots(&fixture.environment(&[prefix.join("bin")])),
+            vec![prefix]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tree_containing_a_link_is_never_proposed() {
+        let fixture = Fixture::new();
+        let tools = fixture.tool("tools/py", "python");
+        std::os::unix::fs::symlink(fixture.canonical(), tools.join("persist")).unwrap();
+        assert!(roots(&fixture.environment(&[tools])).is_empty());
+    }
+
+    #[test]
+    fn mini_agents_own_directories_are_never_proposed() {
+        let fixture = Fixture::new();
+        let tools = fixture.tool("tools/py", "python");
+        let mut environment = fixture.environment(std::slice::from_ref(&tools));
+        environment.excluded_roots = vec![tools.join("config")];
+        assert!(
+            roots(&environment).is_empty(),
+            "contains the config directory"
+        );
+        environment.excluded_roots = vec![fixture.canonical()];
+        assert!(
+            roots(&environment).is_empty(),
+            "inside the application directory"
+        );
+        environment.excluded_roots = vec![fixture.canonical().join("elsewhere")];
+        assert_eq!(roots(&environment), vec![tools]);
     }
 
     #[test]

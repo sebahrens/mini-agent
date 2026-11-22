@@ -2375,6 +2375,13 @@ const SANDBOX_FAILURE_MARKERS: [&str; 7] = [
 
 /// Spellings of the Windows NUL device refusing the AppContainer (Git for Windows opens
 /// `/dev/null` first; .NET names `\\.\NUL`).
+/// Output of shells and Git that could not resolve their working directory by name.
+const WINDOWS_CWD_MARKERS: [&str; 3] = [
+    "unable to read current working directory",
+    "cannot find path 'c:\\' because it does not exist",
+    "access to the path 'c:\\' is denied",
+];
+
 const WINDOWS_NUL_MARKERS: [&str; 2] = ["could not open '/dev/null'", "\\.\\nul' is denied"];
 
 /// Spellings of a denied network: resolver, curl, git, npm, cargo and pip
@@ -2430,7 +2437,12 @@ pub(crate) fn sandbox_failure_note(
         .any(|marker| lowered.contains(marker))
         || proxy_connection_refused(&lowered);
     let toolchain_hint = host_command_unrunnable_hint(sandbox, output);
+    let cwd_failure = sandbox.backend_name() == "appcontainer"
+        && WINDOWS_CWD_MARKERS
+            .iter()
+            .any(|marker| lowered.contains(marker));
     if !network_failure
+        && !cwd_failure
         && toolchain_hint.is_none()
         && !SANDBOX_FAILURE_MARKERS
             .iter()
@@ -2463,8 +2475,24 @@ pub(crate) fn sandbox_failure_note(
             .iter()
             .any(|marker| lowered.contains(marker))
     {
+        if sandbox.windows_null_device() {
+            note.push_str(
+                " The Windows AppContainer cannot open the NUL device; `windows-appcontainer-null-device` is on but only an elevated launcher can add the access, so Git, redirections to nul and Python or Node DEVNULL fail in this shell; use the git tool for Git operations.",
+            );
+        } else {
+            note.push_str(
+                " The Windows AppContainer cannot open the NUL device, so Git, redirections to nul and Python or Node DEVNULL fail in this shell; use the git tool for Git operations. Setting `windows-appcontainer-null-device = true` (global config) adds the access when mini-agent is started from an elevated launcher.",
+            );
+        }
+    }
+    if sandbox.backend_name() == "appcontainer"
+        && !sandbox.windows_ancestor_listing()
+        && WINDOWS_CWD_MARKERS
+            .iter()
+            .any(|marker| lowered.contains(marker))
+    {
         note.push_str(
-            " The Windows AppContainer cannot open the NUL device unless mini-agent runs elevated, so Git, redirections to nul and Python or Node DEVNULL fail in this shell; use the git tool for Git operations.",
+            " Windows tools resolve the working directory by listing each parent directory, which the container may not do by default; setting `windows-appcontainer-ancestor-listing = true` (global config) lets it list the names, sizes and timestamps in each parent of the workspace, and system-owned parents such as `C:\\Users` and the drive root need an elevated launcher (restart required).",
         );
     }
     if let Some(hint) = &toolchain_hint {
@@ -2484,25 +2512,61 @@ pub(crate) fn sandbox_failure_note(
     Some(note)
 }
 
-/// A command the shell could not find or start, as its output names it.
-#[derive(Debug, PartialEq, Eq)]
-enum MissingCommand {
-    /// A bare command name ("python").
-    Name(String),
-    /// A full executable path the shell could not start.
-    Path(String),
+/// Whether `name` is an acceptable bare command name: ASCII letters, digits and `._+-`, starting
+/// with a letter or digit. Anything else (a drive prefix such as `C:foo`, a separator, a space) is
+/// never joined onto a directory.
+fn valid_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
 }
 
-/// Commands named by "not found / not recognized / unable to create process"
-/// output of PowerShell, cmd.exe and POSIX shells (at most three, in order).
-fn missing_commands(output: &str) -> Vec<MissingCommand> {
+/// The command name of an executable path that PowerShell could not start, accepted only when it
+/// is a plain `X:\dir\name.ext` path whose parent directory is, compared lexically and without
+/// touching the filesystem, a directory already on the host `PATH`. UNC, verbatim (`\\?\`),
+/// device (`\\.\`) and drive-relative forms are rejected before anything else: the text came from
+/// sandboxed output, so it must never reach a filesystem call.
+fn command_name_from_path(path: &str, path_directories: &[String]) -> Option<String> {
+    let bytes = path.as_bytes();
+    if path.starts_with("\\\\") || path.starts_with("//") || path.contains("..") {
+        return None;
+    }
+    if !(bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/'))
+    {
+        return None;
+    }
+    let normalized = path.replace('/', "\\");
+    let (parent, leaf) = normalized.rsplit_once('\\')?;
+    let parent = parent.trim_end_matches('\\').to_ascii_lowercase();
+    if !path_directories.iter().any(|directory| {
+        directory
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_ascii_lowercase()
+            == parent
+    }) {
+        return None;
+    }
+    let stem = leaf.rsplit_once('.').map_or(leaf, |(stem, _)| stem);
+    valid_command_name(stem).then(|| stem.to_ascii_lowercase())
+}
+
+/// Command names (at most three, in order) that the output of PowerShell, cmd.exe and POSIX
+/// shells says could not be found or started. No filesystem access happens here.
+fn missing_commands(output: &str, path_directories: &[String]) -> Vec<String> {
     fn quoted_after<'a>(line: &'a str, marker: &str) -> Option<&'a str> {
         let rest = &line[line.to_ascii_lowercase().find(marker)? + marker.len()..];
         let rest = rest.strip_prefix('\'')?;
         Some(&rest[..rest.find('\'')?])
     }
-    let mut found: Vec<MissingCommand> = Vec::new();
-    let mut push = |candidate: MissingCommand| {
+    let mut found: Vec<String> = Vec::new();
+    let mut push = |candidate: String| {
         if found.len() < 3 && !found.contains(&candidate) {
             found.push(candidate);
         }
@@ -2527,14 +2591,15 @@ fn missing_commands(output: &str) -> Vec<MissingCommand> {
             None
         };
         if let Some(name) = name
-            && !name.is_empty()
-            && !name.contains(['/', '\\', ' '])
+            && valid_command_name(name)
         {
-            push(MissingCommand::Name(name.to_string()));
+            push(name.to_string());
             continue;
         }
-        if let Some(rest) = quoted_after_unclosed(line, "unable to create process using ") {
-            push(MissingCommand::Path(rest.to_string()));
+        if let Some(rest) = quoted_after_unclosed(line, "unable to create process using ")
+            && let Some(name) = command_name_from_path(rest, path_directories)
+        {
+            push(name);
         }
     }
     found
@@ -2565,56 +2630,69 @@ fn host_path_extensions() -> Vec<String> {
         .collect()
 }
 
-/// The setting that adds read-only toolchain roots for `backend`, if it has one.
-fn toolchain_roots_setting(backend: &str) -> Option<&'static str> {
-    match backend {
-        "appcontainer" => Some("windows-appcontainer-read-roots"),
-        "bwrap" => Some("sandbox-toolchain-roots"),
+/// What to tell the user to change so a host-resolvable program becomes runnable.
+fn toolchain_advice(sandbox: &Sandbox) -> Option<String> {
+    match sandbox.backend_name() {
+        "appcontainer" if !sandbox.windows_toolchain_discovery() => Some(
+            "Setting `windows-appcontainer-toolchain-discovery = true` (global config; read and execute only, and an administrator-owned install also needs an elevated launcher) or adding its install directory to `windows-appcontainer-read-roots` makes it runnable (restart required)."
+                .to_string(),
+        ),
+        "appcontainer" => Some(
+            "Add its install directory to `windows-appcontainer-read-roots` (restart required; an administrator-owned install also needs an elevated launcher)."
+                .to_string(),
+        ),
+        "bwrap" => Some(
+            "Add its install directory to `sandbox-toolchain-roots` (restart required)."
+                .to_string(),
+        ),
         _ => None,
     }
 }
 
-/// When the failed command's output says a program could not be found or
-/// started, and the host `PATH` resolves it, tell the model the program exists
-/// but is outside the sandbox's read roots, and name the setting that adds it.
+/// Run a short filesystem lookup without stalling an async executor thread.
+fn off_executor<T>(work: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(work)
+        }
+        _ => work(),
+    }
+}
+
+/// When the failed command's output says a program could not be found or started and the host
+/// `PATH` resolves it, tell the model that the program exists but is outside the sandbox's read
+/// roots and which setting changes that. Only the program's name and the setting are shown (never
+/// a host directory), and the only paths touched are the host `PATH` directories.
 fn host_command_unrunnable_hint(sandbox: &Sandbox, output: &str) -> Option<String> {
-    let setting = toolchain_roots_setting(sandbox.backend_name())?;
-    let missing = missing_commands(output);
+    let advice = toolchain_advice(sandbox)?;
+    let path_var = std::env::var_os("PATH")?;
+    let path_directories: Vec<String> = std::env::split_paths(&path_var)
+        .map(|directory| directory.to_string_lossy().into_owned())
+        .collect();
+    let missing = missing_commands(output, &path_directories);
     if missing.is_empty() {
         return None;
     }
-    let path_var = std::env::var_os("PATH")?;
     let extensions = host_path_extensions();
-    let mut located = Vec::new();
-    for command in missing {
-        let resolved = match command {
-            MissingCommand::Name(name) => {
-                crate::sandbox::windows_toolchains::resolve_on_path(&name, &path_var, &extensions)
-                    .map(|path| (name, path))
-            }
-            MissingCommand::Path(path) => {
-                let path = std::path::PathBuf::from(path);
-                let name = path.file_stem()?.to_string_lossy().into_owned();
-                path.is_file().then_some((name, path))
-            }
-        };
-        if let Some(entry) = resolved {
-            located.push(entry);
-        }
-    }
+    let located: Vec<String> = off_executor(|| {
+        missing
+            .into_iter()
+            .filter(|name| {
+                crate::sandbox::windows_toolchains::resolve_on_path(name, &path_var, &extensions)
+                    .is_some()
+            })
+            .collect()
+    });
     if located.is_empty() {
         return None;
     }
     let listed = located
         .iter()
-        .map(|(name, path)| {
-            let directory = path.parent().unwrap_or(path);
-            format!("`{name}` ({})", directory.display())
-        })
+        .map(|name| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(", ");
     Some(format!(
-        "The program(s) {listed} exist on the host but the sandbox cannot run them: the install directory is outside the sandbox's read roots. The user can add that directory to `{setting}` (restart required)."
+        "The program(s) {listed} exist on the host but the sandbox cannot run them: they are outside the sandbox's read roots. {advice}"
     ))
 }
 
@@ -3790,34 +3868,73 @@ mod tests {
 
     #[test]
     fn missing_commands_are_parsed_from_powershell_cmd_and_posix_output() {
-        use MissingCommand::{Name, Path};
+        let path: Vec<String> = vec!["C:\\tools\\py".into()];
         assert_eq!(
             missing_commands(
-                "python: The term 'python' is not recognized as a name of a cmdlet, function, script file, or executable program."
+                "python: The term 'python' is not recognized as a name of a cmdlet, function, script file, or executable program.",
+                &path
             ),
-            vec![Name("python".into())]
-        );
-        assert_eq!(
-            missing_commands("'node' is not recognized as an internal or external command,"),
-            vec![Name("node".into())]
-        );
-        assert_eq!(
-            missing_commands("bash: python3: command not found"),
-            vec![Name("python3".into())]
-        );
-        assert_eq!(
-            missing_commands("/bin/sh: 1: cargo: not found"),
-            vec![Name("cargo".into())]
+            vec!["python".to_string()]
         );
         assert_eq!(
             missing_commands(
-                "Unable to create process using 'C:\\tools\\py\\python.exe -m pip': Access is denied."
+                "'node' is not recognized as an internal or external command,",
+                &path
             ),
-            vec![Path("C:\\tools\\py\\python.exe".into())]
+            vec!["node".to_string()]
         );
-        assert!(missing_commands("everything fine").is_empty());
-        // A path-shaped name is not a bare command.
-        assert!(missing_commands("The term './x/y' is not recognized as a name").is_empty());
+        assert_eq!(
+            missing_commands("bash: python3: command not found", &path),
+            vec!["python3".to_string()]
+        );
+        assert_eq!(
+            missing_commands("/bin/sh: 1: cargo: not found", &path),
+            vec!["cargo".to_string()]
+        );
+        // A path is accepted only when its parent is lexically a host PATH directory.
+        assert_eq!(
+            missing_commands(
+                "Unable to create process using 'C:\\tools\\py\\python.exe -m pip': Access is denied.",
+                &path
+            ),
+            vec!["python".to_string()]
+        );
+        assert!(missing_commands("everything fine", &path).is_empty());
+        assert!(missing_commands("The term './x/y' is not recognized as a name", &path).is_empty());
+    }
+
+    #[test]
+    fn output_naming_hostile_paths_or_names_never_reaches_a_filesystem_call() {
+        let path: Vec<String> = vec!["C:\\tools\\py".into()];
+        for hostile in [
+            // UNC, verbatim and device prefixes, even with an executable suffix.
+            "Unable to create process using '\\\\abcdef.attacker.net\\s\\a.exe': denied",
+            "Unable to create process using '//abcdef.attacker.net/s/a.exe': denied",
+            "Unable to create process using '\\\\?\\C:\\tools\\py\\python.exe': denied",
+            "Unable to create process using '\\\\.\\C:\\tools\\py\\python.exe': denied",
+            // A drive-relative path and a parent that is not a PATH directory.
+            "Unable to create process using 'C:foo\\python.exe': denied",
+            "Unable to create process using 'C:\\secrets\\python.exe': denied",
+            "Unable to create process using 'C:\\tools\\py\\..\\x\\python.exe': denied",
+            // Names with a drive prefix, separators or odd characters.
+            "The term 'C:foo' is not recognized as a name of a cmdlet",
+            "'..\\evil' is not recognized as an internal or external command,",
+            "bash: a b: command not found",
+            "bash: \u{e9}clair: command not found",
+        ] {
+            assert!(
+                missing_commands(hostile, &path).is_empty(),
+                "{hostile} produced a candidate"
+            );
+        }
+        assert_eq!(
+            command_name_from_path("C:\\TOOLS\\py\\Python.EXE", &path).as_deref(),
+            Some("python")
+        );
+        assert!(valid_command_name("python3.12"));
+        assert!(
+            !valid_command_name("C:foo") && !valid_command_name("") && !valid_command_name(".x")
+        );
     }
 
     #[test]
@@ -3846,15 +3963,6 @@ mod tests {
             None
         );
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(
-            toolchain_roots_setting("appcontainer"),
-            Some("windows-appcontainer-read-roots")
-        );
-        assert_eq!(
-            toolchain_roots_setting("bwrap"),
-            Some("sandbox-toolchain-roots")
-        );
-        assert_eq!(toolchain_roots_setting("seatbelt"), None);
         // No contained backend that supports roots: no hint, so no note.
         let seatbelt = Sandbox::new(true, "seatbelt");
         assert_eq!(
@@ -3887,6 +3995,71 @@ mod tests {
         assert!(!note.contains("NUL device"), "{note}");
     }
 
+    #[test]
+    fn failure_notes_name_the_key_that_would_enable_the_missing_capability() {
+        let off = Sandbox::new(true, "appcontainer");
+        let note = sandbox_failure_note(
+            &off,
+            false,
+            true,
+            "fatal: Unable to read current working directory: Permission denied",
+        )
+        .expect("working-directory failures are attributed");
+        assert!(
+            note.contains("windows-appcontainer-ancestor-listing"),
+            "{note}"
+        );
+        assert!(note.contains("elevated launcher"), "{note}");
+        let nul = sandbox_failure_note(
+            &off,
+            false,
+            true,
+            "fatal: could not open '/dev/null' for reading and writing: Permission denied",
+        )
+        .unwrap();
+        assert!(nul.contains("windows-appcontainer-null-device"), "{nul}");
+        assert!(nul.contains("elevated"), "{nul}");
+        // With the keys on, the notes stop recommending them (and say what elevation is for).
+        let on = Sandbox::new(true, "appcontainer")
+            .with_windows_ancestor_listing(true)
+            .with_windows_null_device(true);
+        let note = sandbox_failure_note(
+            &on,
+            false,
+            true,
+            "fatal: Unable to read current working directory: Permission denied",
+        )
+        .unwrap();
+        assert!(
+            !note.contains("windows-appcontainer-ancestor-listing"),
+            "{note}"
+        );
+        let nul = sandbox_failure_note(
+            &on,
+            false,
+            true,
+            "fatal: could not open '/dev/null' for reading and writing: Permission denied",
+        )
+        .unwrap();
+        assert!(nul.contains("only an elevated launcher"), "{nul}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_toolchain_hint_names_discovery_when_it_is_off_and_read_roots_when_it_is_on() {
+        let off = Sandbox::new(true, "appcontainer");
+        let note = sandbox_failure_note(&off, false, true, "bash: sh: command not found").unwrap();
+        assert!(
+            note.contains("windows-appcontainer-toolchain-discovery"),
+            "{note}"
+        );
+        assert!(note.contains("windows-appcontainer-read-roots"), "{note}");
+        let on = Sandbox::new(true, "appcontainer").with_windows_toolchain_discovery(true);
+        let note = sandbox_failure_note(&on, false, true, "bash: sh: command not found").unwrap();
+        assert!(!note.contains("toolchain-discovery"), "{note}");
+        assert!(note.contains("windows-appcontainer-read-roots"), "{note}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_failed_command_that_the_host_path_resolves_gets_the_toolchain_roots_hint() {
@@ -3897,6 +4070,14 @@ mod tests {
         assert!(note.contains("sandbox-toolchain-roots"), "{note}");
         assert!(note.contains("outside the sandbox's read roots"), "{note}");
         assert!(note.contains("exist on the host"), "{note}");
+        // The host directory is never shown to the model.
+        let directory = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .find(|dir| dir.join("sh").is_file())
+            .unwrap();
+        assert!(
+            !note.contains(directory.to_string_lossy().as_ref()),
+            "{note}"
+        );
         // Not on the host PATH either: a plain missing command is not the sandbox.
         assert_eq!(
             sandbox_failure_note(

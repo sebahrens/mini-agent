@@ -312,7 +312,19 @@ pub(crate) const CONFIG_KEYS: &[ConfigKey] = &[
         "windows-appcontainer-toolchain-discovery",
         &["windows_appcontainer_toolchain_discovery"],
     )
-    .described("Global-only: let the Windows AppContainer shell read and execute the install directories of the toolchains the host PATH resolves (python, node, npm, cargo, go, java, ...); never write. Default true; false limits reads to the workspace, cache and windows-appcontainer-read-roots.")
+    .described("Global-only: let the Windows AppContainer shell read and execute the install directories of the toolchains the host PATH resolves (python, node, npm, cargo, go, java, ...); never write. Default false (opt in); true grants only the toolchains a command names, and an administrator-owned install needs an elevated launcher.")
+    .shaped(ConfigShape::Bool),
+    aliased(
+        "windows-appcontainer-ancestor-listing",
+        &["windows_appcontainer_ancestor_listing"],
+    )
+    .described("Global-only: let the Windows AppContainer shell list the names, sizes and timestamps in each parent directory of the workspace (PowerShell Set-Location, cmd dir and Git need it); system-owned parents such as C:\\Users and the drive root need an elevated launcher. Default false.")
+    .shaped(ConfigShape::Bool),
+    aliased(
+        "windows-appcontainer-null-device",
+        &["windows_appcontainer_null_device"],
+    )
+    .described("Global-only: when mini-agent runs elevated, add the AppContainer to the NUL device access list for the life of each shell command (Git, redirections to nul, Python and Node DEVNULL need it). Default false; ignored without elevation.")
     .shaped(ConfigShape::Bool),
     aliased(
         "windows-appcontainer-write-roots",

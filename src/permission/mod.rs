@@ -382,6 +382,8 @@ pub(crate) struct ConfiguredSandboxKey {
     appcontainer_read_roots: Vec<std::path::PathBuf>,
     appcontainer_write_roots: Vec<std::path::PathBuf>,
     appcontainer_toolchain_discovery: bool,
+    appcontainer_ancestor_listing: bool,
+    appcontainer_null_device: bool,
     toolchain_roots: Vec<std::path::PathBuf>,
     network: crate::sandbox::SandboxNetwork,
     network_hosts: Vec<String>,
@@ -417,7 +419,11 @@ impl ConfiguredSandboxKey {
             appcontainer_write_roots: cli.resolve_windows_appcontainer_write_roots(cfg),
             appcontainer_toolchain_discovery: cfg
                 .windows_appcontainer_toolchain_discovery
-                .unwrap_or(true),
+                .unwrap_or(false),
+            appcontainer_ancestor_listing: cfg
+                .windows_appcontainer_ancestor_listing
+                .unwrap_or(false),
+            appcontainer_null_device: cfg.windows_appcontainer_null_device.unwrap_or(false),
             toolchain_roots: cli.resolve_sandbox_toolchain_roots(cfg),
             network: cli.resolve_sandbox_network(cfg),
             network_hosts: cfg.sandbox_network_hosts.clone(),
@@ -451,6 +457,8 @@ impl ConfiguredSandboxKey {
                 self.appcontainer_write_roots.clone(),
             )
             .with_windows_toolchain_discovery(self.appcontainer_toolchain_discovery)
+            .with_windows_ancestor_listing(self.appcontainer_ancestor_listing)
+            .with_windows_null_device(self.appcontainer_null_device)
             .with_bwrap_read_roots(self.toolchain_roots.clone())
             .with_network(self.network)
             .with_network_hosts(self.network_hosts.clone())

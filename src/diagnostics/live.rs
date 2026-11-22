@@ -181,6 +181,22 @@ pub(crate) async fn tool_in_sandbox(sandbox: &crate::sandbox::Sandbox, program: 
     }
 }
 
+/// The effective state of the three opt-in AppContainer shell extras.
+pub(crate) fn appcontainer_extras_line(sandbox: &crate::sandbox::Sandbox) -> String {
+    let state = |on: bool| if on { "on" } else { "off" };
+    let mut line = format!(
+        "ancestor-listing={}, null-device={}, toolchain-discovery={}",
+        state(sandbox.windows_ancestor_listing()),
+        state(sandbox.windows_null_device()),
+        state(sandbox.windows_toolchain_discovery()),
+    );
+    if sandbox.windows_toolchain_discovery() {
+        let roots = crate::sandbox::discovered_toolchain_root_count();
+        line.push_str(&format!(" ({roots} toolchain root(s) resolved)"));
+    }
+    line
+}
+
 /// Command names the sandboxed Python probe tries, in order. Windows has no
 /// `python3`: the interpreter is `python`, or the `py` launcher.
 pub(crate) fn python_probe_names() -> &'static [&'static str] {
@@ -286,8 +302,11 @@ pub(crate) async fn run_all(
         )
         .with_shell(&cli.resolve_shell(cfg))
         .with_windows_toolchain_discovery(
-            cfg.windows_appcontainer_toolchain_discovery.unwrap_or(true),
+            cfg.windows_appcontainer_toolchain_discovery
+                .unwrap_or(false),
         )
+        .with_windows_ancestor_listing(cfg.windows_appcontainer_ancestor_listing.unwrap_or(false))
+        .with_windows_null_device(cfg.windows_appcontainer_null_device.unwrap_or(false))
         .with_bwrap_read_roots(cli.resolve_sandbox_toolchain_roots(cfg))
         .with_workspace_binding(workspace);
     // Doctor is read-only: run the sandboxed probes against a throwaway cache
@@ -324,6 +343,22 @@ pub(crate) async fn run_all(
             false
         }
     };
+    if enabled && backend == "appcontainer" {
+        let for_line = sandbox.clone();
+        let line = tokio::task::spawn_blocking(move || appcontainer_extras_line(&for_line))
+            .await
+            .unwrap_or_else(|_| "unavailable".to_string());
+        checks.push(Check::of("appcontainer extras", Outcome::Pass(line)));
+        let retained = crate::sandbox::retained_stale_grants();
+        if retained > 0 {
+            checks.push(Check::of(
+                "stale grants",
+                Outcome::Warn(format!(
+                    "{retained} earlier session(s) left access grants an unelevated launcher could not remove; start mini-agent elevated once to clear them"
+                )),
+            ));
+        }
+    }
     if enabled && sandbox_ok {
         checks.push(Check::of(
             "sandboxed git",

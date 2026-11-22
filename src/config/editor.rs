@@ -124,6 +124,8 @@ pub(crate) fn prepare(
             | "sandbox_required"
             | "shell_auto_allow_sandboxed"
             | "windows_appcontainer_toolchain_discovery"
+            | "windows_appcontainer_ancestor_listing"
+            | "windows_appcontainer_null_device"
             | "permission_checks_required"
     ) {
         return Err("This setting can only be changed in global configuration");

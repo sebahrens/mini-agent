@@ -20,6 +20,9 @@
 //! max_network = "allowlist"                             # ceiling: deny | allowlist | allow
 //! allowed_hosts = ["registry.npmjs.org"]                # pin sandbox-network-hosts; no run-time approvals
 //! forbid_home_mounts = true                             # ignore sandbox-home-mounts
+//! forbid_windows_ancestor_listing = true                # force windows-appcontainer-ancestor-listing off
+//! forbid_windows_null_device = true                     # force windows-appcontainer-null-device off
+//! forbid_windows_toolchain_discovery = true             # force windows-appcontainer-toolchain-discovery off
 //! allowed_roots = ["/opt/toolchains"]                   # with max_profile: extra read/write/toolchain roots permitted
 //! # Any sandbox pin implies `required = true`.
 //!
@@ -75,6 +78,12 @@ struct SandboxPolicy {
     allowed_hosts: Option<Vec<String>>,
     /// Drop every `sandbox-home-mounts` entry.
     forbid_home_mounts: bool,
+    /// Force `windows-appcontainer-ancestor-listing` off.
+    forbid_windows_ancestor_listing: bool,
+    /// Force `windows-appcontainer-null-device` off.
+    forbid_windows_null_device: bool,
+    /// Force `windows-appcontainer-toolchain-discovery` off.
+    forbid_windows_toolchain_discovery: bool,
     /// With `max_profile`: absolute directories the explicit
     /// `sandbox-read-roots`, `sandbox-write-roots`, `sandbox-toolchain-roots`
     /// and Windows AppContainer roots may fall inside. Without this key, or
@@ -785,6 +794,9 @@ impl ManagedPolicy {
             || sandbox.max_network.is_some()
             || sandbox.allowed_hosts.is_some()
             || sandbox.forbid_home_mounts
+            || sandbox.forbid_windows_ancestor_listing
+            || sandbox.forbid_windows_null_device
+            || sandbox.forbid_windows_toolchain_discovery
             || sandbox.allowed_roots.is_some()
     }
 
@@ -1122,7 +1134,28 @@ impl ManagedPolicy {
         if sandbox.max_profile.is_some() {
             self.clamp_roots(cfg);
             // PATH-derived toolchain roots are not on the policy's allowed_roots list.
+            if cfg.windows_appcontainer_toolchain_discovery == Some(true) {
+                warn_once(
+                    cfg,
+                    format!(
+                        "windows-appcontainer-toolchain-discovery was turned off by the managed policy {file} (max_profile is set)"
+                    ),
+                );
+            }
             cfg.windows_appcontainer_toolchain_discovery = Some(false);
+            mark_managed(cfg, "windows-appcontainer-toolchain-discovery", true);
+        }
+        if sandbox.forbid_windows_ancestor_listing {
+            cfg.windows_appcontainer_ancestor_listing = Some(false);
+            mark_managed(cfg, "windows-appcontainer-ancestor-listing", true);
+        }
+        if sandbox.forbid_windows_null_device {
+            cfg.windows_appcontainer_null_device = Some(false);
+            mark_managed(cfg, "windows-appcontainer-null-device", true);
+        }
+        if sandbox.forbid_windows_toolchain_discovery {
+            cfg.windows_appcontainer_toolchain_discovery = Some(false);
+            mark_managed(cfg, "windows-appcontainer-toolchain-discovery", true);
         }
         if sandbox.forbid_home_mounts && !cfg.sandbox_home_mounts.is_empty() {
             cfg.sandbox_home_mounts.clear();
@@ -1232,6 +1265,28 @@ mod tests {
         assert_eq!(cfg.shell_auto_allow_sandboxed, Some(true));
         policy("[permissions]\nforbid_shell_auto_allow = true\n").apply(&mut cfg);
         assert_eq!(cfg.shell_auto_allow_sandboxed, Some(false));
+    }
+
+    #[test]
+    fn managed_policy_can_force_each_windows_appcontainer_extra_off() {
+        let mut cfg = crate::config::Config {
+            windows_appcontainer_ancestor_listing: Some(true),
+            windows_appcontainer_null_device: Some(true),
+            windows_appcontainer_toolchain_discovery: Some(true),
+            ..Default::default()
+        };
+        policy("[sandbox]\nforbid_windows_null_device = true\n").apply(&mut cfg);
+        assert_eq!(cfg.windows_appcontainer_null_device, Some(false));
+        assert_eq!(cfg.windows_appcontainer_ancestor_listing, Some(true));
+        assert_eq!(cfg.windows_appcontainer_toolchain_discovery, Some(true));
+        policy(
+            "[sandbox]\nforbid_windows_ancestor_listing = true\nforbid_windows_toolchain_discovery = true\n",
+        )
+        .apply(&mut cfg);
+        assert_eq!(cfg.windows_appcontainer_ancestor_listing, Some(false));
+        assert_eq!(cfg.windows_appcontainer_toolchain_discovery, Some(false));
+        let layers = &cfg.provenance.sources["windows-appcontainer-null-device"];
+        assert!(layers.contains(&crate::config::ConfigLayer::Managed));
     }
 
     #[test]
