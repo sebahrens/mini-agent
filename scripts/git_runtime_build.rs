@@ -89,6 +89,18 @@ fn digest_text(text: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+/// Where the bootstrap keeps its native build cache: under `CARGO_TARGET_DIR`
+/// when set (a relative value is relative to the package root, where Cargo
+/// runs the build), otherwise `<package>/target`. The source tree may be
+/// read-only, so a configured target directory is never bypassed.
+fn bootstrap_cache_root(root: &Path, target_dir: Option<std::ffi::OsString>) -> PathBuf {
+    let base = match target_dir.filter(|value| !value.is_empty()) {
+        Some(value) => root.join(PathBuf::from(value)),
+        None => root.join("target"),
+    };
+    base.join("git-runtime-bootstrap")
+}
+
 pub(crate) fn prepare_default(
     root: &Path,
     out: &Path,
@@ -110,12 +122,15 @@ pub(crate) fn prepare_default(
         key.update((bytes.len() as u64).to_le_bytes());
         key.update(bytes);
     }
+    let cache_root = bootstrap_cache_root(root, std::env::var_os("CARGO_TARGET_DIR"));
     let command = || {
         let mut command = Command::new(python);
         command
             .arg(root.join("scripts/build-git-runtime.py"))
             .arg("--target")
             .arg(target)
+            .arg("--cache-root")
+            .arg(&cache_root)
             .current_dir(root)
             .stdin(Stdio::null())
             .stderr(Stdio::inherit());
@@ -160,7 +175,10 @@ pub(crate) fn prepare_default(
             .status()
             .map_err(|error| format!("Cannot start pinned Git bootstrap: {error}. Install Python 3 or set MINI_AGENT_GIT_PYTHON; cross/Windows builds may supply MINI_AGENT_GIT_RUNTIME_BUNDLE."))?;
         if !status.success() {
-            return Err("Pinned Git bootstrap failed; provision its documented native dependencies (Debian/Ubuntu: apt install build-essential libcurl4-openssl-dev zlib1g-dev python3; Fedora: dnf install gcc make libcurl-devel zlib-devel python3; macOS: xcode-select --install) or supply MINI_AGENT_GIT_RUNTIME_BUNDLE for the exact target".into());
+            return Err(format!(
+                "Pinned Git bootstrap failed (its native build cache is {}, which must be writable: set CARGO_TARGET_DIR to a writable directory when the source tree is read-only); if the cause is not the cache, provision its documented native dependencies (Debian/Ubuntu: apt install build-essential libcurl4-openssl-dev zlib1g-dev python3; Fedora: dnf install gcc make libcurl-devel zlib-devel python3; macOS: xcode-select --install) or supply MINI_AGENT_GIT_RUNTIME_BUNDLE for the exact target",
+                cache_root.display()
+            ));
         }
     }
     // An existing output is still checked in full. Do not repair or replace it.
@@ -282,6 +300,27 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const TARGET: &str = "aarch64-unknown-linux-gnu";
+
+    #[test]
+    fn bootstrap_cache_honours_cargo_target_dir() {
+        let root = Path::new("/src/mini-agent");
+        assert_eq!(
+            bootstrap_cache_root(root, None),
+            Path::new("/src/mini-agent/target/git-runtime-bootstrap")
+        );
+        assert_eq!(
+            bootstrap_cache_root(root, Some("".into())),
+            Path::new("/src/mini-agent/target/git-runtime-bootstrap")
+        );
+        assert_eq!(
+            bootstrap_cache_root(root, Some("/target".into())),
+            Path::new("/target/git-runtime-bootstrap")
+        );
+        assert_eq!(
+            bootstrap_cache_root(root, Some("out/t".into())),
+            Path::new("/src/mini-agent/out/t/git-runtime-bootstrap")
+        );
+    }
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
     struct Fixture(PathBuf);
