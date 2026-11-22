@@ -488,7 +488,7 @@ mod tests {
         assert!(
             recipe.contains(&format!(
                 "windows-appcontainer-read-roots = ['{}']",
-                install.display()
+                crate::sandbox::strip_verbatim_prefix(&install.to_string_lossy())
             )),
             "{recipe}"
         );

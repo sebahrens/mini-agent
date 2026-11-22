@@ -9985,8 +9985,8 @@ mod tests {
         .unwrap();
         update_access_ace(&file, true, sid.0, GRANT_ACCESS, FILE_GENERIC_READ).unwrap();
         // The grant reached the tree...
-        let (_, inherited) = exact_sid_rights(&root.join("inner").join("own.txt"), sid.0).unwrap();
-        assert_eq!(inherited & FILE_GENERIC_READ, FILE_GENERIC_READ);
+        let (own, _) = exact_sid_rights(&root.join("inner").join("own.txt"), sid.0).unwrap();
+        assert_eq!(own & FILE_GENERIC_READ, FILE_GENERIC_READ);
         // ...and did not cross the junction into the target.
         assert_eq!(
             exact_sid_rights(&outside.join("secret.txt"), sid.0).unwrap(),
