@@ -11723,7 +11723,8 @@ mod sandbox_tests {
 
     #[test]
     fn git_service_read_roots_grant_each_runtime_file_once() {
-        let (_scratch, root) = canonical_scratch();
+        let scratch = TempDir::new("runtime-roots");
+        let root = scratch.path().to_path_buf();
         std::fs::write(root.join("git.exe"), b"x").unwrap();
         std::fs::write(root.join("libcurl.dll"), b"x").unwrap();
         std::fs::create_dir(root.join("nested")).unwrap();
