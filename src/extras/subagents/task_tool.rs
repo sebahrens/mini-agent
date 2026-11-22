@@ -1011,6 +1011,16 @@ fn render_task_brief_for(
     Ok(rendered)
 }
 
+/// Hold children after the first until `stagger` past the call's start.
+async fn stagger_start(index: usize, stagger: Duration, call_started: Instant) {
+    if index > 0 && !stagger.is_zero() {
+        tokio::time::sleep_until(call_started + stagger).await;
+    }
+}
+
+/// Ceiling of `[subagents] task_stagger_ms`.
+const MAX_STAGGER_MS: u64 = 5_000;
+
 /// Most sibling lines one child is told about.
 const MAX_SIBLING_LINES: usize = 8;
 /// Longest sibling objective line, in characters.
@@ -1242,6 +1252,7 @@ fn resolve_persona_runtime_with(
             memory_dir: None,
             omit_instructions: specialization.extras.omit_instructions,
             git_status: None,
+            prefix_slot: None,
             omit_architecture: specialization.extras.omit_architecture,
             #[cfg(feature = "mcp")]
             mcp_servers: specialization.mcp_servers.clone(),
@@ -2412,6 +2423,14 @@ partial statuses are returned.")
         let shared_mcp = SharedPersonaMcp::default();
         #[cfg(feature = "mcp")]
         let executor_mcp = shared_mcp.clone();
+        let stagger = Duration::from_millis(
+            config
+                .subagents
+                .as_ref()
+                .and_then(|policy| policy.task_stagger_ms)
+                .unwrap_or(0)
+                .min(MAX_STAGGER_MS),
+        );
         let executor: TaskExecutor = {
             let plan = ChildPlan {
                 runtime,
@@ -2443,6 +2462,9 @@ partial statuses are returned.")
                 specialization,
                 child_name,
                 sibling_objectives: Arc::new(sibling_objectives(&prompts)),
+                call_id: uuid::Uuid::new_v4().simple().to_string().into(),
+                stagger,
+                call_started: Instant::now(),
                 pool_weak: pool_weak.clone(),
                 spend_profile,
                 resume_history,
@@ -2640,6 +2662,12 @@ struct ChildPlan {
     child_name: String,
     /// One-line objective of every child of this call, in input order.
     sibling_objectives: Arc<Vec<String>>,
+    /// Id shared by the children of this call, for telemetry.
+    call_id: Arc<str>,
+    /// Trial `[subagents] task_stagger_ms`: children after the first start
+    /// this long after the call began (zero: all start at once).
+    stagger: Duration,
+    call_started: Instant,
     pool_weak: Option<std::sync::Weak<super::background::Pool>>,
     spend_profile: Option<crate::spend::run::Run>,
     resume_history: Option<Arc<Vec<Message>>>,
@@ -2694,6 +2722,9 @@ impl ChildPlan {
             specialization,
             child_name,
             sibling_objectives,
+            call_id,
+            stagger,
+            call_started,
             pool_weak,
             spend_profile,
             resume_history,
@@ -2759,6 +2790,8 @@ impl ChildPlan {
             .as_ref()
             .map(super::inbox::ChildInbox::running_guard);
         persona.inline_images = inline_cap;
+        let prefix_slot: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+        persona.prefix_slot = Some(prefix_slot.clone());
         let event_tx = subagent_event_tx.clone();
         #[cfg(feature = "mcp")]
         let isolated_child = isolation.is_some();
@@ -2812,6 +2845,10 @@ impl ChildPlan {
         let future = crate::startup::heap_future(|| async move {
             // Held for the child's whole run: dropping it ends delivery.
             let _inbox_guard = inbox_guard;
+            // The trial stagger: siblings begin a little after the first, so
+            // they can read its prompt cache. A start-time offset, so later
+            // waves find it already past.
+            stagger_start(index, stagger, call_started).await;
             if let Some(spend) = &spend_profile
                 && let Err(error) = spend.admit()
             {
@@ -3354,6 +3391,12 @@ impl ChildPlan {
                     pool.session_id(),
                     super::telemetry::ChildTelemetry {
                         agent: report_name.to_string(),
+                        call: call_id.to_string(),
+                        prefix: prefix_slot
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone()
+                            .unwrap_or_default(),
                         contract: contract_outcome,
                         repair_used,
                         host_replaced: matches!(
@@ -7026,6 +7069,27 @@ fn main() {
         assert_eq!(brief.context, None);
         assert_eq!(brief.known, ["the cache is warm"]);
         assert_eq!(brief.done_when.as_deref(), Some("named"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn staggered_children_start_after_the_first_and_late_waves_are_not_delayed() {
+        let started = Instant::now();
+        let stagger = Duration::from_millis(800);
+        stagger_start(0, stagger, started).await;
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "the first child starts at once"
+        );
+        stagger_start(1, stagger, started).await;
+        assert_eq!(started.elapsed(), stagger);
+        // A later wave finds the offset already past.
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let before = Instant::now();
+        stagger_start(5, stagger, started).await;
+        assert_eq!(before.elapsed(), Duration::ZERO);
+        // Off by default.
+        stagger_start(3, Duration::ZERO, Instant::now()).await;
     }
 
     #[test]

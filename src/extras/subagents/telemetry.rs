@@ -35,10 +35,28 @@ pub(crate) enum ContractOutcome {
     None,
 }
 
+/// A short fingerprint of a child's system prompt and tool names: equal
+/// fingerprints mean a byte-identical cacheable prefix.
+pub(crate) fn prefix_fingerprint(preamble: &str, tool_names: &[String]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(preamble.as_bytes());
+    for name in tool_names {
+        digest.update([0]);
+        digest.update(name.as_bytes());
+    }
+    crate::hex::encode_lower(digest.finalize())[..16].to_owned()
+}
+
 /// What one finished child did and cost.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct ChildTelemetry {
     pub agent: String,
+    /// Id shared by the children of one `task` call.
+    pub call: String,
+    /// [`prefix_fingerprint`] of the child's system prompt and tool names
+    /// (empty when the child never built an agent).
+    pub prefix: String,
     pub contract: ContractOutcome,
     /// The contract repair turn ran for this child.
     pub repair_used: bool,
@@ -108,9 +126,21 @@ pub(crate) fn delegation_json(
         "total_tokens": sum(&|row| row.total_tokens),
         "cached_input_tokens": sum(&|row| row.cached_input_tokens),
         "cost_units": sum(&|row| row.cost_units),
+        "calls_with_differing_prefixes": differing_prefix_calls(rows),
         "rows_truncated": finished > rows.len(),
         "rows": rows,
     }))
+}
+
+/// How many `task` calls had children whose cacheable prefix differed. Zero
+/// is expected for siblings of one persona; isolated worktree children differ
+/// by working directory by design.
+fn differing_prefix_calls(rows: &[ChildTelemetry]) -> usize {
+    let mut calls: HashMap<&str, std::collections::BTreeSet<&str>> = HashMap::new();
+    for row in rows.iter().filter(|row| !row.prefix.is_empty()) {
+        calls.entry(&row.call).or_default().insert(&row.prefix);
+    }
+    calls.values().filter(|prefixes| prefixes.len() > 1).count()
 }
 
 #[cfg(test)]
@@ -163,6 +193,34 @@ mod tests {
         assert_eq!(json["rows"][1]["contract"], "repaired");
         assert!(delegation_json(&[], 0).is_none());
         assert!(report("another-session").0.is_empty());
+    }
+
+    #[test]
+    fn siblings_with_one_prefix_are_not_flagged_and_a_differing_one_is() {
+        let child = |call: &str, prefix: &str| ChildTelemetry {
+            call: call.into(),
+            prefix: prefix.into(),
+            ..Default::default()
+        };
+        let same = vec![child("a", "p1"), child("a", "p1"), child("b", "p2")];
+        assert_eq!(differing_prefix_calls(&same), 0);
+        let differing = vec![
+            child("a", "p1"),
+            child("a", "p9"),
+            child("b", "p2"),
+            child("b", ""),
+        ];
+        assert_eq!(differing_prefix_calls(&differing), 1);
+        let one = prefix_fingerprint("prompt", &["read".into(), "grep".into()]);
+        assert_eq!(
+            one,
+            prefix_fingerprint("prompt", &["read".into(), "grep".into()])
+        );
+        assert_ne!(
+            one,
+            prefix_fingerprint("prompt", &["grep".into(), "read".into()])
+        );
+        assert_eq!(one.len(), 16);
     }
 
     #[test]

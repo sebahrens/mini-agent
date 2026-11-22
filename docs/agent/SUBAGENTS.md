@@ -824,7 +824,13 @@ whether the repair or a write-up turn ran, its stop reason (`completed`,
 `turn_budget`, `deadline`, `failed`), turns, tool calls, tokens, cached input
 tokens and cost units. A headless JSON result aggregates it as
 `subagent_delegation` next to `subagent_usage`. The delegated-versus-direct lane
-that consumes it is described in [HARNESS_EVAL.md](HARNESS_EVAL.md).
+that consumes it is described in [HARNESS_EVAL.md](HARNESS_EVAL.md). Rows also
+carry a fingerprint of the child's system prompt and tool names, and the
+aggregate reports `calls_with_differing_prefixes` (children of one call that did
+not share a byte-identical cacheable prefix; zero is expected, isolated worktree
+children differ by working directory). The cached input tokens per child are in
+the same rows. A live four-child call with and without `task_stagger_ms` still
+has to compare the cached-token ratios.
 
 ### Evidence handles
 
@@ -1320,6 +1326,7 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `[subagents] agent_memory` / `agent_hooks` | `bool` | `false` | Opt in to a persona's `memory:` notes directory and `hooks:` frontmatter (project config needs trust) |
 | `[subagents] headless_exit_wait_secs` | `u64` | `300` | Seconds a headless run waits at exit for running background tasks before cancelling them (at most 3600; `0` cancels at once) |
 | `[subagents] task_max_turns_ceiling` | `usize` | `100` | Highest per-call or persona `max_turns`; larger values are rejected |
+| `[subagents] task_stagger_ms` | `u64` | `0` | Trial: the second and later children of a call start this many milliseconds after the call began (at most 5000), so they can read the first child's prompt cache; later waves are not delayed. Off by default pending the cache measurement below |
 | `[subagents] task_unverified_bytes` | `usize` | `6144` | Raw text of a host-replaced report kept for `/tasks result` (at most 16384) |
 | `[subagents] task_timeout_ceiling_secs` | `u64` | `3600` | Highest per-call or persona `timeout_secs` (at most 86400); larger values are rejected |
 | `task_enabled`              | `bool`   | `true`                   | Whether the `task` tool is registered |

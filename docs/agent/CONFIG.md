@@ -5075,6 +5075,10 @@ location is a private scratch directory; the workspace stays read-only.
 `web_fetch`/`web_search` the parent's eligible web tools. See
 [Opt-in read-only shell and web tools](SUBAGENTS.md#opt-in-read-only-shell-and-web-tools).
 
+`[subagents] task_stagger_ms` (default 0, at most 5000) is a trial: the second and later
+children of a call start that many milliseconds after the first so they can read its prompt
+cache. See [Subagents](SUBAGENTS.md).
+
 `[subagents] task_unverified_bytes` (default 6144, at most 16384) bounds the
 raw text of a host-replaced child report that `/tasks result <id>` shows the
 user (never the model). Persona frontmatter `contract: none` skips the report
