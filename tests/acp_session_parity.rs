@@ -604,6 +604,47 @@ fn acp53_stdio_feature_off_refuses_input_and_saved_images_without_mutation_or_ht
 }
 
 #[test]
+fn acp_reloading_a_live_session_keeps_the_permission_mode_the_client_set() {
+    // mini-agent-w7thh: session/load of an id this process still holds replaces
+    // it with the saved copy; the mode chosen with session/set_mode is runtime
+    // state, never saved, and must not silently fall back to the default.
+    let roots = Roots::new();
+    let mut provider = Provider::start(&roots);
+    let mut peer = Peer::start_with_read(&roots, true);
+    peer.request(
+        1,
+        "initialize",
+        serde_json::json!({"protocolVersion":1,"clientCapabilities":{}}),
+    );
+    let created = peer.request(
+        2,
+        "session/new",
+        serde_json::json!({"cwd":roots.0,"mcpServers":[]}),
+    );
+    let id = created["sessionId"].as_str().unwrap().to_owned();
+    let initial = created["modes"]["currentModeId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(initial, "readonly");
+    peer.request(3, "session/prompt", serde_json::json!({"sessionId":id,"prompt":[{"type":"text","text":"/rename reload keeps mode"}]}));
+    peer.request(
+        4,
+        "session/set_mode",
+        serde_json::json!({"sessionId":id,"modeId":"readonly"}),
+    );
+    let loaded = peer.request(
+        5,
+        "session/load",
+        serde_json::json!({"sessionId":id,"cwd":roots.0,"mcpServers":[]}),
+    );
+    assert_eq!(loaded["modes"]["currentModeId"], "readonly");
+    peer.request(6, "session/close", serde_json::json!({"sessionId":id}));
+    peer.finish();
+    assert!(provider.finish().is_empty());
+}
+
+#[test]
 fn acp53_stdio_live_writer_refusal_does_not_fork_or_release_another_process() {
     let roots = Roots::new();
     let mut provider = Provider::start(&roots);
