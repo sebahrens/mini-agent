@@ -198,6 +198,7 @@ EXPECTED_RELEASE_ARCHIVES = (
     "mini-agent-x86_64-unknown-linux-musl.tar.gz",
     "mini-agent-aarch64-unknown-linux-musl.tar.gz",
     "mini-agent-x86_64-pc-windows-msvc.tar.gz",
+    "mini-agent-aarch64-pc-windows-msvc.tar.gz",
     "mini-agent-lite-x86_64-unknown-linux-gnu.tar.gz",
     "mini-agent-lite-aarch64-unknown-linux-gnu.tar.gz",
     "mini-agent-lite-x86_64-apple-darwin.tar.gz",
@@ -205,6 +206,7 @@ EXPECTED_RELEASE_ARCHIVES = (
     "mini-agent-lite-x86_64-unknown-linux-musl.tar.gz",
     "mini-agent-lite-aarch64-unknown-linux-musl.tar.gz",
     "mini-agent-lite-x86_64-pc-windows-msvc.tar.gz",
+    "mini-agent-lite-aarch64-pc-windows-msvc.tar.gz",
     "mini-agent-${GITHUB_REF_NAME}-source.tar.gz",
 )
 # The release workflow reads the version once from Cargo.toml in the

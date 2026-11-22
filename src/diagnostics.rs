@@ -618,6 +618,20 @@ fn warning_classes(warnings: &[String]) -> Vec<(&str, usize)> {
     classes
 }
 
+/// One-line startup warning when the x64 Windows build runs under emulation on an ARM64 host.
+/// `identifier` is the host's `PROCESSOR_IDENTIFIER` (an ARM64 host reports an "ARMv8" or "ARM"
+/// family string even for an emulated x64 process).
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+pub(crate) fn x64_on_arm64_notice(identifier: Option<&str>) -> Option<&'static str> {
+    let identifier = identifier?.trim_start();
+    if !identifier.to_ascii_lowercase().starts_with("arm") {
+        return None;
+    }
+    Some(
+        "this x64 build is running under emulation on a Windows ARM64 host; the shell, git and js tools are unavailable and startup is slow. Install the native aarch64-pc-windows-msvc release archive instead",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -865,5 +879,14 @@ mod tests {
             directory_bytes(&root.path().join("directory-link")),
             "not a regular directory"
         );
+    }
+
+    #[test]
+    fn x64_on_arm64_notice_names_the_limitation_only_for_arm_hosts() {
+        let arm = "ARMv8 (64-bit) Family 8 Model 1 Revision 201, Qualcomm Technologies Inc";
+        let notice = super::x64_on_arm64_notice(Some(arm)).expect("ARM host");
+        assert!(notice.contains("emulation") && notice.contains("aarch64-pc-windows-msvc"));
+        assert!(super::x64_on_arm64_notice(Some("Intel64 Family 6 Model 85")).is_none());
+        assert!(super::x64_on_arm64_notice(None).is_none());
     }
 }

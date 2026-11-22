@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build a native x64 Windows Git payload in an explicitly provisioned MSYS2 UCRT64 shell.
+"""Build a native Windows Git payload in an explicitly provisioned MSYS2 shell.
+
+x86_64-pc-windows-msvc uses the UCRT64 environment (gcc); aarch64-pc-windows-msvc uses CLANGARM64
+(clang) on a Windows ARM64 host. Each builds only for its own architecture; there is no cross build.
 
 Run with /usr/bin/python3 (MSYS POSIX Python), not the MinGW/Windows Python.
 No toolchain, packages or source are downloaded by this helper.
@@ -22,6 +25,22 @@ import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "x86_64-pc-windows-msvc"
+# Per-target MSYS2 environment. "machine" is the PE COFF machine every bundled image must have.
+PROFILES = {
+    "x86_64-pc-windows-msvc": {
+        "msystem": "UCRT64", "prefix": "/ucrt64", "compiler": "gcc", "machine": 0x8664,
+        "triples": frozenset({"x86_64-w64-mingw32"}), "arch": "AMD64",
+        "package_prefix": "mingw-w64-ucrt-x86_64", "powershell_timeout": 30,
+    },
+    "aarch64-pc-windows-msvc": {
+        "msystem": "CLANGARM64", "prefix": "/clangarm64", "compiler": "clang", "machine": 0xAA64,
+        "triples": frozenset({"aarch64-w64-windows-gnu", "aarch64-w64-mingw32"}), "arch": "ARM64",
+        "package_prefix": "mingw-w64-clang-aarch64",
+        # The MSYS2 userland on Windows ARM64 is x64 under emulation; its first PowerShell/.NET
+        # start measured well above 30 s on hosted runners.
+        "powershell_timeout": 300,
+    },
+}
 # Windows 10+ system contracts only. Every other import must be bundled.
 SYSTEM_DLLS = frozenset("""
 advapi32.dll authz.dll bcrypt.dll bcryptprimitives.dll cfgmgr32.dll comdlg32.dll
@@ -86,7 +105,7 @@ def validate_cache_acl(record: dict) -> None:
         seen.add(rule["sid"])
 
 
-def private_directory(path: Path, env: dict[str, str]) -> None:
+def private_directory(path: Path, env: dict[str, str], timeout: int = 30) -> None:
     # Reject MSYS symlinks before invoking native APIs; native reparse points
     # are independently rejected after opening the actual Windows path.
     if path.is_symlink() or (path.exists() and not stat.S_ISDIR(path.lstat().st_mode)):
@@ -100,7 +119,7 @@ def private_directory(path: Path, env: dict[str, str]) -> None:
         raise ValueError("Windows cache security paths are unavailable")
     security_env = env.copy()
     security_env["MINI_AGENT_GIT_BUILD_DIRECTORY"] = windows_path
-    response = subprocess.run([powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PRIVATE_CACHE_SCRIPT], env=security_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30, check=True)
+    response = subprocess.run([powershell, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", PRIVATE_CACHE_SCRIPT], env=security_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=True)
     if len(response.stdout) > 16384:
         raise ValueError("Native cache security record exceeds bound")
     validate_cache_acl(json.loads(response.stdout))
@@ -126,8 +145,8 @@ def system_dll(name: str) -> bool:
     return name in SYSTEM_DLLS or bool(re.fullmatch(r"(?:api|ext)-ms-win-[a-z0-9-]+\.dll", name))
 
 
-def pe_dependencies(data: bytes) -> set[str]:
-    """Bounded PE32+ AMD64 import, delay-import and export-forwarder names.
+def pe_dependencies(data: bytes, expected_machine: int = 0x8664, arch: str = "AMD64") -> set[str]:
+    """Bounded PE32+ (AMD64 or ARM64) import, delay-import and export-forwarder names.
 
     Layout follows Microsoft's PE/COFF specification. No payload is executed.
     """
@@ -143,8 +162,8 @@ def pe_dependencies(data: bytes) -> set[str]:
         raise ValueError("Invalid Windows PE signature")
     machine, count, _, _, _, optional_size, _ = unpack("<HHIIIHH", pe + 4)
     optional = pe + 24
-    if machine != 0x8664 or not 1 <= count <= 96 or optional_size < 240 or unpack("<H", optional)[0] != 0x20B:
-        raise ValueError("Windows Git payload must be native AMD64 PE32+")
+    if machine != expected_machine or not 1 <= count <= 96 or optional_size < 240 or unpack("<H", optional)[0] != 0x20B:
+        raise ValueError(f"Windows Git payload must be native {arch} PE32+")
     directories, = unpack("<I", optional + 108)
     if directories < 14:
         raise ValueError("Incomplete Windows PE directory table")
@@ -214,7 +233,8 @@ def pe_dependencies(data: bytes) -> set[str]:
     return dependencies
 
 
-def dependency_closure(programs: list[Path], library_bin: Path, read) -> list[Path]:
+def dependency_closure(programs: list[Path], library_bin: Path, read, target: str = TARGET) -> list[Path]:
+    profile = PROFILES[target]
     candidates = {}
     for index, file in enumerate(library_bin.iterdir()):
         if index >= 8192:
@@ -233,7 +253,7 @@ def dependency_closure(programs: list[Path], library_bin: Path, read) -> list[Pa
         total += len(data)
         if total > 256 * 1024 * 1024:
             raise ValueError("Windows Git dependency closure exceeds bound")
-        for name in pe_dependencies(data):
+        for name in pe_dependencies(data, profile["machine"], profile["arch"]):
             if name.startswith(("msys-", "cygwin")):
                 raise ValueError("Native Windows Git cannot depend on an MSYS/Cygwin runtime")
             if system_dll(name):
@@ -248,16 +268,18 @@ def dependency_closure(programs: list[Path], library_bin: Path, read) -> list[Pa
     return [captured[name] for name in sorted(captured)]
 
 
-def toolchain_environment(prefix: Path) -> dict[str, str]:
-    if os.name != "posix" or not sys.platform.startswith(("msys", "cygwin")) or os.environ.get("MSYSTEM") != "UCRT64":
-        raise ValueError("Run with MSYS2 /usr/bin/python3 in a native UCRT64 shell")
+def toolchain_environment(prefix: Path, target: str = TARGET) -> dict[str, str]:
+    profile = PROFILES[target]
+    msystem = profile["msystem"]
+    if os.name != "posix" or not sys.platform.startswith(("msys", "cygwin")) or os.environ.get("MSYSTEM") != msystem:
+        raise ValueError(f"Run with MSYS2 /usr/bin/python3 in a native {msystem} shell")
     if not prefix.is_absolute() or not re.fullmatch(r"/[A-Za-z0-9_./-]+", str(prefix)) or ".." in prefix.parts:
-        raise ValueError("UCRT64 prefix must be an explicit absolute build path without Make metacharacters")
+        raise ValueError(f"{msystem} prefix must be an explicit absolute build path without Make metacharacters")
     env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_") and key not in {"MINI_AGENT_GIT_GLOBAL_SNAPSHOT", "MAKEFLAGS", "MFLAGS"}}
-    env.update(PATH=str(prefix / "bin") + ":/usr/bin:/bin", MINGW_PREFIX=str(prefix), MSYSTEM="UCRT64")
-    machine = subprocess.check_output([str(prefix / "bin/gcc"), "-dumpmachine"], env=env, text=True, timeout=30).strip()
-    if machine != "x86_64-w64-mingw32":
-        raise ValueError("UCRT64 compiler is not native x86-64 MinGW")
+    env.update(PATH=str(prefix / "bin") + ":/usr/bin:/bin", MINGW_PREFIX=str(prefix), MSYSTEM=msystem)
+    machine = subprocess.check_output([str(prefix / "bin" / profile["compiler"]), "-dumpmachine"], env=env, text=True, timeout=30).strip()
+    if machine not in profile["triples"]:
+        raise ValueError(f"{msystem} compiler is not a native {profile['arch']} MinGW compiler")
     backends = subprocess.check_output([str(prefix / "bin/curl-config"), "--ssl-backends"], env=env, text=True, timeout=30).strip().lower()
     if backends != "schannel":
         raise ValueError("Provision curl-winssl with Schannel only; no external CA/provider path is bundled")
@@ -275,19 +297,21 @@ def require_cmp(env: dict[str, str]) -> None:
         raise ValueError("Required /usr/bin/cmp is missing or unusable; install MSYS2 diffutils before building Git") from error
 
 
-def require_pcre2_header(prefix: Path, env: dict[str, str]) -> None:
+def require_pcre2_header(prefix: Path, env: dict[str, str], target: str = TARGET) -> None:
+    profile = PROFILES[target]
     # The pinned MinGW configuration enables PCRE2. Check its actual header
     # with the already-validated compiler, without writing or running a binary.
     source = b"#define PCRE2_CODE_UNIT_WIDTH 8\n#include <pcre2.h>\n"
     try:
-        subprocess.run([str(prefix / "bin/gcc"), "-x", "c", "-fsyntax-only", "-"],
+        subprocess.run([str(prefix / "bin" / profile["compiler"]), "-x", "c", "-fsyntax-only", "-"],
                        input=source, env=env, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=10, check=True)
     except (OSError, subprocess.SubprocessError) as error:
-        raise ValueError("Required UCRT64 pcre2.h is missing or unusable; install mingw-w64-ucrt-x86_64-pcre2 before building Git") from error
+        raise ValueError(f"Required {profile['msystem']} pcre2.h is missing or unusable; install {profile['package_prefix']}-pcre2 before building Git") from error
 
 
-def bootstrap(*, output: Path, source_archive: Path, policy_patch: Path, cache_root: Path, toolchain_prefix: Path, jobs: int) -> Path:
+def bootstrap(*, output: Path, source_archive: Path, policy_patch: Path, cache_root: Path, toolchain_prefix: Path, jobs: int, target: str = TARGET) -> Path:
+    profile = PROFILES[target]
     if not 1 <= jobs <= 64:
         raise ValueError("Git bootstrap jobs must be between 1 and 64")
     common = common_module()
@@ -300,14 +324,14 @@ def bootstrap(*, output: Path, source_archive: Path, policy_patch: Path, cache_r
     output = output.absolute()
     if output.exists() or output.is_symlink():
         raise ValueError("Windows Git bundle output must not already exist")
-    env = toolchain_environment(toolchain_prefix)
+    env = toolchain_environment(toolchain_prefix, target)
     require_cmp(env)
-    require_pcre2_header(toolchain_prefix, env)
+    require_pcre2_header(toolchain_prefix, env, target)
     cache_root = cache_root.absolute()
     cache_root.parent.mkdir(parents=True, exist_ok=True)
-    private_directory(cache_root, env)
-    native_cache = cache_root / TARGET
-    private_directory(native_cache, env)
+    private_directory(cache_root, env, profile["powershell_timeout"])
+    native_cache = cache_root / target
+    private_directory(native_cache, env, profile["powershell_timeout"])
     # Fresh build only: CI provisions the compiler and DLLs explicitly. No cache
     # can retain an obsolete dependency package across a toolchain update.
     # Every build owns fresh staging; no shared cached artifact is consumed,
@@ -318,11 +342,11 @@ def bootstrap(*, output: Path, source_archive: Path, policy_patch: Path, cache_r
         patch_file = staging / "policy.patch"
         patch_file.write_bytes(patch)
         common.run(["/usr/bin/patch", "--batch", "--fuzz=0", "-p1", "-i", str(patch_file)], source, env)
-        common.run(["/usr/bin/make", f"-j{jobs}", "NO_RUST=YesPlease", "NO_GETTEXT=YesPlease", "NO_TCLTK=YesPlease", "NO_PERL=YesPlease", "NO_PYTHON=YesPlease", "NO_OPENSSL=YesPlease", "NO_INSTALL_HARDLINKS=YesPlease", "NO_GITWEB=YesPlease", f"CC={toolchain_prefix}/bin/gcc", f"CURL_CONFIG={toolchain_prefix}/bin/curl-config", "CFLAGS=-O2", f"prefix={toolchain_prefix}", "git.exe", "git-remote-http.exe"], source, env)
+        common.run(["/usr/bin/make", f"-j{jobs}", "NO_RUST=YesPlease", "NO_GETTEXT=YesPlease", "NO_TCLTK=YesPlease", "NO_PERL=YesPlease", "NO_PYTHON=YesPlease", "NO_OPENSSL=YesPlease", "NO_INSTALL_HARDLINKS=YesPlease", "NO_GITWEB=YesPlease", f"CC={toolchain_prefix}/bin/{profile['compiler']}", f"CURL_CONFIG={toolchain_prefix}/bin/curl-config", "CFLAGS=-O2", f"prefix={toolchain_prefix}", "git.exe", "git-remote-http.exe"], source, env)
         programs = [source / "git.exe", source / "git-remote-http.exe"]
-        libraries = dependency_closure(programs, toolchain_prefix / "bin", common.read_regular)
+        libraries = dependency_closure(programs, toolchain_prefix / "bin", common.read_regular, target)
         producer = common.prepare_module()
-        producer.prepare(root=ROOT, target=TARGET, source_archive=source_archive, git=programs[0], http_helper=programs[1], https_helper=None, libraries=libraries, output=output)
+        producer.prepare(root=ROOT, target=target, source_archive=source_archive, git=programs[0], http_helper=programs[1], https_helper=None, libraries=libraries, output=output)
         # Version check uses ONLY the captured payload DLLs and Windows OS
         # directories. UCRT64/bin is deliberately absent from this PATH.
         try:
@@ -343,15 +367,16 @@ def bootstrap(*, output: Path, source_archive: Path, policy_patch: Path, cache_r
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--target", default=TARGET, choices=[TARGET])
+    parser.add_argument("--target", default=TARGET, choices=sorted(PROFILES))
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--source-archive", type=Path, default=ROOT / "scripts/git-runtime/git-2.56.0.tar.xz")
     parser.add_argument("--policy-patch", type=Path, default=ROOT / "scripts/git-runtime/policy.patch")
     parser.add_argument("--cache-root", type=Path, default=ROOT / "target/git-runtime-bootstrap")
-    parser.add_argument("--toolchain-prefix", type=Path, default=Path("/ucrt64"))
+    parser.add_argument("--toolchain-prefix", type=Path, default=None, help="default: /ucrt64 or /clangarm64 by target")
     parser.add_argument("--jobs", type=int, default=min(os.cpu_count() or 1, 8))
     args = vars(parser.parse_args())
-    args.pop("target")
+    if args["toolchain_prefix"] is None:
+        args["toolchain_prefix"] = Path(PROFILES[args["target"]]["prefix"])
     def interrupt(_signum, _frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupt)
