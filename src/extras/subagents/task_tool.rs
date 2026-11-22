@@ -420,7 +420,14 @@ struct TaskLimits {
     timeout: Duration,
     /// Opt-in `[subagents] task_fail_fast`: a child failure stops the call.
     fail_fast: bool,
+    /// `timeout` is each child's own window, counted from the moment its
+    /// model run starts (mini-agent-ss239), not one deadline shared by the
+    /// call; the call then gets a larger ceiling ([`Self::call_deadline`]).
+    per_child: bool,
 }
+
+/// Time a child past its window gets for its tool-free write-up turn.
+const WRITEUP_GRACE: Duration = Duration::from_secs(60);
 
 impl Default for TaskLimits {
     fn default() -> Self {
@@ -431,6 +438,7 @@ impl Default for TaskLimits {
             max_cost_units: DEFAULT_MAX_COST_UNITS,
             timeout: DEFAULT_CALL_TIMEOUT,
             fail_fast: false,
+            per_child: false,
         }
     }
 }
@@ -447,7 +455,22 @@ impl TaskLimits {
                 .subagents
                 .as_ref()
                 .is_some_and(|policy| policy.task_fail_fast),
+            per_child: true,
         }
+    }
+
+    /// The whole-call ceiling for `children` children: one deadline when the
+    /// window is shared, else one window plus its write-up grace per wave of
+    /// `max_concurrency` children, capped at [`MAX_CALL_TIMEOUT`].
+    fn call_deadline(&self, children: usize) -> Duration {
+        if !self.per_child {
+            return self.timeout;
+        }
+        let waves = u32::try_from(children.div_ceil(self.max_concurrency.max(1)).max(1))
+            .unwrap_or(u32::MAX);
+        (self.timeout + WRITEUP_GRACE)
+            .saturating_mul(waves)
+            .min(MAX_CALL_TIMEOUT)
     }
 
     /// Background calls use their own, longer deadline; everything else is
@@ -1744,21 +1767,13 @@ impl Tool for TaskTool {
 crate::agent::prompt::task_delegation_rule!(),
 " Typical delegated work: where is X used, how does Y work, what calls Z, \
 audit Q across an unknown part of the codebase. \
-The subagent starts with a blank context: it sees none of this conversation, \
-your plan, or the files you have read. State the goal and why, the paths, \
-errors and decisions it needs, what is already established or ruled out, and \
-what to return and when to stop; describe the goal, not the steps. \
-The subagent uses its configured subset of read, grep, file discovery, \
-directory listing, and read-only memory tools, then returns a structured \
-report whose claims you should spot-check. \
+The subagent sees none of this conversation, your plan, or the files you have \
+read: state the goal and why, the paths and errors it needs, what is already \
+established or ruled out, and what to return and when to stop; describe the \
+goal, not the steps. It uses its configured read-only tools and returns a \
+structured report whose claims you should spot-check. \
 Send exactly one of `briefs` (structured handoffs, the primary form) or \
-`prompts` (plain strings, shorthand for one-line questions); omit the unused \
-field entirely or pass it as []. For example a brief: \
-{\"objective\": \"Find why resumed sessions lose tool results\", \
-\"context\": \"Resume was rewritten last week; tests pass, the bug is only in real sessions\", \
-\"files\": [\"src/session/resume.rs\"], \
-\"known\": [\"the stored transcript contains the results\"], \
-\"done_when\": \"the dropping code path is named with file and line\"}. \
+`prompts` (shorthand for one-line questions); omit the unused field or pass []. \
 Multiple prompts or briefs use bounded parallelism and return in input order. \
 A failed child does not cancel its siblings. If the deadline or an aggregate \
 resource limit is reached, remaining work is cancelled, in-flight children \
@@ -1833,7 +1848,7 @@ partial statuses are returned.")
                     "type": "array",
                     "maxItems": max_prompts,
                     "items": { "type": "string", "minLength": 1 },
-                    "description": "Investigation prompt for the subagent. Use one for a focused question, or multiple to run independent investigations with bounded parallelism. Shorthand for one-line questions, for example 'Where is config loaded?' or 'How does the agent loop work?'; prefer briefs for anything that needs context. Send either prompts or briefs, never both populated: omit this field or pass [] when using briefs."
+                    "description": "Shorthand for one-line questions, one or several run in parallel (for example 'Where is config loaded?'); prefer briefs when context is needed. Send either prompts or briefs, never both populated: omit this field or pass [] when using briefs."
                 },
                 "briefs": {
                     "type": "array",
@@ -1842,16 +1857,16 @@ partial statuses are returned.")
                         "type": "object",
                         "additionalProperties": false,
                         "properties": {
-                            "label": { "type": "string", "description": "Optional 3-5 word description of this subagent." },
-                            "objective": { "type": "string", "minLength": 1, "description": "The goal of the subagent and why it matters; describe the outcome, not the steps." },
-                            "context": { "type": "string", "description": "Optional. Why the task exists and the decisions that bear on it. The subagent cannot see this conversation." },
+                            "label": { "type": "string", "description": "Optional 3-5 word name." },
+                            "objective": { "type": "string", "minLength": 1, "description": "The goal and why; the outcome, not the steps." },
+                            "context": { "type": "string", "description": "Optional. Why the task exists and relevant decisions." },
                             "known": {
                                 "type": "array",
                                 "maxItems": MAX_BRIEF_LIST_ITEMS,
                                 "items": { "type": "string", "minLength": 1 },
-                                "description": "Optional. Facts already established and approaches already ruled out, so the subagent does not repeat them."
+                                "description": "Optional. Facts established and approaches ruled out."
                             },
-                            "done_when": { "type": "string", "description": "Optional. The stopping condition: what makes the work finished." },
+                            "done_when": { "type": "string", "description": "Optional. The stopping condition." },
                             "files": {
                                 "type": "array",
                                 "maxItems": MAX_BRIEF_LIST_ITEMS,
@@ -1870,7 +1885,7 @@ partial statuses are returned.")
                         },
                         "required": ["objective"]
                     },
-                    "description": "Structured handoffs for independent subagents. Each gives an objective plus optional context, known facts, file scope hints, constraints, expected content, and a done_when stopping condition. Send either briefs or prompts, never both populated: omit this field or pass [] when using prompts."
+                    "description": "Structured handoffs for independent subagents: an objective plus optional context, known facts, file scope hints, constraints, expected content and a stopping condition. Send either briefs or prompts, never both populated: omit this field or pass [] when using prompts."
                 },
                 "max_turns": {
                     "type": "integer",
@@ -1882,16 +1897,16 @@ partial statuses are returned.")
                     "type": "integer",
                     "minimum": 1,
                     "maximum": timeout_ceiling,
-                    "description": format!("Optional whole-call deadline in seconds (default: the persona's timeout_secs, else task_timeout_secs {default_timeout} in the foreground or task_background_timeout_secs {default_background_timeout} in the background). Values above the configured ceiling ({timeout_ceiling}, [subagents] task_timeout_ceiling_secs) are rejected.")
+                    "description": format!("Optional per-child window in seconds from its start (default: the persona's timeout_secs, else task_timeout_secs {default_timeout}, or {default_background_timeout} in the background); a child past it returns a marked partial write-up. Above {timeout_ceiling} ([subagents] task_timeout_ceiling_secs) is rejected.")
                 },
                 "label": {
                     "type": "string",
-                    "description": "Optional 3-5 word description of this call, shown in permission prompts, /tasks and logs. The full prompt stays visible in the approval."
+                    "description": "Optional 3-5 word description shown in approvals and /tasks."
                 },
                 "contract": {
                     "type": "string",
                     "enum": ["report", "plain"],
-                    "description": "Optional response shape for this call's children. report (default) requires the host Findings, Unverified and Coverage sections and is validated; plain returns the child's free-form text, quoted and size-bounded but not section-checked, which suits a one-line answer or generated text. Overrides a persona's contract."
+                    "description": "Optional. report (default) validates the Findings, Unverified and Coverage sections; plain returns free-form text, quoted and bounded but not section-checked. Overrides a persona's contract."
                 },
                 "model": {
                     "type": "string",
@@ -2280,7 +2295,10 @@ partial statuses are returned.")
             None => run,
         });
         let (read_only_shell, web_tools) = self.child_extras(specialization.as_ref(), &config);
-        let report_policy = ReportPolicy::from_config(&config, call_free_form);
+        let mut report_policy = ReportPolicy::from_config(&config, call_free_form);
+        if limits.per_child {
+            report_policy.child_window_secs = limits.timeout.as_secs();
+        }
         runtime.execution.tools =
             with_read_only_shell_tool(runtime.execution.tools.take(), read_only_shell);
         let specialization = specialization.map(|resolved| resolved.prompt);
@@ -3046,18 +3064,22 @@ impl ChildPlan {
                     let retry = relief_retry.clone();
                     let events = relief_events.clone();
                     let ledger = relief_ledger.clone();
+                    let summarizing = matches!(stage, ChildRelief::Summarize);
                     async move {
-                        agent
-                            .run_subagent_with_history(
-                                &prompt,
-                                history,
-                                turns,
-                                events.as_ref(),
-                                &retry,
-                                ledger,
-                                None,
-                            )
-                            .await
+                        let run = agent.run_subagent_with_history(
+                            &prompt,
+                            history,
+                            turns,
+                            events.as_ref(),
+                            &retry,
+                            ledger,
+                            None,
+                        );
+                        if summarizing {
+                            super::partial::without_child_window(run).await
+                        } else {
+                            run.await
+                        }
                     }
                 },
             )
@@ -3082,6 +3104,7 @@ impl ChildPlan {
             }
             #[cfg(feature = "hooks")]
             if !task_budget.exhausted()
+                && !run.deadline_exceeded
                 && let Ok(response) = run.response.as_ref()
                 && let crate::extras::hooks::SubagentStopGate::Continue { reason } =
                     child_hook_bindings
@@ -3144,7 +3167,9 @@ impl ChildPlan {
                         .for_subagent_report_repair(repair_max_tokens);
                     let retry = continuation_retry.clone();
                     let events = continuation_events.clone();
-                    async move {
+                    // The repair and write-up turns run outside the child's
+                    // window: they report on its deadline, they do not obey it.
+                    super::partial::without_child_window(async move {
                         repair_agent
                             .run_subagent_with_history(
                                 &prompt,
@@ -3156,7 +3181,7 @@ impl ChildPlan {
                                 None,
                             )
                             .await
-                    }
+                    })
                 },
             )
             .await;
@@ -3409,6 +3434,35 @@ fn turn_budget_header(turns: u32, tool_calls: u32, written_up: bool) -> String {
     )
 }
 
+/// Header for a child stopped by its own time window; the marker is asserted
+/// by tests so an interrupted child is never reported as complete.
+fn child_deadline_header(secs: u64, turns: u32, tool_calls: u32, written_up: bool) -> String {
+    let tail = if written_up {
+        "findings written without tools"
+    } else {
+        "no tool-free write-up available"
+    };
+    format!(
+        "[partial: child deadline of {secs}s reached after {turns} model turns and {tool_calls} tool calls; {tail}]"
+    )
+}
+
+/// Final prompt for a child past its time window.
+fn child_deadline_writeup_prompt(
+    secs: u64,
+    turns: u32,
+    tool_calls: u32,
+    max_report_bytes: usize,
+    free_form: bool,
+) -> String {
+    let lead = format!(
+        "Your time limit of {secs} seconds is reached after {turns} model turns and {tool_calls} tool calls. \
+         You cannot call tools any more and must not try. Using only what your earlier tool \
+         results in this conversation established, write your final report now"
+    );
+    writeup_prompt_with_lead(&lead, max_report_bytes, free_form)
+}
+
 /// Final prompt for a child out of turns: report from the conversation so far.
 fn turn_budget_writeup_prompt(
     turns: u32,
@@ -3500,6 +3554,9 @@ struct ReportPolicy {
     /// `[subagents] task_unverified_bytes`: raw text kept for `/tasks result`
     /// when the host replaces a report.
     unverified_bytes: usize,
+    /// Seconds of the per-child window, named in the deadline header and the
+    /// write-up prompt (0 when the call has no per-child window).
+    child_window_secs: u64,
 }
 
 impl Default for ReportPolicy {
@@ -3507,6 +3564,7 @@ impl Default for ReportPolicy {
         Self {
             free_form: false,
             unverified_bytes: crate::extras::subagents::background::MAX_UNVERIFIED_BYTES,
+            child_window_secs: 0,
         }
     }
 }
@@ -3524,6 +3582,7 @@ impl ReportPolicy {
                 .and_then(|policy| policy.task_unverified_bytes)
                 .unwrap_or(MAX_UNVERIFIED_BYTES)
                 .min(MAX_UNVERIFIED_BYTES_CEILING),
+            child_window_secs: 0,
         }
     }
 }
@@ -3548,21 +3607,28 @@ where
         unverified: None,
         evidence: None,
     };
-    if run.turn_budget_exhausted && run.response.is_ok() {
+    if (run.turn_budget_exhausted || run.deadline_exceeded) && run.response.is_ok() {
         let mut written_up = false;
         let mut narration = run.response.clone().unwrap_or_default();
         if !run.history.is_empty() && !budget_exhausted() {
-            let writeup = continue_tool_free(
-                Continuation::WriteUp,
+            let prompt = if run.deadline_exceeded {
+                child_deadline_writeup_prompt(
+                    policy.child_window_secs,
+                    run.turns,
+                    run.tool_calls,
+                    max_report_bytes,
+                    policy.free_form,
+                )
+            } else {
                 turn_budget_writeup_prompt(
                     run.turns,
                     run.tool_calls,
                     max_report_bytes,
                     policy.free_form,
-                ),
-                run.history.clone(),
-            )
-            .await;
+                )
+            };
+            let writeup =
+                continue_tool_free(Continuation::WriteUp, prompt, run.history.clone()).await;
             run.usage = usage_saturating_add(run.usage, writeup.usage);
             if let Ok(text) = writeup.response
                 && !text.trim().is_empty()
@@ -3572,10 +3638,17 @@ where
                 written_up = true;
             }
         }
-        run.response = Ok(format!(
-            "{}\n{narration}",
+        let header = if run.deadline_exceeded {
+            child_deadline_header(
+                policy.child_window_secs,
+                run.turns,
+                run.tool_calls,
+                written_up,
+            )
+        } else {
             turn_budget_header(run.turns, run.tool_calls, written_up)
-        ));
+        };
+        run.response = Ok(format!("{header}\n{narration}"));
     }
 
     // A child that did its tool work and then wrote nothing gets the same
@@ -3935,6 +4008,7 @@ fn indexed_child_future(
     child: ChildFuture,
     clock: &Arc<BatchClock>,
     capture: super::partial::PartialCapture,
+    child_window: Option<Duration>,
 ) -> IndexedChildFuture {
     struct InFlight(Arc<BatchClock>);
     impl Drop for InFlight {
@@ -3948,7 +4022,13 @@ fn indexed_child_future(
     let in_flight = InFlight(clock.clone());
     Box::pin(async move {
         let _in_flight = in_flight;
-        let child = capture.scope(BATCH_SLOT.scope(BatchSlot { clock, index }, child));
+        let child = BATCH_SLOT.scope(BatchSlot { clock, index }, child);
+        // Each child's window opens when its own model run starts.
+        let child: ChildFuture = match child_window {
+            Some(window) => Box::pin(super::partial::with_child_window(window, child)),
+            None => Box::pin(child),
+        };
+        let child = capture.scope(child);
         let child = match AssertUnwindSafe(child).catch_unwind().await {
             Ok(child) => child,
             Err(_) => {
@@ -4032,6 +4112,10 @@ impl StopReason {
             Self::CostLimit => format!(
                 "aggregate cost limit of {} units reached",
                 limits.max_cost_units
+            ),
+            Self::Deadline if limits.per_child => format!(
+                "whole-call ceiling reached (each child's window is {}s)",
+                limits.timeout.as_secs()
             ),
             Self::Deadline => format!(
                 "wall-clock deadline of {}s reached",
@@ -4475,8 +4559,9 @@ async fn execute_tasks_with_budget_cancellable(
     let captures: Vec<super::partial::PartialCapture> = std::iter::repeat_with(Default::default)
         .take(task_count)
         .collect();
-    let deadline = Instant::now() + limits.timeout;
-    let clock = Arc::new(BatchClock::new(limits.timeout));
+    let call_deadline = limits.call_deadline(task_count);
+    let deadline = Instant::now() + call_deadline;
+    let clock = Arc::new(BatchClock::new(call_deadline));
     let mut in_flight: FuturesUnordered<IndexedChildFuture> = FuturesUnordered::new();
 
     while stop_reason.is_none()
@@ -4503,6 +4588,7 @@ async fn execute_tasks_with_budget_cancellable(
             child.future,
             &clock,
             captures[index].clone(),
+            limits.per_child.then_some(limits.timeout),
         ));
     }
 
@@ -4629,6 +4715,7 @@ async fn execute_tasks_with_budget_cancellable(
                 child.future,
                 &clock,
                 captures[index].clone(),
+                limits.per_child.then_some(limits.timeout),
             ));
         }
     }
@@ -5828,6 +5915,7 @@ mod tests {
             max_cost_units: 1_000,
             timeout: Duration::from_secs(1),
             fail_fast: false,
+            per_child: false,
         }
     }
 
@@ -6045,9 +6133,16 @@ mod tests {
             MAX_SUBAGENT_RESPONSE_BYTES,
         );
 
-        assert_eq!(small, large);
-        assert!(large.len() < 1_024);
-        assert!(report_contract_violations(&large).is_empty());
+        // The answer is delivered as bounded, quoted data (mini-agent-zc1gc),
+        // so the repair no longer ignores its size, but never exceeds the cap.
+        assert!(small.starts_with(UNSTRUCTURED_MARKER));
+        assert!(small.len() < 1_024);
+        assert!(
+            large.len() <= MAX_SUBAGENT_RESPONSE_BYTES,
+            "{}",
+            large.len()
+        );
+        assert!(large.contains("[truncated by host"));
     }
 
     #[test]
@@ -6727,7 +6822,7 @@ fn main() {
             let description = property["description"].as_str().unwrap();
             assert!(description.contains(&format!("pass [] when using {other}")));
         }
-        assert!(tool.description().contains("exactly one of `prompts`"));
+        assert!(tool.description().contains("exactly one of `briefs`"));
     }
 
     #[test]
@@ -7885,6 +7980,7 @@ fn main() {
                 prompts(4),
                 TaskLimits {
                     fail_fast: true,
+                    per_child: false,
                     ..limits()
                 },
                 fake_executor(steps, Arc::clone(&counters)),
@@ -8013,6 +8109,49 @@ fn main() {
                 cancellation_cost: Arc::new(|| 1),
             }
         })
+    }
+
+    // mini-agent-ss239: with per-child windows, a second wave of children gets
+    // a full window; with one shared deadline it is cut off.
+    #[tokio::test(start_paused = true)]
+    async fn per_child_windows_give_a_second_wave_a_full_window() {
+        fn slow_executor() -> TaskExecutor {
+            Arc::new(|_, _| ScheduledChild {
+                future: Box::pin(async {
+                    tokio::time::sleep(Duration::from_secs(8)).await;
+                    ChildExecution {
+                        output: Ok("done".into()),
+                        cost_units: 1,
+                        host_suffix: None,
+                    }
+                }),
+                cancellation_cost: Arc::new(|| 1),
+            })
+        }
+        let base = TaskLimits {
+            max_prompts: 8,
+            max_concurrency: 4,
+            timeout: Duration::from_secs(10),
+            ..limits()
+        };
+        let shared = execute_tasks(prompts(8), base, slow_executor(), None).await;
+        assert!(
+            matches!(shared.stop_reason, Some(StopReason::Deadline)),
+            "a shared deadline starves the second wave"
+        );
+        let per_child = TaskLimits {
+            per_child: true,
+            ..base
+        };
+        assert_eq!(per_child.call_deadline(8), Duration::from_secs(140));
+        let report = execute_tasks(prompts(8), per_child, slow_executor(), None).await;
+        assert!(report.stop_reason.is_none(), "{:?}", report.stop_reason);
+        assert!(
+            report
+                .outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, TaskOutcome::Success(_)))
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -8402,7 +8541,9 @@ fn main() {
         for allow_write in [false, true] {
             let tool = TaskTool::new(None, None, allow_write);
             let size = tool.description().len() + tool.parameters().to_string().len();
-            assert!(size <= 6_200, "task definition is {size} bytes");
+            // Raised from 6_200 for the brief guidance, brief fields, label and
+            // contract added by the 2026-11-22 subagent-context beads.
+            assert!(size <= 7_100, "task definition is {size} bytes");
         }
     }
 
@@ -9718,6 +9859,95 @@ mod child_continuation_tests {
             self.0.fetch_add(1, Ordering::SeqCst);
             Ok("EVIDENCE: src/lib.rs:7 defines the cache".to_owned())
         }
+    }
+
+    /// A `read` that never returns, to hold a child past its window.
+    #[derive(Clone)]
+    struct HangingReadTool;
+    impl Tool for HangingReadTool {
+        const NAME: &'static str = "read";
+        type Error = MockToolError;
+        type Args = serde_json::Value;
+        type Output = String;
+        fn description(&self) -> String {
+            "Read a file".to_owned()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn call(&self, _args: Self::Args) -> Result<Self::Output, Self::Error> {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok("late".to_owned())
+        }
+    }
+
+    // mini-agent-ss239: a child past its window keeps its conversation, gets
+    // one tool-free write-up turn, and the result is marked partial.
+    #[tokio::test(start_paused = true)]
+    async fn a_child_past_its_window_gets_a_marked_write_up() {
+        let model = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text("Looking at the cache."),
+            MockStreamEvent::tool_call(
+                "call-0".to_string(),
+                HangingReadTool::NAME,
+                serde_json::json!({"path": "src/lib.rs"}),
+            ),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let agent = AgentBuilder::new(model).tool(HangingReadTool).build();
+        let run = crate::extras::subagents::partial::with_child_window(
+            Duration::from_secs(5),
+            run_subagent_with_history(
+                &agent,
+                "investigate the cache",
+                Vec::new(),
+                5,
+                None,
+                &crate::retry::RetryConfig::default(),
+                SharedUsageLedger::default(),
+                None,
+            ),
+        )
+        .await;
+        assert!(run.deadline_exceeded);
+        assert!(!run.turn_budget_exhausted);
+        assert!(!run.history.is_empty(), "the conversation is kept");
+        assert!(
+            run.response
+                .as_ref()
+                .unwrap()
+                .contains("[partial: child deadline reached]")
+        );
+
+        let writeup = MockCompletionModel::from_stream_turns(vec![vec![
+            MockStreamEvent::text(CONTRACT),
+            MockStreamEvent::final_response_with_default_usage(),
+        ]]);
+        let finished = finish_child_run_with(
+            run,
+            || false,
+            4096,
+            None,
+            ReportPolicy {
+                child_window_secs: 5,
+                ..ReportPolicy::default()
+            },
+            continuation(writeup.clone(), Arc::default()),
+        )
+        .await;
+        let response = finished.response.unwrap();
+        assert!(
+            response.starts_with("[partial: child deadline of 5s reached after"),
+            "{response}"
+        );
+        assert!(
+            response.contains("findings written without tools"),
+            "{response}"
+        );
+        assert!(response.contains("The cache is defined at src/lib.rs:7."));
+        let requests = writeup.requests();
+        assert_eq!(requests.len(), 1);
+        assert!(format!("{:?}", requests[0].chat_history).contains("time limit of 5 seconds"));
     }
 
     const CONTRACT: &str = "## Findings\n- [confidence: high] The cache is defined at src/lib.rs:7.\n\n## Unverified\n- None\n\n## Coverage\n- Covered: src/lib.rs\n- Skipped: None\n";

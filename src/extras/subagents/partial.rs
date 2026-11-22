@@ -68,6 +68,51 @@ impl PartialCapture {
     }
 }
 
+/// The per-child time window (mini-agent-ss239): its length and the moment
+/// the child's first model run started, which is when the window opens.
+#[derive(Clone)]
+pub(crate) struct ChildWindow {
+    timeout: std::time::Duration,
+    opened: Arc<Mutex<Option<tokio::time::Instant>>>,
+}
+
+tokio::task_local! {
+    static WINDOW: Option<ChildWindow>;
+}
+
+/// Run `future` with a per-child window of `timeout`; the runner reads it
+/// through [`child_deadline`].
+pub(crate) fn with_child_window<F: Future>(
+    timeout: std::time::Duration,
+    future: F,
+) -> impl Future<Output = F::Output> {
+    WINDOW.scope(
+        Some(ChildWindow {
+            timeout,
+            opened: Arc::default(),
+        }),
+        future,
+    )
+}
+
+/// Run `future` outside any child window: the tool-free repair and write-up
+/// turns that follow a deadline must not be cut by the deadline they report.
+pub(crate) fn without_child_window<F: Future>(future: F) -> impl Future<Output = F::Output> {
+    WINDOW.scope(None, future)
+}
+
+/// The deadline of the current child's window, opening it on first use.
+pub(crate) fn child_deadline() -> Option<tokio::time::Instant> {
+    WINDOW
+        .try_with(|window| {
+            let window = window.as_ref()?;
+            let mut opened = window.opened.lock().unwrap_or_else(|e| e.into_inner());
+            Some(*opened.get_or_insert_with(tokio::time::Instant::now) + window.timeout)
+        })
+        .ok()
+        .flatten()
+}
+
 /// Record streamed child text (no-op outside a scheduled child).
 pub(crate) fn record_text(text: &str) {
     let _ = CAPTURE.try_with(|capture| capture.push(text));
@@ -84,6 +129,22 @@ pub(crate) fn record_tool_call() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn the_child_window_opens_once_and_can_be_suspended() {
+        assert!(child_deadline().is_none());
+        with_child_window(std::time::Duration::from_secs(10), async {
+            let first = child_deadline().unwrap();
+            tokio::time::advance(std::time::Duration::from_secs(4)).await;
+            assert_eq!(child_deadline().unwrap(), first, "the window opens once");
+            assert!(
+                without_child_window(async { child_deadline() })
+                    .await
+                    .is_none()
+            );
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn partial_capture_records_text_only_inside_its_scope_and_is_bounded() {

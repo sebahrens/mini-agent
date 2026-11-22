@@ -37,7 +37,7 @@ task(prompts: [
 
 - Batch independent questions into one `task` call — they run in parallel.
 - For domain-specific work, set `agent_type` to a specialist listed in the tool schema (for example `rust-security-review` or `rust-async-concurrency`). Omit it for general exploration.
-- Each subagent has a fresh context, and the call has one shared deadline (5 minutes by default, configurable) that covers all children; ask focused questions.
+- Each subagent has a fresh context and its own time window (5 minutes by default, configurable) from when it starts; a child past it returns a marked partial write-up. Ask focused questions.
 - Spot-check the returned report before relying on it, and act yourself on it — the subagent cannot apply its own findings.
 
 ## `mini-agent -p` Subprocesses

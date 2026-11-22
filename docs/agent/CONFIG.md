@@ -956,7 +956,7 @@ Accepted top-level keys:
 | `task_cost_weighting`     | string | `"auto"` (default) derives model-aware normalized ratios; `"fixed"` uses configured weights. Applies to the next delegation; requires `subagents`. |
 | `task_cost_weights`       | object | Finite token weights: `input=1.0`, `output=5.0`, `cache_read=1.0`, `cache_write_5m=2.0`, `cache_write_1h=2.0`. Input/output must be positive; cache weights nonnegative. Partial objects use built-in defaults. Applies to the next delegation. |
 | `task_cost_overrides`     | object | Map of exact quick-model aliases to `{ weighting?, weights? }`. Only the actual selected alias matching the child provider/model can override the globals. Default: `{}`; applies to the next delegation. |
-| `task_timeout_secs`       | integer | Whole-call subagent deadline. Default: `300`, maximum `86400`; requires `subagents`. |
+| `task_timeout_secs`       | integer | Per-child subagent window, counted from the moment each child starts (a child past it gets a tool-free write-up turn marked partial); the whole call is capped at one window plus a 60 s grace per wave of `task_max_concurrency` children. Default: `300`, maximum `86400`; requires `subagents`. |
 | `task_enabled`            | boolean | Register the `task` tool when subagents are compiled in. Default: `true`. |
 | `subagent_model`          | string  | Raw model id or quick-model alias used by subagents; absent inherits the main model. |
 | `subagent_provider`       | string  | Provider used by subagents when not supplied by a quick-model alias; absent inherits the main provider. |
@@ -5058,7 +5058,7 @@ By default a failed child is only that child's outcome. See
 [Bounded execution](SUBAGENTS.md#bounded-execution-and-partial-results).
 
 `[subagents] task_background_timeout_secs = N` (default 3600, 1 to 86400) is
-the whole-call deadline of `run_in_background` task calls; foreground calls
+the per-child window of `run_in_background` task calls; foreground calls
 keep `task_timeout_secs` (default 300). See
 [Background tasks](SUBAGENTS.md#background-tasks).
 

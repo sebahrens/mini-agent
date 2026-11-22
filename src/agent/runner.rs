@@ -7246,6 +7246,9 @@ pub(crate) struct SubagentRunOutput {
     /// The child's next request would exceed its context window
     /// ([`CHILD_CONTEXT_REFUSAL`]); `history` is the conversation so far.
     pub context_exhausted: bool,
+    /// The run was stopped by the child's own time window
+    /// (mini-agent-ss239); `history` is the conversation so far.
+    pub deadline_exceeded: bool,
     /// Conversations replaced by context compaction, oldest first. Their tool
     /// results are still evidence the child gathered.
     pub compacted_histories: Vec<Vec<Message>>,
@@ -7265,6 +7268,7 @@ impl SubagentRunOutput {
             turn_budget_exhausted: false,
             empty_final: false,
             context_exhausted: false,
+            deadline_exceeded: false,
             compacted_histories: Vec::new(),
         }
     }
@@ -7294,6 +7298,10 @@ pub(crate) const CHILD_CONTEXT_REFUSAL: &str = "task: child context estimate exc
 
 #[cfg(feature = "subagents")]
 const SUBAGENT_TURN_BUDGET_PARTIAL: &str = "[partial: turn budget exhausted]";
+
+/// Closes the narration of a child stopped by its own time window.
+#[cfg(feature = "subagents")]
+const SUBAGENT_DEADLINE_PARTIAL: &str = "[partial: child deadline reached]";
 
 #[cfg(feature = "subagents")]
 fn append_subagent_turn_budget_partial(response: &mut String) {
@@ -7479,6 +7487,9 @@ where
     // Rig call id -> row in `tool_log` (rows past the bound are not tracked).
     let mut logged: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut turn_budget_exhausted = false;
+    let mut deadline_exceeded = false;
+    // The child's own time window, when the scheduler gave it one.
+    let child_deadline = crate::extras::subagents::partial::child_deadline();
     // Mid-stream retry: what this stream produced so far, to resume from it.
     let mut bridge: Vec<Message> = Vec::new();
     // Messages before the current stream's own (original prompt + bridge) once resumed.
@@ -7495,11 +7506,35 @@ where
                 turn_budget_exhausted,
                 empty_final: false,
                 context_exhausted: false,
+                deadline_exceeded,
                 compacted_histories: Vec::new(),
             }
         };
     }
-    while let Some(item) = stream.next().await {
+    loop {
+        let next = match child_deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    biased;
+                    item = stream.next() => item,
+                    () = tokio::time::sleep_until(deadline) => {
+                        // Keep what the child did and ask the task tool for a
+                        // tool-free write-up instead of discarding it.
+                        deadline_exceeded = true;
+                        turn.tool_calls.finalize_unresolved(&mut turn.interactions);
+                        child_history =
+                            subagent_history_so_far(&history, prompt, &bridge, &turn.interactions);
+                        if !turn.response.is_empty() && !turn.response.ends_with('\n') {
+                            turn.response.push('\n');
+                        }
+                        turn.response.push_str(SUBAGENT_DEADLINE_PARTIAL);
+                        break;
+                    }
+                }
+            }
+            None => stream.next().await,
+        };
+        let Some(item) = next else { break };
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
                 turn.on_text(&text.text);

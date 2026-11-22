@@ -51,10 +51,11 @@ Main-agent definition loading remains available when subagents are disabled.
 
 Set `run_in_background: true` on an ordinary `task` call to return a task ID
 immediately. The same persona, tools, permission checks, captured prices and
-session cost cap apply. A background call has its own whole-call deadline,
+session cost cap apply. A background call has its own per-child window,
 `[subagents] task_background_timeout_secs` (default 3600 seconds, at most
-86400), instead of the foreground `task_timeout_secs` (300 s); when it expires,
-in-flight children return their narration so far as `[partial: cancelled ...]`
+86400), instead of the foreground `task_timeout_secs` (300 s); a child past it
+gets a tool-free write-up turn marked `[partial: child deadline ...]`, and when
+the whole-call ceiling expires, in-flight children return their narration so far as `[partial: cancelled ...]`
 sections (see [Bounded execution](#bounded-execution-and-partial-results)). The session keeps at most 32 tasks, including
 finished reports. When it is full, the next admission drops the oldest finished
 task whose completion notice was already delivered (or that was restored from a
@@ -199,7 +200,7 @@ system prompt ends with an environment block (working directory, UTC date and
 platform; a write child also gets its branch line and a short `git status`).
 
 Optional `max_turns` and `timeout_secs` arguments set the child model-turn
-budget and the whole-call deadline for one call (for example
+budget and each child's time window for one call (for example
 `{"prompts": ["…"], "max_turns": 60, "timeout_secs": 1800}`). They override a
 persona's frontmatter values and the configured defaults, and are rejected
 when above `[subagents] task_max_turns_ceiling` (default 100) or
@@ -685,7 +686,7 @@ mode: review
   rejects the definition.
 - `max_turns` (1–10000) sets the child's model-turn budget, replacing the
   `turn_budget` fraction of `task_max_turns`; `timeout_secs` (1–86400) sets
-  the whole-call deadline of calls using the persona. Both may exceed the
+  each child's time window in calls using the persona. Both may exceed the
   global defaults but are checked against `[subagents] task_max_turns_ceiling`
   (default 100) and `task_timeout_ceiling_secs` (default 3600): a value above
   its ceiling rejects the `task` call with an error naming the key, never a
@@ -1298,7 +1299,7 @@ normal TOML/YAML/JSON mini-agent configuration described in
 | `task_cost_weighting`       | `string` | `"auto"`                 | Model-aware ratios; `"fixed"` uses configured weights |
 | `task_cost_weights`         | `object` | See below                | Token-category weights and automatic-mode fallbacks |
 | `task_cost_overrides`       | `object` | `{}`                     | Weighting/weights by exact selected quick-model alias |
-| `task_timeout_secs`         | `u64`    | `300`                    | Whole-call wall-clock deadline of foreground calls; completed sibling results and in-flight narration are retained when it expires |
+| `task_timeout_secs`         | `u64`    | `300`                    | Per-child window of foreground calls, counted from the moment each child's model run starts; the whole call is capped at one window plus a 60 s write-up grace per wave of `task_max_concurrency` children. A child past its window keeps its conversation, gets one tool-free write-up turn and returns `[partial: child deadline of Ns reached ...]`; completed siblings and in-flight narration are retained if the whole-call ceiling is reached |
 | `[subagents] task_background_timeout_secs` | `u64` | `3600` | Whole-call deadline of `run_in_background` calls (at most 86400) |
 | `[subagents] agent_memory` / `agent_hooks` | `bool` | `false` | Opt in to a persona's `memory:` notes directory and `hooks:` frontmatter (project config needs trust) |
 | `[subagents] headless_exit_wait_secs` | `u64` | `300` | Seconds a headless run waits at exit for running background tasks before cancelling them (at most 3600; `0` cancels at once) |
@@ -1323,7 +1324,7 @@ Session background batches share one lane of `task_max_concurrency` children;
 the parent turn's own (foreground) task call uses a separate lane of the same
 size, so running background jobs cannot serialize it. Write children of every
 batch still share the session's single write lane. While every in-flight child
-of a call is waiting for a lane, its `task_timeout_secs` deadline is paused,
+of a call is waiting for a lane, its whole-call ceiling is paused,
 with that credit capped at one further timeout; when the deadline stops a call
 whose started children are still waiting, the partial-status header reports
 them as `queued=N`.
