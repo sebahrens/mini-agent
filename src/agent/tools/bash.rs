@@ -432,14 +432,23 @@ impl Tool for ShellTool {
                 );
                 if self.sandbox.uses_powershell_workspace_drive() {
                     description.push_str(&format!(
-                        " The command starts in the PowerShell drive {}:\\ (the workspace root); Get-Location prints that drive, relative paths work (except that Remove-Item and Move-Item need the item piped, `Get-Item name | Remove-Item`, or its full path), and native programs get the real directory.",
+                        " The command starts in the PowerShell drive {}:\\ (the workspace root); Get-Location prints that drive, relative paths work, and native programs get the real directory.",
                         crate::sandbox::POWERSHELL_WORKSPACE_DRIVE
                     ));
                 }
             }
-            Some(crate::sandbox::ShellDialect::Cmd) => description.push_str(
-                " cmd.exe syntax: chain with '&' or '&&', redirect to NUL, and use %VAR% for environment variables.",
-            ),
+            Some(crate::sandbox::ShellDialect::Cmd) => {
+                description.push_str(
+                    " cmd.exe syntax: chain with '&' or '&&', redirect to NUL, and use %VAR% for environment variables.",
+                );
+                if self.sandbox.backend_name() == "appcontainer"
+                    && self.sandbox.containment_requested()
+                {
+                    description.push_str(
+                        " Under the default Windows sandbox `dir`, `del` and redirection to NUL are refused: list with `for %f in (*) do @echo %f`, or use PowerShell.",
+                    );
+                }
+            }
             _ => {}
         }
         if let Some(alias) = self.sandbox.shell_cwd_alias() {
@@ -2789,7 +2798,7 @@ fn host_command_unrunnable_hint(sandbox: &Sandbox, output: &str) -> Option<Strin
         .collect();
     let missing = missing_commands(output, &path_directories);
     if missing.is_empty() {
-        return None;
+        return launcher_started_unreadable_program_hint(sandbox, output);
     }
     let extensions = host_path_extensions();
     let located: Vec<(String, Option<String>)> = off_executor(|| {
@@ -2808,7 +2817,7 @@ fn host_command_unrunnable_hint(sandbox: &Sandbox, output: &str) -> Option<Strin
             .collect()
     });
     if located.is_empty() {
-        return None;
+        return launcher_started_unreadable_program_hint(sandbox, output);
     }
     let listed = located
         .iter()
@@ -2828,6 +2837,29 @@ fn host_command_unrunnable_hint(sandbox: &Sandbox, output: &str) -> Option<Strin
     let advice = toolchain_advice(sandbox, &directories)?;
     Some(format!(
         "The program(s) {listed} exist on the host but the sandbox cannot run them: they are outside the sandbox's read roots. {advice}"
+    ))
+}
+
+/// A launcher (the Windows `py` launcher is the usual one) runs, but the program it starts
+/// (`Unable to create process using '<path>'`) is outside the read roots and is not on the host
+/// `PATH`, so it cannot be named from `PATH`. The path is already in the message above; only
+/// the key and the shape of the entry are given here, never a path taken from the output.
+fn launcher_started_unreadable_program_hint(sandbox: &Sandbox, output: &str) -> Option<String> {
+    if sandbox.backend_name() != "appcontainer"
+        || !output
+            .to_ascii_lowercase()
+            .contains("unable to create process using")
+    {
+        return None;
+    }
+    Some(format!(
+        "A launcher started a program that the sandbox cannot read (the path in the message above). {} Add that program's install directory, for example `windows-appcontainer-read-roots = ['C:\\Python312']`, to the global config (restart required; an administrator-owned install also needs an elevated launcher).{}",
+        "This is the default by decision.",
+        if sandbox.windows_toolchain_discovery() {
+            ""
+        } else {
+            " Setting `windows-appcontainer-toolchain-discovery = true` grants the directories of programs found on `PATH` automatically."
+        }
     ))
 }
 
@@ -4234,6 +4266,27 @@ mod tests {
         )
         .unwrap();
         assert!(nul.contains("only an elevated launcher"), "{nul}");
+    }
+
+    #[test]
+    fn a_launcher_that_starts_an_unreadable_program_gets_the_read_root_recipe() {
+        let sandbox = Sandbox::new(true, "appcontainer");
+        let output = "Unable to create process using 'C:\\hosted\\Python\\3.15.2\\x64\\python.exe --version': Access is denied.";
+        let note = sandbox_failure_note(&sandbox, false, true, output).unwrap();
+        assert!(
+            note.contains("windows-appcontainer-read-roots = ['"),
+            "{note}"
+        );
+        assert!(
+            note.contains("windows-appcontainer-toolchain-discovery = true"),
+            "{note}"
+        );
+        // The path from the output is never repeated by the note.
+        assert!(!note.contains("3.15.2"), "{note}");
+        assert_eq!(
+            sandbox_failure_note(&Sandbox::new(true, "bwrap"), false, true, output),
+            None
+        );
     }
 
     #[test]
