@@ -9,6 +9,8 @@ Notable changes to mini-agent are documented in this file. The format follows
 ### Fixed
 
 - On Windows, `/rewind` Restore workspace now works: whole-workspace snapshots use the handle-bound checked primitives, never follow junctions or symbolic links, and refuse the whole restore (nothing changed) when a file is held open by another program or a case-only rename makes the plan ambiguous (mini-agent-rb4w2).
+- The budget preflight refusal is no longer skipped in the unit-test binary: a per-run switch replaces the `cfg!(test)` bypass, and `MINI_AGENT_BUDGET_PREFLIGHT=0` still turns it off (mini-agent-bnynh).
+- `--stream-json-schema claude` text messages carry the provider's `stop_reason` (null only when the provider gave none); an interrupted OpenRouter stream's estimated ledger row is replaced by the generation endpoint's counts when it answers within 3 seconds (mini-agent-qqknv).
 - Project instruction files from a workspace whose project config is not trusted are framed as reference-only data again; trusted workspaces keep the standing-instructions framing, and the global `AGENTS.md` is authoritative either way (mini-agent-dqk7m).
 - `--mcp-server` runs with a progress token send `notifications/progress` at each tool call start and finish and each model turn, not only a heartbeat (mini-agent-1ptzh).
 - A permission denial from a stream-json, MCP elicitation or ACP client now reads "denied by the client"; an unanswered MCP elicitation is refused early enough for the run to save its session before `--mcp-server-timeout`; a second ACP TCP peer reads a "busy" line instead of waiting silently (mini-agent-mt2f2).
