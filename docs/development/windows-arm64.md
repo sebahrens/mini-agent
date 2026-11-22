@@ -1,8 +1,9 @@
 # Windows ARM64 release binary
 
 Status: the release workflow builds `aarch64-pc-windows-msvc` natively on a `windows-11-arm` runner
-and publishes `mini-agent-aarch64-pc-windows-msvc.tar.gz` and the lite equivalent (zip-style archives,
-no MSI yet). Running the x64 binary under emulation on ARM64 Windows is not supported: the shell, git and
+and publishes `mini-agent-aarch64-pc-windows-msvc.tar.gz` and the lite equivalent (zip-style archives).
+The ARM64 build ships as an archive only: no MSI, no win32-arm64 VSIX and no npm platform package.
+Running the x64 binary under emulation on ARM64 Windows is not supported: the shell, git and
 js tools are unavailable there, so use the native archive.
 
 How it works:
@@ -16,7 +17,17 @@ How it works:
   workflow for both Windows rows.
 - `.github/workflows/windows-arm64-smoke.yml` (manual) builds the target and runs `--version`,
   `--js-runtime-check` (the JS worker LPAC self-check) and `--git-runtime-check`.
-- `mini-agent update` selects the asset by install channel, not by a target table.
+- `mini-agent update` maps the host to an asset name with a pure function (`release_archive_for` in
+  `src/self_update.rs`; aarch64 Windows gives `mini-agent-aarch64-pc-windows-msvc.tar.gz`, unit-tested on any
+  host). Windows installs stay on the manual path because a running `.exe` cannot be replaced in place, so the
+  update check only compares versions.
+- `ci.yml` has a compile-only job, `windows-arm64-compile` (ARM64 Git runtime, then `cargo test --locked
+  --no-run` on `windows-11-arm`), under the same scope rules as `windows-hooks-compile` and listed in
+  `ci-success`. The runtime checks run on the release archive in `archive-smoke`.
+- The Scoop manifest carries an `arm64` architecture entry (and `autoupdate`) for the ARM64 archive.
 
-CI note: a compile-only ARM64 job (prepare the runtime with the ARM64 target, then run the test build on
-`windows-11-arm`) belongs in `ci.yml`; it is not added here.
+Why no ARM64 MSI yet: WiX 6 can build an `arm64` package, but the MSI embeds the VS Code extension for its
+own architecture, and the release builds no `win32-arm64` VSIX (it needs a VS Code ARM64 integration run,
+`vscode-target` and npm platform wiring, and `check-package-metadata.py` pins the five-VSIX set). Until that
+exists the ARM64 MSI and the winget `arm64` installer are deferred; winget lists only the x64 MSI. Install
+the ARM64 archive by hand or with Scoop.
