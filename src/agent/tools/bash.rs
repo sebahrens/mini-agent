@@ -432,7 +432,7 @@ impl Tool for ShellTool {
                 );
                 if self.sandbox.uses_powershell_workspace_drive() {
                     description.push_str(&format!(
-                        " The command starts in the PowerShell drive {}:\\ (the workspace root); Get-Location prints that drive, relative paths work, and native programs get the real directory.",
+                        " The command starts in the PowerShell drive {}:\\ (the workspace root); Get-Location prints that drive, relative paths work (except that Remove-Item and Move-Item need the item piped, `Get-Item name | Remove-Item`, or its full path), and native programs get the real directory.",
                         crate::sandbox::POWERSHELL_WORKSPACE_DRIVE
                     ));
                 }
@@ -2524,6 +2524,13 @@ pub(crate) fn sandbox_failure_note(
     {
         note.push_str(
             " In cmd.exe `dir` cannot enumerate directories here; `for %f in (*) do @echo %f` (files) and `for /d %d in (*) do @echo %d` (directories) work, as does PowerShell Get-ChildItem.",
+        );
+    }
+    if sandbox.uses_powershell_workspace_drive()
+        && lowered.contains("access to the path 'c:\\' is denied")
+    {
+        note.push_str(
+            " PowerShell Remove-Item and Move-Item cannot resolve a relative path here; pipe the item (`Get-Item name | Remove-Item`) or pass its full path (`Join-Path (Get-Location).ProviderPath name`).",
         );
     }
     if let Some(hint) = &toolchain_hint {
