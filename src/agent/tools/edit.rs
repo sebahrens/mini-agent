@@ -1827,7 +1827,15 @@ impl EditTool {
                     "'replace_all' is only supported with SEARCH/REPLACE blocks.".to_string(),
                 ));
             }
-            handle_hashedit(&path, file_crc, edits, &content, disclose_source).await?
+            match handle_hashedit(&path, file_crc, edits, &content, disclose_source).await {
+                Ok(parts) => parts,
+                Err(error) => {
+                    // The error asks for a re-read; the repeated-read guard
+                    // must not refuse the very read it asks for (mini-agent-5zdmu).
+                    self.read_tracker.untrack_read_path(&path);
+                    return Err(error);
+                }
+            }
         } else {
             return Err(ToolError::Msg(
                 "Provide either 'block' (SEARCH/REPLACE) or 'file_crc'+'edits' (hashedit). Inspect the edit tool schema and the latest read output to choose the active format."

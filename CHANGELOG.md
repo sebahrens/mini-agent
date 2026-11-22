@@ -6,6 +6,13 @@ Notable changes to mini-agent are documented in this file. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- A failed hashedit lets the re-read it asks for through the repeated-read guard, and restarted goal/loop rounds clear the guard because their earlier tool results are gone (mini-agent-5zdmu, mini-agent-hs2tc).
+- A compaction summary cut off at the output cap (reasoning tokens count toward it) is retried once with a four times larger cap before it is accepted, and an empty reasoning-only response now reports why (mini-agent-h3ay0).
+- Compaction on the OpenRouter route forks the conversation's own request so the provider prompt cache can serve the prefix, as Anthropic and OpenAI already did (mini-agent-csng7).
+- A custom command directory with more than 128 files loads the first 128 in name order and one notice names the directory and the skipped count, instead of dropping the whole layer (mini-agent-jd6h1).
+
 ### Added
 
 - `compact_size_fraction` (default 0.75; `0` disables) starts automatic compaction, between turns and at tool-batch boundaries, when the encoded session nears the 32 MiB save ceiling, so image-heavy sessions compact before saving stops (mini-agent-fmmhs).
