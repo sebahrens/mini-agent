@@ -167,6 +167,11 @@ const PROVIDER_ENVELOPE_TOKEN_RESERVE: u64 = 512;
 const MIN_SUMMARY_OUTPUT_TOKENS: u64 = 256;
 const MAX_SUMMARY_OUTPUT_TOKENS: u64 = 4_096;
 const MAX_SCALED_SUMMARY_OUTPUT_TOKENS: u64 = 20_000;
+/// A cut-off summary is retried once with the cap multiplied by this factor
+/// (reasoning tokens count toward the output cap), bounded by
+/// [`MAX_SUMMARY_RETRY_OUTPUT_TOKENS`] (mini-agent-h3ay0).
+const SUMMARY_RETRY_CAP_FACTOR: u64 = 4;
+const MAX_SUMMARY_RETRY_OUTPUT_TOKENS: u64 = 32_768;
 const NO_PREVIOUS_SUMMARY: &str = "(none)";
 const OLDER_HISTORY_OMITTED: &str = "[older history omitted to bound compaction work]\n";
 
@@ -2498,7 +2503,7 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
 {
     run_summarizer_with(
-        || {
+        |max_output_tokens| {
             let request = model
                 .completion_request(prompt.clone())
                 .preamble(preamble.clone())
@@ -2533,7 +2538,7 @@ async fn run_summarizer_with<M, F, Fut>(
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
-    F: Fn() -> Fut,
+    F: Fn(u64) -> Fut,
     Fut: std::future::Future<
             Output = Result<
                 rig::completion::CompletionRequestBuilder<M>,
@@ -2542,6 +2547,9 @@ where
         > + Send
         + 'static,
 {
+    let mut max_output_tokens = max_output_tokens;
+    let mut escalated = false;
+    let mut spent = rig::completion::Usage::new();
     let config = retry_config.bounded();
     let max_backoff = Duration::from_millis(config.max_backoff_ms);
     let mut backoff = Duration::from_millis(config.initial_backoff_ms);
@@ -2566,7 +2574,46 @@ where
         )
         .await
         {
-            Ok(done) => return Ok(done),
+            Ok((response, usage, cut_off)) => {
+                spent = crate::event::UsageDelta::from(spent)
+                    .saturating_add(crate::event::UsageDelta::from(usage))
+                    .into();
+                // Reasoning tokens share the output cap, so a reasoning model
+                // can spend all of it before writing the summary. Retry once
+                // with a larger cap before accepting a cut-off or empty
+                // summary (mini-agent-h3ay0).
+                if cut_off && !escalated {
+                    let larger = max_output_tokens
+                        .saturating_mul(SUMMARY_RETRY_CAP_FACTOR)
+                        .min(MAX_SUMMARY_RETRY_OUTPUT_TOKENS);
+                    if larger > max_output_tokens {
+                        tracing::warn!(
+                            max_output_tokens,
+                            larger,
+                            "compaction summary hit the output limit; retrying once with a larger cap"
+                        );
+                        escalated = true;
+                        max_output_tokens = larger;
+                        continue;
+                    }
+                }
+                if response.is_empty() {
+                    return Err(anyhow::anyhow!(if cut_off {
+                        format!(
+                            "Compression returned no summary: the model used its whole {max_output_tokens}-token output allowance (reasoning counts toward it); use a non-reasoning `compaction_model` or lower the reasoning effort"
+                        )
+                    } else {
+                        "Compression returned empty response".to_string()
+                    }));
+                }
+                if cut_off {
+                    tracing::warn!(
+                        max_output_tokens,
+                        "compaction summary hit the output limit and was cut off"
+                    );
+                }
+                return Ok((mark_cut_off_summary(response, cut_off), spent));
+            }
             Err(SummarizerFailure::Fatal(error)) => return Err(error),
             Err(SummarizerFailure::Retry(delay, error)) => {
                 tracing::warn!(
@@ -2600,7 +2647,7 @@ where
 {
     use rig::completion::Completion as _;
     run_summarizer_with(
-        || {
+        |max_output_tokens| {
             let (agent, history, instruction) =
                 (agent.clone(), history.clone(), instruction.clone());
             async move {
@@ -2624,11 +2671,11 @@ async fn run_summarizer_attempt<M, F, Fut>(
     retry_config: &RetryConfig,
     observed: &crate::spend::run::UsageObserver,
     midstream_delay: impl Fn(&rig::completion::CompletionError) -> Option<Duration>,
-) -> Result<(String, rig::completion::Usage), SummarizerFailure>
+) -> Result<(String, rig::completion::Usage, bool), SummarizerFailure>
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
-    F: Fn() -> Fut,
+    F: Fn(u64) -> Fut,
     Fut: std::future::Future<
             Output = Result<
                 rig::completion::CompletionRequestBuilder<M>,
@@ -2645,7 +2692,7 @@ where
     // usage event. These requests never have tools: consume one raw stream and
     // observe its canonical Final before validation, just like title requests.
     let mut stream = retry::retry_stream_chat(retry_config, || {
-        let request = make_request();
+        let request = make_request(max_output_tokens);
         let observed = observed.clone();
         async move {
             let prior =
@@ -2740,16 +2787,7 @@ where
     if unexpected_tool {
         return Err(anyhow::anyhow!("Compression returned an unexpected tool call").into());
     }
-    if response.is_empty() {
-        return Err(anyhow::anyhow!("Compression returned empty response").into());
-    }
-    if cut_off {
-        tracing::warn!(
-            max_output_tokens,
-            "compaction summary hit the output limit and was cut off"
-        );
-    }
-    Ok((mark_cut_off_summary(response, cut_off), usage))
+    Ok((response, usage, cut_off))
 }
 
 #[derive(Default)]
@@ -4349,11 +4387,13 @@ impl NativeTurnBinding {
 impl AnyAgent {
     /// Whether this agent's route has a native prompt cache a forked
     /// summarization request can reuse (Anthropic `cache_control`, OpenAI
-    /// `prompt_cache_key`). Other routes keep the text-serialized summarizer.
+    /// `prompt_cache_key`, and OpenRouter, whose upstream providers cache an
+    /// identical prefix; mini-agent-csng7). Other routes keep the
+    /// text-serialized summarizer.
     pub(crate) fn supports_cache_fork(&self) -> bool {
         matches!(
             self.inner,
-            AnyAgentInner::Anthropic(_) | AnyAgentInner::OpenAI(_)
+            AnyAgentInner::Anthropic(_) | AnyAgentInner::OpenAI(_) | AnyAgentInner::OpenRouter(_)
         )
     }
 
@@ -4405,6 +4445,7 @@ impl AnyAgent {
                 AnyAgentInner::Anthropic(agent) => fork!(agent).await,
                 AnyAgentInner::OpenAI(OpenAiAgent::Responses(agent)) => fork!(agent).await,
                 AnyAgentInner::OpenAI(OpenAiAgent::Completions(agent)) => fork!(agent).await,
+                AnyAgentInner::OpenRouter(agent) => fork!(agent).await,
                 _ => Err(anyhow::anyhow!(
                     "this provider route has no native prompt cache to fork"
                 )),
