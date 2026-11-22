@@ -2121,19 +2121,19 @@ fn classify_git_probe(exit_code: Option<i32>, stderr: &str) -> Result<(), String
 }
 
 /// A single-use Git standard-input file; removed when dropped.
-#[cfg(all(target_os = "windows", feature = "git-worktree"))]
+#[cfg(target_os = "windows")]
 pub(crate) struct GitStdinFile {
     path: PathBuf,
 }
 
-#[cfg(all(target_os = "windows", feature = "git-worktree"))]
+#[cfg(target_os = "windows")]
 impl GitStdinFile {
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
 
-#[cfg(all(target_os = "windows", feature = "git-worktree"))]
+#[cfg(target_os = "windows")]
 impl Drop for GitStdinFile {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
@@ -5585,7 +5585,7 @@ impl Sandbox {
     /// Windows containers cannot receive a caller pipe on stdin. Git commands that read
     /// standard input instead get a private single-use file in the application cache (a
     /// read root of the container); the patched guarded Git redirects fd 0 to it.
-    #[cfg(all(target_os = "windows", feature = "git-worktree"))]
+    #[cfg(target_os = "windows")]
     pub(crate) fn write_git_stdin_file(&self, input: &[u8]) -> Result<GitStdinFile, String> {
         use std::io::Write as _;
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -11184,7 +11184,7 @@ mod sandbox_tests {
 
     /// Index of the `flag source mount_point` triple whose mount point is
     /// `mount_point`, for any of the given flags.
-    #[cfg(unix)]
+    #[cfg(all(unix, any(not(target_os = "macos"), feature = "hooks")))]
     fn bind_position(args: &[String], flags: &[&str], mount_point: &str) -> Option<usize> {
         args.windows(3)
             .position(|w| flags.contains(&w[0].as_str()) && w[2] == mount_point)

@@ -120,7 +120,7 @@ impl DiscoveryEnvironment {
             "ProgramW6432",
         ]
         .iter()
-        .filter_map(|name| std::env::var_os(name))
+        .filter_map(std::env::var_os)
         .map(PathBuf::from)
         .filter_map(|path| std::fs::canonicalize(path).ok())
         .collect();
