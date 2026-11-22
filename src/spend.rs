@@ -585,6 +585,10 @@ impl Receipt {
     }
     /// This receipt, standing in for the estimated `old` one: same row id and
     /// time, no longer flagged as an estimate (mini-agent-qqknv).
+    #[allow(
+        clippy::needless_update,
+        reason = "`observation` exists only with subagents"
+    )]
     pub(crate) fn replacing(self, old: &Receipt) -> Self {
         let mut row = (*self.row).clone();
         row.id = old.row.id;

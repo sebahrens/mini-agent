@@ -4275,6 +4275,7 @@ pub(crate) fn convert_history_prefix(
 /// prefix is the native wire history itself, cut before the user prompt at
 /// `cut_idx` (mini-agent-sskdu.265). The cut is verified: the wire history's
 /// user prompts must equal the session's own replay, one for one.
+#[cfg(test)]
 pub(crate) fn cache_fork_history(
     session: &Session,
     cut_idx: usize,

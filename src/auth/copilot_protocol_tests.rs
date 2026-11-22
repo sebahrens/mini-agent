@@ -176,7 +176,7 @@ async fn copilot207_sign_in_with_an_own_oauth_app_explains_a_refused_token_excha
     assert!(headers.contains("authorization: token new_github"));
     assert!(headers.contains("editor-version: mini-agent/"));
     answer(socket, 404, json!({"message":"Not Found"})).await;
-    let error = sign_in.await.unwrap().err().expect("refused exchange");
+    let error = sign_in.await.unwrap().expect_err("refused exchange");
     let text = error.to_string();
     assert!(text.contains("approved editor integrations"), "{text}");
     assert!(text.contains("GITHUB_COPILOT_API_TOKEN"), "{text}");
