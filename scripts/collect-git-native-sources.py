@@ -407,7 +407,7 @@ def verify_msys2_auxiliary(signature: Path, payload: Path, recipe: str, output: 
         raise CollectionError("upstream detached signature does not match signed-recipe validpgpkeys")
 
 
-def collect_msys2(name: str, output: Path, cache: Path) -> tuple[str, str, str, list[Path], list[Path]]:
+def collect_msys2(name: str, output: Path, cache: Path, repo: str = "ucrt64") -> tuple[str, str, str, list[Path], list[Path]]:
     identity = capture(["pacman", "-Q", name]).strip().split()
     if len(identity) != 2 or identity[0] != name:
         raise CollectionError("MSYS2 installed package identity mismatch")
@@ -418,7 +418,7 @@ def collect_msys2(name: str, output: Path, cache: Path) -> tuple[str, str, str, 
     binary = candidates[0]
     signature = Path(str(binary) + ".sig")
     if not signature.is_file():
-        fetch("https://repo.msys2.org/mingw/ucrt64/" + binary.name + ".sig", output / "binary.sig")
+        fetch(f"https://repo.msys2.org/mingw/{repo}/" + binary.name + ".sig", output / "binary.sig")
         signature = output / "binary.sig"
     verify_msys2_signature(signature, binary)
     with archive(binary) as (source, members):
@@ -508,11 +508,15 @@ def main():
     parser.add_argument("--alpine-db", type=Path, default=Path("/lib/apk/db/installed"))
     parser.add_argument("--alpine-series", help="default: derive vMAJOR.MINOR from the actual /etc/alpine-release")
     parser.add_argument("--pacman-cache", type=Path, default=Path("/var/cache/pacman/pkg"))
-    parser.add_argument("--toolchain-prefix", type=Path, default=Path("/ucrt64"))
+    parser.add_argument("--toolchain-prefix", type=Path, default=None, help="default: /ucrt64, or /clangarm64 for aarch64-pc-windows-msvc")
     parser.add_argument("--curl-source", type=Path)
     parser.add_argument("--source-cache", type=Path, help="reuse only checksum-verified source files across collection retries")
     parser.add_argument("--pgp-key-cache", type=Path, help="reuse upstream public keys only after matching signed-recipe fingerprints")
     args = parser.parse_args()
+    arm64_windows = args.target == "aarch64-pc-windows-msvc"
+    msys2_repo = "clangarm64" if arm64_windows else "ucrt64"
+    if args.toolchain_prefix is None:
+        args.toolchain_prefix = Path("/" + msys2_repo)
     created = False
     successful = False
     try:
@@ -572,7 +576,7 @@ def main():
                 license = fields["L"]
             else:
                 try:
-                    version, license, url, sources, notices = collect_msys2(name, directory, args.pacman_cache)
+                    version, license, url, sources, notices = collect_msys2(name, directory, args.pacman_cache, msys2_repo)
                 except CollectionError as error:
                     raise CollectionError(f"MSYS2 component {safe(name)}: {error}") from error
             components.append({"name": name, "version": version, "license": license, "source_url": url, "bundled_files": files.get(name, []), "license_files": [asset(p, args.output) for p in notices], "source_files": [asset(p, args.output) for p in sources]})

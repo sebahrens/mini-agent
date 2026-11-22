@@ -17,12 +17,12 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 
 
-def pe_image(imports=(), delayed=(), forwarded=()):
+def pe_image(imports=(), delayed=(), forwarded=(), machine=0x8664):
     data = bytearray(4096)
     data[:2] = b"MZ"
     struct.pack_into("<I", data, 0x3C, 0x80)
     data[0x80:0x84] = b"PE\0\0"
-    struct.pack_into("<HHIIIHH", data, 0x84, 0x8664, 1, 0, 0, 0, 240, 0)
+    struct.pack_into("<HHIIIHH", data, 0x84, machine, 1, 0, 0, 0, 240, 0)
     optional = 0x98
     struct.pack_into("<H", data, optional, 0x20B)
     struct.pack_into("<I", data, optional + 108, 16)
@@ -201,6 +201,33 @@ class WindowsGitBootstrapTests(unittest.TestCase):
             for outputs in [["i686-w64-mingw32\n"], ["x86_64-w64-mingw32\n", "OpenSSL Schannel\n"]]:
                 with patch.object(MODULE.subprocess, "check_output", side_effect=outputs), self.assertRaises(ValueError):
                     MODULE.toolchain_environment(Path("/ucrt64"))
+
+    def test_arm64_profile_accepts_only_native_arm64_pe_and_clangarm64_compiler(self):
+        arm = pe_image(["KERNEL32.dll", "libcurl-4.dll"], machine=0xAA64)
+        profile = MODULE.PROFILES["aarch64-pc-windows-msvc"]
+        self.assertEqual(MODULE.pe_dependencies(arm, profile["machine"], profile["arch"]), {"kernel32.dll", "libcurl-4.dll"})
+        with self.assertRaisesRegex(ValueError, "native ARM64"):
+            MODULE.pe_dependencies(pe_image(), profile["machine"], profile["arch"])
+        with self.assertRaisesRegex(ValueError, "native AMD64"):
+            MODULE.pe_dependencies(arm)
+        git = self.file("git.exe", ["libcurl-4.dll"])
+        git.write_bytes(arm)
+        (self.bin / "libcurl-4.dll").write_bytes(pe_image(machine=0xAA64))
+        libraries = MODULE.dependency_closure([git], self.bin, self.read, "aarch64-pc-windows-msvc")
+        self.assertEqual([p.name for p in libraries], ["libcurl-4.dll"])
+        (self.bin / "libcurl-4.dll").write_bytes(pe_image())
+        with self.assertRaisesRegex(ValueError, "native ARM64"):
+            MODULE.dependency_closure([git], self.bin, self.read, "aarch64-pc-windows-msvc")
+        with patch.object(MODULE.sys, "platform", "msys"), patch.dict(os.environ, {"MSYSTEM": "CLANGARM64"}):
+            with patch.object(MODULE.subprocess, "check_output", side_effect=["aarch64-w64-windows-gnu\n", "Schannel\n"]) as query:
+                env = MODULE.toolchain_environment(Path("/clangarm64"), "aarch64-pc-windows-msvc")
+            self.assertEqual(env["PATH"], "/clangarm64/bin:/usr/bin:/bin")
+            self.assertEqual(env["MSYSTEM"], "CLANGARM64")
+            self.assertEqual(query.call_args_list[0].args[0], ["/clangarm64/bin/clang", "-dumpmachine"])
+            with patch.object(MODULE.subprocess, "check_output", side_effect=["x86_64-w64-windows-gnu\n"]), self.assertRaises(ValueError):
+                MODULE.toolchain_environment(Path("/clangarm64"), "aarch64-pc-windows-msvc")
+        with patch.object(MODULE.sys, "platform", "msys"), patch.dict(os.environ, {"MSYSTEM": "UCRT64"}), self.assertRaisesRegex(ValueError, "CLANGARM64"):
+            MODULE.toolchain_environment(Path("/clangarm64"), "aarch64-pc-windows-msvc")
 
     def test_required_cmp_preflight_is_fixed_bounded_and_fails_clearly(self):
         environment = {"HOME": os.environ.get("HOME", ""), "PATH": "/ucrt64/bin:/usr/bin:/bin"}
