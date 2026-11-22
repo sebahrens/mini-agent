@@ -679,14 +679,23 @@ impl Run {
     /// cheaper of the input and cache-read rates), so it never refuses a
     /// request that could have fit. Returns true when refused.
     pub(crate) fn refuse_unaffordable(&self, body_bytes: usize) -> bool {
+        // For providers billed far below their list price. The unit-test
+        // binary never refuses here: its fixtures use micro-dollar caps and
+        // absurd prices to pin the response-based accounting contracts, which
+        // a pre-send refusal would hide. The refusal itself is pinned by
+        // `refuse_unaffordable_checked` tests.
+        if cfg!(test)
+            || std::env::var_os("MINI_AGENT_BUDGET_PREFLIGHT").is_some_and(|value| value == "0")
+        {
+            return false;
+        }
+        self.refuse_unaffordable_checked(body_bytes)
+    }
+    fn refuse_unaffordable_checked(&self, body_bytes: usize) -> bool {
         let snapshot = self.account.snapshot();
         let Some(cap) = snapshot.cap else {
             return false;
         };
-        // For providers billed far below their list price.
-        if std::env::var_os("MINI_AGENT_BUDGET_PREFLIGHT").is_some_and(|value| value == "0") {
-            return false;
-        }
         let tokens = (body_bytes / 8) as u64;
         let usage = UsageDelta {
             input_tokens: tokens,
@@ -1092,10 +1101,13 @@ mod first_item_tests {
             "unaffordable",
             PriceSnapshot::capture(Some((1.0, 2.0)), Default::default(), false),
         );
-        assert!(!run.refuse_unaffordable(1_000), "a small prompt fits");
+        assert!(
+            !run.refuse_unaffordable_checked(1_000),
+            "a small prompt fits"
+        );
         assert!(!run.was_refused());
         // 8 MB of body is at least 1M input tokens, $1 at $1 per million.
-        assert!(run.refuse_unaffordable(8_000_000));
+        assert!(run.refuse_unaffordable_checked(8_000_000));
         assert!(run.was_refused());
     }
 

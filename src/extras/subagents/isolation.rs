@@ -206,7 +206,6 @@ pub(crate) fn validate_base_ref(base: &str) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "git-worktree")]
 /// One sentence on what the isolated worktree lacks from the parent checkout.
 fn parent_dirty_sentence(parent_dirty: Option<bool>) -> &'static str {
     match parent_dirty {
@@ -232,6 +231,7 @@ fn child_note_text(branch: &str, base: &str, parent_dirty: Option<bool>) -> Stri
     )
 }
 
+#[cfg(feature = "git-worktree")]
 pub(crate) use real::prepare;
 #[cfg(not(feature = "git-worktree"))]
 pub(crate) use stub::prepare;
