@@ -21,25 +21,23 @@ async function within(promise, milliseconds, label) {
 
 const delay = milliseconds => new Promise(resolve => setTimeout(resolve, milliseconds));
 
-async function drivePermissionPicker(deny, updates, eventsPath, priorResults) {
-  // A tool-call update is emitted before VS Code paints the permission picker.
-  // Retry the workbench action until ACP or the provider observes its decision.
-  await delay(100);
-  const deadline = Date.now() + 5_000;
-  while (Date.now() < deadline) {
-    if (deny) {
-      await vscode.commands.executeCommand('workbench.action.quickOpenSelectNext');
-      await vscode.commands.executeCommand('workbench.action.quickOpenSelectNext');
-    }
-    await vscode.commands.executeCommand('workbench.action.acceptSelectedQuickOpenItem');
-    if (updates.some(update => update.sessionUpdate === 'tool_call_update')
-      || fs.readFileSync(eventsPath, 'utf8').trim().split('\n').filter(Boolean)
-        .map(JSON.parse).filter(event => event.scenario === 'TOOL_RESULT').length > priorResults) {
-      return;
-    }
-    await delay(100);
-  }
-  throw new Error('permission picker did not produce an ACP tool update or provider result');
+// VS Code has no command that accepts a modal dialog (native dialogs are OS
+// windows; custom ones expose no accept command), so a host test cannot press the
+// buttons of showWarningMessage({ modal: true }). The suite instead swaps only the
+// modal call through the extension's module-export seam. The real ACP request still
+// reaches requestPermission, which builds the real title, detail and buttons; the
+// stub records them and answers as a user pressing one button. The mapping back to
+// an ACP outcome, dismissal-as-cancel and the trust re-check are the production code.
+function installPermissionModal(installed, deny, shown) {
+  assert.equal(typeof installed.setPermissionModalForTests, 'function',
+    'installed extension exports the permission modal test seam');
+  installed.setPermissionModalForTests(async (message, detail, titles) => {
+    shown.push({ message, detail, titles: [...titles] });
+    const choice = titles.find(title => (deny ? /^(reject|deny)/i : /^allow/i).test(title)
+      && !/always/i.test(title));
+    assert.ok(choice, `permission modal offers a ${deny ? 'reject' : 'allow'}-once button: ${JSON.stringify(titles)}`);
+    return choice;
+  });
 }
 
 exports.run = async () => {
@@ -125,6 +123,8 @@ exports.run = async () => {
       const priorResults = before.filter(event => event.scenario === 'TOOL_RESULT').length;
       let onToolCall;
       const toolCall = new Promise(resolve => { onToolCall = resolve; });
+      const shown = [];
+      installPermissionModal(installed, deny, shown);
       const permissionPrompt = active.prompt(
         `${marker}: read the local fixture file.`,
         update => {
@@ -133,16 +133,23 @@ exports.run = async () => {
         },
         controller.signal,
       );
-      const pickerDriver = within(toolCall, 10_000, `${marker} tool call`).then(() => (
-        drivePermissionPicker(deny, updates, eventsPath, priorResults)
-      ));
-      const [reason] = await Promise.all([
-        within(permissionPrompt, 30_000, `${marker} prompt`),
-        within(pickerDriver, 10_000, `${marker} picker driver`),
-      ]).catch(error => {
+      let reason;
+      try {
+        reason = await within(permissionPrompt, 30_000, `${marker} prompt`);
+        await within(toolCall, 10_000, `${marker} tool call`);
+      } catch (error) {
         controller.abort();
         throw error;
-      });
+      } finally {
+        installed.setPermissionModalForTests(undefined);
+      }
+      assert.equal(shown.length, 1, `${marker} asks exactly one permission modal`);
+      assert.match(shown[0].message, /requests permission/);
+      assert.ok(shown[0].detail.includes('fixture.txt'),
+        `${marker} modal carries the tool input as detail`);
+      assert.ok(shown[0].titles.some(title => /^allow/i.test(title))
+        && shown[0].titles.some(title => /^(reject|deny)/i.test(title)),
+      `${marker} modal offers allow and reject buttons: ${JSON.stringify(shown[0].titles)}`);
       assert.equal(reason, 'end_turn');
       assert.ok(updates.some(update => update.sessionUpdate === 'tool_call'),
         `${marker} displays a tool call in the IDE session`);
@@ -160,11 +167,13 @@ exports.run = async () => {
       } else {
         assert.match(String(result.toolResult), /OFFLINE_IDE_FIXTURE/);
       }
-      console.log(`IDE_PERMISSION_${deny ? 'DENY' : 'ALLOW'}_PASS real Quick Pick and tool effect`);
+      console.log(`IDE_PERMISSION_${deny ? 'DENY' : 'ALLOW'}_PASS real permission request, modal buttons and tool effect`);
     }
 
     const beforeCancel = fs.readFileSync(eventsPath, 'utf8').trim().split('\n').map(JSON.parse);
     const cancelController = new AbortController();
+    // Nobody answers this prompt; only the ACP cancellation can end it.
+    installed.setPermissionModalForTests(() => new Promise(() => {}));
     let sawCancelTool = false;
     let cancelTimer;
     const cancelled = active.prompt(
@@ -184,6 +193,7 @@ exports.run = async () => {
       cancelController.abort();
       throw error;
     } finally {
+      installed.setPermissionModalForTests(undefined);
       clearTimeout(cancelTimer);
     }
     assert.ok(sawCancelTool, 'cancellation reaches the ACP permission tool call');
@@ -192,7 +202,7 @@ exports.run = async () => {
     assert.equal(afterCancel.filter(event => event.scenario === 'TOOL_RESULT').length,
       beforeCancel.filter(event => event.scenario === 'TOOL_RESULT').length,
       'cancelled permission does not submit a tool result to the provider');
-    console.log('IDE_PERMISSION_CANCEL_PASS active ACP turn and picker cancellation');
+    console.log('IDE_PERMISSION_CANCEL_PASS active ACP turn and permission cancellation');
     console.log('IDE_HOST_SMOKE_PASS activation/start/restart/stop/config');
   } finally {
     try {

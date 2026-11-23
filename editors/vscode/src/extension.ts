@@ -321,6 +321,32 @@ function showFullPermissionText(text: string): void {
   permissionChannel.show(false);
 }
 
+/** Shows the modal permission prompt; resolves to the chosen button title, or undefined if dismissed. */
+export type PermissionModal = (
+  message: string,
+  detail: string,
+  titles: readonly string[],
+) => Thenable<string | undefined>;
+
+const vscodePermissionModal: PermissionModal = (message, detail, titles) => (
+  vscode.window.showWarningMessage(message, { modal: true, detail }, ...titles)
+);
+let permissionModal: PermissionModal = vscodePermissionModal;
+
+/**
+ * Test seam for the installed-VSIX integration suite. VS Code exposes no command
+ * that accepts a modal dialog (native dialogs are OS windows; custom ones have no
+ * accept command), so a host test cannot press its buttons. This is deliberately
+ * not reachable from settings, env vars or commands: it exists only as a module
+ * export, which only code already running inside this extension host can reach
+ * (the suite loads the installed bundle from require.cache). Pass undefined to
+ * restore the real VS Code modal. Everything after the modal (option mapping,
+ * dismissal as cancel, trust re-check) is the production path.
+ */
+export function setPermissionModalForTests(modal: PermissionModal | undefined): void {
+  permissionModal = modal ?? vscodePermissionModal;
+}
+
 export async function requestPermission(
   request: acp.RequestPermissionRequest,
   signal: AbortSignal,
@@ -357,10 +383,10 @@ export async function requestPermission(
   try {
     for (;;) {
       const picked = await Promise.race([
-        vscode.window.showWarningMessage(
+        permissionModal(
           `Mini Agent requests permission: ${request.toolCall.title ?? 'tool call'}`,
-          { modal: true, detail: buildPermissionDetail(request) },
-          ...titles,
+          buildPermissionDetail(request),
+          titles,
         ),
         aborted,
       ]);
