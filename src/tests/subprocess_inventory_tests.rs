@@ -542,7 +542,13 @@ fn terminal_calls(source: &str) -> Result<Vec<TerminalCall>, String> {
     fn is_terminal(name: &str) -> bool {
         matches!(
             name,
-            "spawn" | "output" | "status" | "spawn_guarded" | "output_guarded" | "status_guarded"
+            "spawn"
+                | "output"
+                | "status"
+                | "spawn_guarded"
+                | "output_guarded"
+                | "output_configured_stdin_guarded"
+                | "status_guarded"
         )
     }
 
@@ -4084,12 +4090,14 @@ fn is_inventory_line(line: &str) -> bool {
         || line.contains(".spawn_guarded(")
         || line.contains(".output(")
         || line.contains(".output_guarded(")
+        || line.contains(".output_configured_stdin_guarded(")
         || line.contains(".status(")
         || line.contains(".status_guarded(")
 }
 
 fn normalized_inventory_line(line: &str) -> String {
     line.replace(".spawn_guarded(", ".spawn(")
+        .replace(".output_configured_stdin_guarded(", ".output(")
         .replace(".output_guarded(", ".output(")
         .replace(".status_guarded(", ".status(")
 }
