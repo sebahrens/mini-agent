@@ -1,4 +1,6 @@
 #![deny(unsafe_code)]
+// Auto-trait proofs for the deeply nested turn futures exceed the default depth of 128.
+#![recursion_limit = "256"]
 
 mod acp_auth;
 mod agent;

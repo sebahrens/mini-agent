@@ -41,3 +41,8 @@ skills-lock.json
 
 # Machine-local project config, independent from reviewed project defaults.
 .mini-agent/config.local.toml
+
+# Local research scratch output and indexer state (not part of the crate).
+/reports/
+/research_notes/
+.claude/code-indexer_state/
