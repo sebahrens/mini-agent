@@ -95,8 +95,8 @@ as its `LOCALAPPDATA` root, giving the downloaded executable the same trusted-an
 required by the production AppContainer launcher without changing the shared hosted-runner profile
 or weakening the launcher for CI.
 
-Every release also includes five platform VSIX candidates, the dual-purpose
-`mini-agent-windows-x64.msi`, their checksum manifests, and
+Every release also includes six platform VSIX candidates (linux, darwin and win32 for x64, plus
+arm64 for each), the dual-purpose `mini-agent-windows-x64.msi` and `mini-agent-windows-arm64.msi`, their checksum manifests, and
 `mini-agent-vX.Y.Z-source.tar.gz`. This Corresponding Source archive is
 made from the exact tagged commit and adds the complete locked Cargo dependency graph under
 `vendor/` plus a generated `.cargo/config.toml`, and every npm tarball pinned by
@@ -149,7 +149,7 @@ in-repo manifests and templates but no published package. Their status is delibe
 | Source/Cargo | Install only from this repository checkout. The crates.io `mini-agent` package is unrelated and must never be advertised or published by this project. |
 | GitHub release archives and shell installer | Supported only after the exact-version archive and `SHA256SUMS` smoke passes against the public canonical repository. |
 | Windows MSI | Supported x86-64 dual-purpose installer. Defaults to a no-admin per-user install, supports `ALLUSERS=1` enterprise deployment, and side-loads the bundled VSIX when VS Code exists in the installing account. |
-| Native VS Code VSIX | Supported local-install candidates for five release targets; Marketplace/Open VSX publication remains a separate deferred step. |
+| Native VS Code VSIX | Supported local-install candidates for six release targets; Marketplace/Open VSX publication remains a separate deferred step. |
 | AUR and Conda | Repository-maintained recipes; publication remains the manual downstream step described below. |
 | Homebrew | Compatibility formula retained, but no end-user install command is supported until a canonical tap exists and its archive smoke passes. |
 | winget, scoop, npm | Templates under `packaging/winget`, `packaging/scoop` and `packaging/npm`, rendered by `scripts/render_package_manifests.py`. Nothing is published; see "Publishing to winget, scoop and npm" below. |
@@ -400,7 +400,7 @@ never become a public release identity. Tags containing a prerelease suffix (for
 
 If a tagged run needs recovery, use **Re-run jobs** on that tag's existing Actions run. Do not
 start the release workflow from a branch. Publication still happens only after every expected full
-and lite archive, the tag-matched Corresponding Source archive, five platform VSIX candidates, the
+and lite archive, the tag-matched Corresponding Source archive, six platform VSIX candidates, the
 Windows MSI, and all three checksum manifests have been assembled and checked. The MSI job uses
 pinned WiX 6.0.2, performs a quiet per-user install, runs the installed binary, and uninstalls it
 before upload.

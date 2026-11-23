@@ -166,6 +166,7 @@
     "test:integration": "node ./scripts/run-integration-tests.mjs",
     "package": "vsce package",
     "package:win32-x64": "node ./scripts/package-target.mjs win32-x64",
+    "package:win32-arm64": "node ./scripts/package-target.mjs win32-arm64",
     "package:darwin-x64": "node ./scripts/package-target.mjs darwin-x64",
     "package:darwin-arm64": "node ./scripts/package-target.mjs darwin-arm64",
     "package:linux-x64": "node ./scripts/package-target.mjs linux-x64",

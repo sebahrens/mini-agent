@@ -11,7 +11,7 @@ from scripts import render_package_manifests as render
 REPOSITORY = Path(__file__).resolve().parents[2]
 SUMS = "\n".join(
     f"{hashlib.sha256(name.encode()).hexdigest()}  {name}"
-    for name in [render.SCOOP_ASSET, render.SCOOP_ARM64_ASSET, render.MSI_ASSET]
+    for name in [render.SCOOP_ASSET, render.SCOOP_ARM64_ASSET, render.MSI_ASSET, render.MSI_ARM64_ASSET]
 )
 
 
@@ -42,6 +42,9 @@ class RenderManifestTests(unittest.TestCase):
             installer = next(p for p in written if "installer" in p.name).read_text()
             self.assertIn(digest(render.MSI_ASSET).upper(), installer)
             self.assertIn("v1.12.0/mini-agent-windows-x64.msi", installer)
+            self.assertIn(digest(render.MSI_ARM64_ASSET).upper(), installer)
+            self.assertIn("Architecture: arm64", installer)
+            self.assertIn("v1.12.0/mini-agent-windows-arm64.msi", installer)
             for path in written:
                 self.assertEqual([], render.TOKEN.findall(path.read_text()))
                 self.assertIn("PackageVersion: 1.12.0", path.read_text())
@@ -97,7 +100,7 @@ class RenderManifestTests(unittest.TestCase):
                 render.render_npm("1.12.0", "\n".join(lines), archives, root / "out2")
 
     def test_templates_hold_only_known_placeholders(self) -> None:
-        known = {"VERSION", "MSI_SHA256", "ARCHIVE_SHA256", "ARCHIVE_ARM64_SHA256", "PLATFORM", "OS", "CPU", "BINARY", "ARCHIVE"}
+        known = {"VERSION", "MSI_SHA256", "MSI_ARM64_SHA256", "ARCHIVE_SHA256", "ARCHIVE_ARM64_SHA256", "PLATFORM", "OS", "CPU", "BINARY", "ARCHIVE"}
         for template in (REPOSITORY / "packaging").rglob("*.in"):
             tokens = {t.strip("@") for t in render.TOKEN.findall(template.read_text())}
             self.assertLessEqual(tokens, known, template)

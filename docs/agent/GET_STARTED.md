@@ -39,8 +39,8 @@ release) and, when the GitHub CLI is installed and signed in, requires
 `gh attestation verify <archive> --repo sebahrens/mini-agent` to accept the archive's build
 provenance. Without `gh` it installs with a warning that prints that command.
 
-On x86-64 Windows, download `mini-agent-windows-x64.msi` and
-`MSI_SHA256SUMS` from the same GitHub release, verify the checksum, then open
+On Windows, download `mini-agent-windows-x64.msi` (or `mini-agent-windows-arm64.msi` on Windows
+on ARM) and `MSI_SHA256SUMS` from the same GitHub release, verify the checksum, then open
 the MSI. It installs per-user without elevation by default and side-loads the
 bundled VSIX when VS Code is present. Managed machines can use:
 

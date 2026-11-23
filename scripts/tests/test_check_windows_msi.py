@@ -73,6 +73,22 @@ class WindowsMsiPolicyTests(unittest.TestCase):
             self.assertTrue(any("exactly one file" in error for error in errors))
             self.assertTrue(any("MiniAgentVsixComponent" in error for error in errors))
 
+    def test_arm64_package_is_part_of_the_release_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            shutil.copytree(REPOSITORY / "packaging/windows", root / "packaging/windows")
+            workflow = root / ".github/workflows/release.yml"
+            workflow.parent.mkdir(parents=True)
+            text = (REPOSITORY / ".github/workflows/release.yml").read_text(encoding="utf-8")
+            self.assertIn("vscode-target: win32-arm64", text)
+            self.assertIn("-eq 6", text)
+            workflow.write_text(text.replace("msi-arch: arm64", "msi-arch: removed", 1), encoding="utf-8")
+            shutil.copy(REPOSITORY / ".github/workflows/ci.yml", workflow.parent / "ci.yml")
+
+            errors = check_windows_msi.validate(root)
+
+            self.assertTrue(any("msi-arch: arm64" in error for error in errors))
+
     def test_release_must_wait_for_msiexec(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

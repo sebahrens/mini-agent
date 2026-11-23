@@ -11,5 +11,8 @@ Installers:
   - Architecture: x64
     InstallerUrl: https://github.com/sebahrens/mini-agent/releases/download/v@VERSION@/mini-agent-windows-x64.msi
     InstallerSha256: @MSI_SHA256@
+  - Architecture: arm64
+    InstallerUrl: https://github.com/sebahrens/mini-agent/releases/download/v@VERSION@/mini-agent-windows-arm64.msi
+    InstallerSha256: @MSI_ARM64_SHA256@
 ManifestType: installer
 ManifestVersion: 1.6.0

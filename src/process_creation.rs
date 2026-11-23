@@ -3,9 +3,12 @@
 //! Rust's standard library protects its own inheritable pipe setup with a private lock. The
 //! broker-only Windows worker also needs raw inheritable handles, so every production `Command`
 //! terminal in this crate enters this outer boundary before standard-library or Tokio process
-//! creation. Spawn/status helpers release the guard after synchronous spawn. The output helper must
-//! retain it through synchronous `Command::output` to preserve opaque stdio and reusable-builder
-//! semantics; no guard crosses async work.
+//! creation. Spawn/status helpers release the guard after synchronous spawn. The output helper
+//! spawns under the guard with explicitly piped stdout/stderr and a null stdin, releases it, and
+//! only then waits for the child and drains its pipes: the lock serialises handle inheritance
+//! during `CreateProcess`, so it must never cover the child's lifetime (a slow child, such as a
+//! PowerShell start on a loaded ARM64 host, would otherwise starve every other spawn until its
+//! deadline). No guard crosses async work.
 
 use std::io;
 use std::process::{Child, ExitStatus, Output};
@@ -173,11 +176,6 @@ fn spawn_std_once(command: &mut std::process::Command) -> io::Result<Child> {
     std::process::Command::spawn(command)
 }
 
-fn output_std_once(command: &mut std::process::Command) -> io::Result<Output> {
-    let _guard = creation_guard()?;
-    std::process::Command::output(command)
-}
-
 fn spawn_tokio_once(command: &mut TokioCommand) -> io::Result<TokioChild> {
     let _guard = creation_guard()?;
     TokioCommand::spawn(command)
@@ -199,6 +197,7 @@ pub(crate) trait StdCommandCreationExt {
     // Production callers are Windows-only since `/undo stash` moved to the
     // hardened Git runner (mini-agent-93gx4).
     #[cfg_attr(not(any(test, windows)), allow(dead_code))]
+    /// Spawn under the creation guard, release it, then wait and collect stdout/stderr.
     fn output_guarded(&mut self) -> io::Result<Output>;
 }
 
@@ -225,11 +224,15 @@ impl StdCommandCreationExt for std::process::Command {
     }
 
     fn output_guarded(&mut self) -> io::Result<Output> {
-        // `Command` exposes no way to inspect or clone its configured stdio. Delegating to the
-        // standard-library terminal is therefore required to preserve explicit stdio and reuse of
-        // the same builder. This synchronous path holds the outer Windows lock until `output`
-        // returns; it never crosses an async suspension.
-        retry_text_file_busy(|| output_std_once(self))
+        // Same defaults as `Command::output`, made explicit so the spawn can be separated from the
+        // wait: stdin is null, stdout and stderr are captured, and any stdio the caller configured
+        // earlier is replaced (no caller relies on redirecting an `output_guarded` stream). The
+        // creation guard is held only inside `spawn_guarded`; reading the pipes and waiting for
+        // exit happen after it is released.
+        self.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        self.spawn_guarded()?.wait_with_output()
     }
 }
 
@@ -315,13 +318,9 @@ mod tests {
     }
 
     #[test]
-    fn guarded_output_preserves_explicit_stdio_across_builder_reuse() {
+    fn guarded_output_captures_stdio_and_reuses_the_builder() {
         let mut command = Command::new(std::env::current_exe().expect("test executable exists"));
-        command
-            .arg("--help")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
+        command.arg("--help").stdout(Stdio::null());
 
         for _ in 0..2 {
             let output = command
@@ -329,15 +328,48 @@ mod tests {
                 .expect("guarded output should launch the reusable command");
             assert!(output.status.success());
             assert!(
-                output.stdout.is_empty(),
-                "explicit stdout must not be replaced"
-            );
-            assert!(
-                output.stderr.is_empty(),
-                "explicit stderr must not be replaced"
+                !output.stdout.is_empty(),
+                "output_guarded captures stdout even when the builder named another stream"
             );
         }
     }
+
+    /// The creation lock must not cover a child's lifetime: while one guarded
+    /// output call is still waiting on a slow child, a second guarded spawn
+    /// has to complete promptly.
+    #[cfg(windows)]
+    #[test]
+    fn guarded_output_does_not_hold_the_creation_lock_across_the_child() {
+        use std::time::{Duration, Instant};
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let ping = std::path::Path::new(&root).join(r"System32\PING.EXE");
+        let slow = std::thread::spawn(move || {
+            // About 4 s: one probe per second against the local address.
+            Command::new(ping)
+                .args(["-n", "5", "127.0.0.1"])
+                .output_guarded()
+                .expect("slow guarded output")
+        });
+        // Let the slow child get past its spawn and into its wait.
+        std::thread::sleep(Duration::from_millis(1500));
+        let started = Instant::now();
+        let mut quick = Command::new(std::env::current_exe().expect("test executable exists"));
+        quick
+            .arg("--help")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = quick
+            .spawn_guarded_until(Instant::now() + Duration::from_secs(2))
+            .expect("a second guarded spawn must not wait for the first child to exit");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = child.wait();
+        assert!(
+            !slow.is_finished(),
+            "the slow child must still be running when the second spawn succeeds"
+        );
+        assert!(slow.join().expect("slow thread").status.success());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn spawn_retries_while_executable_is_briefly_open_for_writing() {

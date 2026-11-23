@@ -29,6 +29,7 @@ HEX_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 TOKEN = re.compile(r"@[A-Z0-9_]+@")
 
 MSI_ASSET = "mini-agent-windows-x64.msi"
+MSI_ARM64_ASSET = "mini-agent-windows-arm64.msi"
 SCOOP_ASSET = "mini-agent-x86_64-pc-windows-msvc.tar.gz"
 SCOOP_ARM64_ASSET = "mini-agent-aarch64-pc-windows-msvc.tar.gz"
 # npm platform name -> (node os, node cpu, release target, binary name)
@@ -81,7 +82,11 @@ def read_template(relative: str) -> str:
 
 
 def render_winget(version: str, msi_sums: str, out: Path) -> list[Path]:
-    values = {"VERSION": version, "MSI_SHA256": digest_for(msi_sums, MSI_ASSET).upper()}
+    values = {
+        "VERSION": version,
+        "MSI_SHA256": digest_for(msi_sums, MSI_ASSET).upper(),
+        "MSI_ARM64_SHA256": digest_for(msi_sums, MSI_ARM64_ASSET).upper(),
+    }
     out.mkdir(parents=True, exist_ok=True)
     written = []
     for template in sorted((PACKAGING / "winget").glob("*.yaml.in")):

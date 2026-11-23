@@ -1,7 +1,9 @@
 @echo off
 setlocal
 
-set "MINI_AGENT_VSIX=%~dp0mini-agent-win32-x64.vsix"
+set "MINI_AGENT_VSIX="
+for %%F in ("%~dp0mini-agent-win32-*.vsix") do set "MINI_AGENT_VSIX=%%~fF"
+if not defined MINI_AGENT_VSIX exit /b 0
 if not exist "%MINI_AGENT_VSIX%" exit /b 0
 
 where code.cmd >nul 2>nul

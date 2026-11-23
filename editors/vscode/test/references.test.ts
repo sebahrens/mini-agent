@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { pathToFileURL } from 'node:url';
 import {
   MAX_IMAGE_BYTES, MAX_REFERENCES, MAX_SNIPPET_BYTES, buildPromptBlocks, type PromptBuildOptions, type ReferenceInput,
 } from '../src/references';
@@ -19,7 +20,7 @@ describe('buildPromptBlocks', () => {
     const built = await buildPromptBlocks(options([{ kind: 'file', fsPath: '/work/space/src/a.rs' }]));
     expect(built.blocks).toEqual([
       { type: 'text', text: 'hi' },
-      { type: 'resource_link', name: 'a.rs', uri: 'file:///work/space/src/a.rs' },
+      { type: 'resource_link', name: 'a.rs', uri: pathToFileURL('/work/space/src/a.rs').href },
     ]);
     expect(built.notes).toEqual([]);
   });
@@ -28,7 +29,7 @@ describe('buildPromptBlocks', () => {
     const snippet: ReferenceInput = { kind: 'snippet', fsPath: '/work/space/a.ts', text: 'let x', startLine: 4, endLine: 6 };
     const embedded = await buildPromptBlocks(options([snippet]));
     expect(embedded.blocks[1]).toEqual({
-      type: 'resource', resource: { uri: 'file:///work/space/a.ts#L5-7', mimeType: 'text/plain', text: 'let x' },
+      type: 'resource', resource: { uri: `${pathToFileURL('/work/space/a.ts').href}#L5-7`, mimeType: 'text/plain', text: 'let x' },
     });
     const inline = await buildPromptBlocks(options([snippet], { embeddedContext: false }));
     expect(inline.blocks[1]).toEqual({ type: 'text', text: 'Reference a.ts:5-7:\nlet x' });
