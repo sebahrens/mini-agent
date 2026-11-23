@@ -721,8 +721,57 @@ fn self_check_failed(error: anyhow::Error) -> anyhow::Result<()> {
     ) {
         return Err(error);
     }
-    eprintln!("Error: {error:#}");
+    eprintln!("{}", format_self_check_error(&error));
     std::process::exit(1);
+}
+
+/// Render an error chain with one element per line: `Error: <outermost>`,
+/// then a `Caused by:` header and each cause indented four spaces. A cause
+/// stays alone on its line so CI and release smoke can match it exactly.
+#[cfg(any(feature = "js", feature = "git-worktree"))]
+fn format_self_check_error(error: &anyhow::Error) -> String {
+    let mut out = format!("Error: {error}");
+    let mut causes = error.chain().skip(1).peekable();
+    if causes.peek().is_some() {
+        out.push_str("\n\nCaused by:");
+        for cause in causes {
+            out.push_str("\n    ");
+            out.push_str(&cause.to_string());
+        }
+    }
+    out
+}
+
+#[cfg(all(test, any(feature = "js", feature = "git-worktree")))]
+mod self_check_format_tests {
+    use super::format_self_check_error;
+
+    #[test]
+    fn chain_elements_each_get_their_own_line() {
+        let error = anyhow::Error::msg("detail (backend)")
+            .context("JavaScript worker containment is unavailable")
+            .context("JavaScript runtime self-check could not execute");
+        let text = format_self_check_error(&error);
+        assert!(text.contains("JavaScript runtime self-check could not execute"));
+        assert_eq!(
+            text,
+            "Error: JavaScript runtime self-check could not execute\n\nCaused by:\n    \
+             JavaScript worker containment is unavailable\n    detail (backend)"
+        );
+        // Equivalent of CI's (?m)^\s*...\s*$ line match.
+        assert!(
+            text.lines()
+                .any(|l| l.trim() == "JavaScript worker containment is unavailable")
+        );
+    }
+
+    #[test]
+    fn single_error_has_no_caused_by_section() {
+        assert_eq!(
+            format_self_check_error(&anyhow::anyhow!("boom")),
+            "Error: boom"
+        );
+    }
 }
 
 /// Run the verification-only `--*-check` flags that need nothing but the
