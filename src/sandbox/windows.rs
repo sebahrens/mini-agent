@@ -6967,7 +6967,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     )?;
     let mut output = command
         .as_std_mut()
-        .output_guarded()
+        .output_configured_stdin_guarded()
         .map_err(|e| format!("run write-boundary probe: {e}"))?;
     if !output.status.success() || !inside_file.exists() || outside_file.exists() {
         if output.stderr.is_empty() {
@@ -7031,7 +7031,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     )?;
     let configured_result = configured_launch
         .as_std_mut()
-        .output_guarded()
+        .output_configured_stdin_guarded()
         .map_err(|e| format!("run configured AppContainer tool/root probe: {e}"))?;
     if !configured_result.status.success() || !configured_output.exists() {
         return Err(format!(
@@ -7067,7 +7067,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     )?;
     if hardlink
         .as_std_mut()
-        .output_guarded()
+        .output_configured_stdin_guarded()
         .map_err(|e| format!("run hardlink probe: {e}"))?
         .status
         .success()
@@ -7089,7 +7089,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     )?;
     if !max_request
         .as_std_mut()
-        .output_guarded()
+        .output_configured_stdin_guarded()
         .map_err(|e| format!("run bounded request-pipe probe: {e}"))?
         .status
         .success()
@@ -7190,7 +7190,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     )?;
     if !second_launch
         .as_std_mut()
-        .output_guarded()
+        .output_configured_stdin_guarded()
         .map_err(|e| format!("run unique-SID sequential probe: {e}"))?
         .status
         .success()
@@ -7228,7 +7228,7 @@ fn run_runtime_probe() -> Result<i32, String> {
     )?;
     let authority_result = authority_probe
         .as_std_mut()
-        .output_guarded()
+        .output_configured_stdin_guarded()
         .map_err(|e| format!("run restricted authority probe: {e}"))?;
     if !authority_result.status.success() || authority_escape.exists() || escaped_a.exists() {
         return Err(format!(

@@ -3,9 +3,11 @@
 //! Rust's standard library protects its own inheritable pipe setup with a private lock. The
 //! broker-only Windows worker also needs raw inheritable handles, so every production `Command`
 //! terminal in this crate enters this outer boundary before standard-library or Tokio process
-//! creation. Spawn/status helpers release the guard after synchronous spawn. The output helper
-//! spawns under the guard with explicitly piped stdout/stderr and a null stdin, releases it, and
-//! only then waits for the child and drains its pipes: the lock serialises handle inheritance
+//! creation. Spawn/status helpers release the guard after synchronous spawn. `output_guarded` spawns
+//! under the guard with piped stdout/stderr and a null stdin; `output_configured_stdin_guarded`
+//! does the same but keeps the stdin the caller configured (the Windows AppContainer helper
+//! receives its launch request on a private stdin pipe). Both release the guard and
+//! only then wait for the child and drains its pipes: the lock serialises handle inheritance
 //! during `CreateProcess`, so it must never cover the child's lifetime (a slow child, such as a
 //! PowerShell start on a loaded ARM64 host, would otherwise starve every other spawn until its
 //! deadline). No guard crosses async work.
@@ -198,7 +200,18 @@ pub(crate) trait StdCommandCreationExt {
     // hardened Git runner (mini-agent-93gx4).
     #[cfg_attr(not(any(test, windows)), allow(dead_code))]
     /// Spawn under the creation guard, release it, then wait and collect stdout/stderr.
+    ///
+    /// Stdin is forced to null and stdout/stderr to pipes, replacing whatever the builder set. Use
+    /// this only for commands that never configure stdin; a command that feeds the child through
+    /// stdin (the Windows AppContainer helper request pipe) must use
+    /// [`Self::output_configured_stdin_guarded`], or the child sees immediate EOF.
     fn output_guarded(&mut self) -> io::Result<Output>;
+    /// Like [`Self::output_guarded`], but leaves stdin exactly as the caller configured it
+    /// (`std::process::Command` has no stdio getter, so it cannot be re-defaulted here); only
+    /// stdout and stderr are piped. If the caller never set stdin, the child inherits it, as with
+    /// `Command::spawn`.
+    #[cfg_attr(not(any(test, windows)), allow(dead_code))]
+    fn output_configured_stdin_guarded(&mut self) -> io::Result<Output>;
 }
 
 impl StdCommandCreationExt for std::process::Command {
@@ -226,11 +239,15 @@ impl StdCommandCreationExt for std::process::Command {
     fn output_guarded(&mut self) -> io::Result<Output> {
         // Same defaults as `Command::output`, made explicit so the spawn can be separated from the
         // wait: stdin is null, stdout and stderr are captured, and any stdio the caller configured
-        // earlier is replaced (no caller relies on redirecting an `output_guarded` stream). The
-        // creation guard is held only inside `spawn_guarded`; reading the pipes and waiting for
-        // exit happen after it is released.
-        self.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
+        // earlier is replaced. Callers that deliver input on a configured stdin must use
+        // `output_configured_stdin_guarded`. The creation guard is held only inside
+        // `spawn_guarded`; reading the pipes and waiting for exit happen after it is released.
+        self.stdin(std::process::Stdio::null());
+        self.output_configured_stdin_guarded()
+    }
+
+    fn output_configured_stdin_guarded(&mut self) -> io::Result<Output> {
+        self.stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
         self.spawn_guarded()?.wait_with_output()
     }
@@ -332,6 +349,51 @@ mod tests {
                 "output_guarded captures stdout even when the builder named another stream"
             );
         }
+    }
+
+    /// A portable command that copies its stdin to stdout.
+    fn stdin_echo_command() -> Command {
+        #[cfg(windows)]
+        {
+            let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+            let mut command = Command::new(std::path::Path::new(&root).join(r"System32\find.exe"));
+            command.arg("/v").arg("");
+            command
+        }
+        #[cfg(not(windows))]
+        {
+            Command::new("cat")
+        }
+    }
+
+    #[test]
+    fn configured_stdin_variant_delivers_the_callers_stdin_and_default_nulls_it() {
+        use std::io::Write;
+        let (reader, mut writer) = std::io::pipe().expect("anonymous pipe");
+        let mut command = stdin_echo_command();
+        command.stdin(Stdio::from(reader));
+        let feeder = std::thread::spawn(move || {
+            writer.write_all(b"request-bytes\r\n").expect("feed stdin");
+        });
+        let output = command
+            .output_configured_stdin_guarded()
+            .expect("configured-stdin output");
+        feeder.join().expect("feeder");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("request-bytes"),
+            "the configured stdin must reach the child: {output:?}"
+        );
+
+        // The default variant replaces a configured stdin with null: the child sees EOF.
+        let (reader, mut writer) = std::io::pipe().expect("anonymous pipe");
+        let mut command = stdin_echo_command();
+        command.stdin(Stdio::from(reader));
+        let output = command.output_guarded().expect("default guarded output");
+        let _ = writer.write_all(b"ignored\r\n");
+        assert!(
+            !String::from_utf8_lossy(&output.stdout).contains("ignored"),
+            "output_guarded must null stdin: {output:?}"
+        );
     }
 
     /// The creation lock must not cover a child's lifetime: while one guarded
