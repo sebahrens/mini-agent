@@ -873,6 +873,8 @@ async fn usd_budget_native_advisor_receipt_is_retained_and_next_request_refused(
     let wire = Wire::new(vec![Some(response("captured guidance", false)), None]).await;
     let (client, cfg) = wire.client();
     let (run, ledger) = profile(&root, &cfg, RequestKind::Advisor, Some(0.00001));
+    // This fixture pins response-based accounting under a micro-dollar cap.
+    let run = run.without_preflight();
     let model = client.completion_model("fixture");
     let first = super::run::scope(
         Some(run.clone()),
