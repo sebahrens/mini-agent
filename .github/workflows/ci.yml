@@ -825,13 +825,15 @@ jobs:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.changes.outputs.test_os) }}
-        # The macOS run is a 37-minute serial-free rerun of the default suite;
+        # The macOS run is a serial-free rerun of the default suite (37 min warm,
+        # over 45 min cold: a cancelled main run never saves the cache, so the
+        # limit must cover a cold build);
         # it runs on pushes, tags and the weekly drift schedule, not on pull
         # requests (the Linux run and the macOS `test` default row stay).
         exclude:
           - os: ${{ github.event_name == 'pull_request' && 'macos-latest' || 'not-excluded' }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
