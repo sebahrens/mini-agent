@@ -19,6 +19,16 @@ pub(crate) mod worker;
 #[cfg(test)]
 mod tests;
 
+/// Self-check failure for unavailable containment. The chain, outermost first,
+/// is the "could not execute" summary, the closed worker witness line (CI and
+/// the release smoke match it on its own stderr line), then the actionable
+/// `{reason} ({backend})` detail.
+fn containment_unavailable_error(backend: &str, reason: &str) -> anyhow::Error {
+    anyhow::Error::msg(format!("{reason} ({backend})"))
+        .context(supervisor::WorkerError::ContainmentUnavailable.to_string())
+        .context("JavaScript runtime self-check could not execute")
+}
+
 pub(crate) async fn verify_runtime(
     workspace: std::sync::Arc<crate::paths::WorkspaceBinding>,
 ) -> anyhow::Result<()> {
@@ -34,9 +44,7 @@ pub(crate) async fn verify_runtime(
         ..
     }) = tokio::task::spawn_blocking(crate::sandbox::worker::containment_status).await
     {
-        anyhow::bail!(
-            "JavaScript runtime self-check: containment is unavailable ({backend}): {reason}"
-        );
+        return Err(containment_unavailable_error(&backend.to_string(), &reason));
     }
     let allow = host::AllowConfig::from_settings(workspace.root(), None, None, None, false, false)
         .with_workspace_binding(workspace);
@@ -57,4 +65,21 @@ pub(crate) async fn verify_runtime(
         "JavaScript runtime self-check returned {result:?}"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod containment_witness_tests {
+    #[test]
+    fn unavailable_error_chain_carries_both_witnesses_in_order() {
+        let error = super::containment_unavailable_error("appcontainer", "bad install location");
+        let chain: Vec<String> = error.chain().map(|e| e.to_string()).collect();
+        assert_eq!(
+            chain,
+            [
+                "JavaScript runtime self-check could not execute",
+                "JavaScript worker containment is unavailable",
+                "bad install location (appcontainer)",
+            ]
+        );
+    }
 }
